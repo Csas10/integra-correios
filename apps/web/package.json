@@ -1,0 +1,14 @@
+{
+  "name": "@integra-correios/web",
+  "version": "2.0.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@integra-correios/domain": "*"
+  }
+}

@@ -13,7 +13,7 @@ entrada, saída ou evidência; não são o estado transacional da aplicação.
 - Perfil Ouro PPN como contrato tipado e testado;
 - contratos dos quatro templates oficiais, sem publicar as linhas de exemplo;
 - adaptador Correios sem rede, credenciais ou chamadas reais;
-- shells compiláveis de web, API e worker para evolução posterior;
+- cockpit web React/Vite e shells compiláveis de API e worker;
 - cockpit Apps Script somente leitura para o ecossistema Sheets/Drive atual;
 - baseline Apps Script V1.8.5 preservada sem reformatação;
 - CI com gates independentes de typecheck, testes, build e política do repositório.
@@ -37,7 +37,7 @@ O código não mantém contagens cadastrais fixas nem dados de demonstração.
 ```text
 apps/
   api/                    contrato stateless, sem servidor publicado
-  web/                    modelo de navegação do cockpit
+  web/                    cockpit React/Vite, sem fonte operacional conectada
   worker/                 orquestração por portas injetadas
   apps-script-cockpit/    primeira interface sobre Sheets/Drive
 packages/
@@ -65,6 +65,7 @@ npm run policy:repo
 npm run typecheck
 npm test
 npm run build
+npm run build:web
 ```
 
 Cada gate possui finalidade própria: análise estática, regressão automatizada,
@@ -77,7 +78,7 @@ compilação real e verificação de que artefatos proibidos não entraram no Gi
 | Google Sheets/Drive | adaptador do cockpit; sem IDs no código novo |
 | Correios PPN | contrato e serialização puros; rede desabilitada |
 | PostgreSQL | evolução documentada; não implementado nesta fase |
-| Vercel | nenhum deploy configurado |
+| Vercel | Preview da branch; produção continua vinculada à `main` |
 
 Consulte [docs/architecture/overview.md](docs/architecture/overview.md) para os
 limites completos da fundação.

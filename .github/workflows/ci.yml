@@ -41,5 +41,8 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Build web application
+        run: npm run build:web
+
       - name: Git whitespace check
         run: git diff --check HEAD^

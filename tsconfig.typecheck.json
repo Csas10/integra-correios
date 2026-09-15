@@ -5,10 +5,16 @@
     "declaration": false,
     "declarationMap": false,
     "sourceMap": false,
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "types": ["node", "vitest/globals"]
   },
   "include": [
     "apps/*/src/**/*.ts",
+    "apps/*/src/**/*.tsx",
+    "apps/*/vite.config.ts",
+    "apps/*/test/**/*.ts",
     "packages/*/src/**/*.ts",
     "packages/*/test/**/*.ts",
     "vitest.config.ts"

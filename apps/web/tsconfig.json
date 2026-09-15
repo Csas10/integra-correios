@@ -5,8 +5,8 @@
     "moduleResolution": "Bundler",
     "jsx": "react-jsx",
     "rootDir": "src",
-    "outDir": "dist",
-    "tsBuildInfoFile": "dist/.tsbuildinfo"
+    "outDir": ".tsc",
+    "tsBuildInfoFile": ".tsc/tsconfig.tsbuildinfo"
   },
   "references": [{ "path": "../../packages/domain" }],
   "include": ["src/**/*.ts", "src/**/*.tsx"]

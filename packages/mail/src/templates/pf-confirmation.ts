@@ -34,7 +34,7 @@ export function renderPfConfirmationMail(input: ConfirmationMailInput): Outbound
   const htmlBody = `<p>Olá, ${safeName}.</p><p>Precisamos confirmar seus dados cadastrais para uma futura etapa de pré-postagem.</p><p><a href="${safeUrl}">Confirmar ou atualizar dados</a></p><p>Se não reconhecer esta solicitação, responda a este e-mail.</p>`;
 
   return {
-    idempotencyKey: `pf-confirmation:${input.confirmationId}`,
+    idempotencyKey: `pf-confirmation:${input.confirmationId}:pf-confirmation-v1`,
     confirmationId: input.confirmationId,
     to: input.recipient,
     replyTo: input.replyTo,

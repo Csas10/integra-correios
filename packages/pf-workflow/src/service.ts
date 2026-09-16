@@ -98,7 +98,7 @@ export class PfConfirmationWorkflow {
       professionalId: state.professional.id,
       recipient: state.professional.original.email,
       professionalName: state.professional.original.nome,
-      replyTo: "carteiras@instituicao.example",
+      replyTo: this.dependencies.confirmationReplyTo,
       confirmationUrl,
     });
     const receipt: MailReceipt = await this.dependencies.mail.send(message);

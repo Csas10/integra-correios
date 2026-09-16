@@ -84,6 +84,7 @@ function criarCenario() {
     confirmations,
     tokens: new FakeTokenService(),
     confirmationBaseUrl: "https://app.example.invalid",
+    confirmationReplyTo: "carteiras@instituicao.example",
     clock: () => new Date("2026-09-16T00:00:00.000Z"),
     confirmationTtlMs: 60_000,
   });
@@ -181,6 +182,7 @@ describe("workflow de confirmação cadastral PF", () => {
       confirmations,
       tokens: new FakeTokenService(),
       confirmationBaseUrl: "https://app.example.invalid",
+      confirmationReplyTo: "carteiras@instituicao.example",
       clock: () => new Date("2026-09-16T00:00:00.000Z"),
       idFactory: () => "confirmation-test-failure",
     });
@@ -222,6 +224,7 @@ describe("workflow de confirmação cadastral PF", () => {
       confirmations: new InMemoryConfirmationOwnership(),
       tokens: new FakeTokenService(),
       confirmationBaseUrl: "http://app.example.invalid",
+      confirmationReplyTo: "carteiras@instituicao.example",
       clock: () => new Date("2026-09-16T00:00:00.000Z"),
     });
     const initial: PfWorkflowState = {

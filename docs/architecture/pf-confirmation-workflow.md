@@ -1,7 +1,8 @@
 # Fluxo de confirmação cadastral PF
 
-Esta feature prepara a carteira PF antes de qualquer pré-postagem. Ela não
-consulta banco, planilhas, Google Drive, Correios ou provedor de e-mail.
+Esta feature prepara a carteira PF antes de qualquer pré-postagem. O workflow
+não consulta diretamente banco, planilhas, Google Drive, Correios ou provedor
+de e-mail; todas as integrações permanecem atrás de portas.
 
 ```text
 CARTEIRA_IDENTIFICADA
@@ -40,9 +41,12 @@ oferece garantia distribuída; o adapter PostgreSQL deverá implementar a mesma
 operação de forma transacional antes do uso operacional.
 
 `MailGateway` e `ConversationGateway` são contratos independentes de Gmail,
-Microsoft Graph ou Resend. Os adapters reais ficam para uma etapa autorizada
-posterior; o adapter atual falha explicitamente sem rede.
+Microsoft Graph ou Resend. O adapter Resend somente é habilitado no modo
+`homologation`, com whitelist curta e comando deliberado. A integração
+operacional permanece posterior à persistência e à outbox.
 
 O cockpit oferece a rota `/confirma/:token` para o formulário, mas nesta fase o
 envio é apenas uma validação local de interface. A mensagem apresentada deixa
 explícito que não houve registro. Não há endpoint nem persistência operacional.
+O spike de e-mail pode abrir essa página por link real, mas o formulário não
+promove o cadastro nem altera o gate `APTO_PREPOSTAGEM`.

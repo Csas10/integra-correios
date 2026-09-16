@@ -23,7 +23,9 @@ nas regras PF/PJ.
 - Apps Script V1.8.5 permanece congelado como baseline homologada;
 - o cockpit Apps Script lê somente contagens agregadas;
 - TypeScript concentra contratos e regressões portáveis;
-- não há banco de dados, consulta SQL, endpoint público ou deploy.
+- não há banco de dados nem consulta SQL;
+- o único endpoint novo é o webhook efêmero da homologação de e-mail no Preview,
+  desabilitado sem configuração explícita e sem persistência operacional.
 
 ### Evolução prevista
 

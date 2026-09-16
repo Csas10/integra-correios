@@ -11,16 +11,18 @@ entrada, saída ou evidência; não são o estado transacional da aplicação.
 - domínio PF/PJ e identidade operacional (`PF|CODIGO` ou `PJ|CODIGO`);
 - estados e gates para triagem PF, confirmação, validação, lote, retorno e reteste;
 - workflow PF com token seguro, snapshot original/confirmado e comunicação desacoplada;
+- adapter Resend de homologação bloqueado por modo e whitelist de até cinco destinatários;
 - Perfil Ouro PPN como contrato tipado e testado;
 - contratos dos quatro templates oficiais, sem publicar as linhas de exemplo;
 - adaptador Correios sem rede, credenciais ou chamadas reais;
-- cockpit web React/Vite e shells compiláveis de API e worker;
+- cockpit web React/Vite, webhook efêmero de homologação e worker com comando deliberado;
 - cockpit Apps Script somente leitura para o ecossistema Sheets/Drive atual;
 - baseline Apps Script V1.8.5 preservada sem reformatação;
 - CI com gates independentes de typecheck, testes, build e política do repositório.
 
 Não existem neste repositório bases cadastrais, consultas SQL, migrations, seeds,
 credenciais, arquivos `.env`, templates XLSX binários nem chamadas reais ao PPN.
+O envio de e-mail permanece desabilitado por padrão e não é executado pelos gates.
 
 ## Áreas do cockpit
 
@@ -36,10 +38,12 @@ O código não mantém contagens cadastrais fixas nem dados de demonstração.
 ## Estrutura
 
 ```text
+api/
+  webhooks/resend.ts      endpoint assinado e sem persistência para o spike
 apps/
   api/                    contrato stateless, sem servidor publicado
   web/                    cockpit React/Vite, sem fonte operacional conectada
-  worker/                 orquestração por portas injetadas
+  worker/                 orquestração e comando controlado de homologação
   apps-script-cockpit/    primeira interface sobre Sheets/Drive
 packages/
   domain/                 origem, identidade, estados e lotes
@@ -80,6 +84,7 @@ compilação real e verificação de que artefatos proibidos não entraram no Gi
 |---|---|
 | Google Sheets/Drive | adaptador do cockpit; sem IDs no código novo |
 | Correios PPN | contrato e serialização puros; rede desabilitada |
+| Resend | adapter de homologação; envio bloqueado sem modo, segredo e whitelist explícitos |
 | PostgreSQL | evolução documentada; não implementado nesta fase |
 | Vercel | Preview da branch; produção continua vinculada à `main` |
 
@@ -91,6 +96,18 @@ de formulário `/confirma/:token`; os valores permanecem vazios nesta fase.
 Somente `APTO_PREPOSTAGEM` libera a entrada no lote. Consulte
 [docs/architecture/pf-confirmation-workflow.md](docs/architecture/pf-confirmation-workflow.md)
 e [ADR-005](docs/architecture/decisions/ADR-005-confirmacao-pf-e-mail-desacoplado.md).
+
+## Homologação técnica de e-mail
+
+A etapa `0.5` permite enviar apenas o template sintético `pf-confirmation-v1`
+para até cinco destinatários controlados. O comando exige confirmação explícita,
+o adapter aplica whitelist antes de chamar o provedor e o webhook registra apenas
+identificadores, status e timestamp. Consulte
+[o roteiro de homologação](docs/homologation/pf-mail-channel.md) e
+[ADR-006](docs/architecture/decisions/ADR-006-homologacao-canal-email.md).
+
+Essa etapa não persiste confirmações, não cria outbox, não promove registros a
+`APTO_PREPOSTAGEM` e não autoriza comunicação com profissionais reais.
 
 Consulte [docs/architecture/overview.md](docs/architecture/overview.md) para os
 limites completos da fundação.

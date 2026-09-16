@@ -34,45 +34,95 @@ function decodificar(bytes: Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: true }).decode(body);
 }
 
+interface RegistroCsv {
+  /** Campos do registro (aspas já resolvidas, quebras internas preservadas). */
+  readonly campos: string[];
+  /** Número 1-based da linha física onde o registro começa. */
+  readonly linhaFisica: number;
+}
+
 /**
- * Divide uma linha CSV respeitando aspas ("a,b" é um campo; """" vira ").
- * Linha vazia → [].
+ * Parser RFC 4180 por estado sobre o arquivo inteiro:
+ * - campos entre aspas podem conter delimitador, aspas ("") e quebras
+ *   de linha — o registro só termina fora de aspas;
+ * - linha física inicial de cada registro é preservada para auditoria.
  */
-function dividirLinha(linha: string, delimitador: string): string[] {
-  const campos: string[] = [];
+function parsearCsv(texto: string, delimitador: string): readonly RegistroCsv[] {
+  const registros: RegistroCsv[] = [];
+  let campos: string[] = [];
   let atual = "";
   let dentroAspas = false;
-  for (let i = 0; i < linha.length; i++) {
-    const ch = linha[i] as string;
+  let linhaFisica = 1;
+  let linhaInicioRegistro = 1;
+  let registroAberto = false;
+
+  const fecharCampo = (): void => {
+    campos.push(atual);
+    atual = "";
+  };
+  const fecharRegistro = (): void => {
+    fecharCampo();
+    registros.push({ campos, linhaFisica: linhaInicioRegistro });
+    campos = [];
+    registroAberto = false;
+    linhaInicioRegistro = linhaFisica + 1;
+  };
+
+  for (let i = 0; i < texto.length; i++) {
+    const ch = texto[i] as string;
     if (dentroAspas) {
       if (ch === '"') {
-        const next = linha[i + 1];
-        if (next === '"') {
+        if (texto[i + 1] === '"') {
           atual += '"';
           i++;
         } else {
           dentroAspas = false;
         }
       } else {
+        if (ch === "\n") linhaFisica++;
         atual += ch;
       }
-    } else if (ch === '"' && atual === "") {
-      dentroAspas = true;
-    } else if (ch === delimitador) {
-      campos.push(atual);
-      atual = "";
-    } else {
-      atual += ch;
+      continue;
     }
+    if (ch === '"' && atual === "") {
+      dentroAspas = true;
+      registroAberto = true;
+      continue;
+    }
+    if (ch === delimitador) {
+      fecharCampo();
+      registroAberto = true;
+      continue;
+    }
+    if (ch === "\r") {
+      if (texto[i + 1] === "\n") i++;
+      fecharRegistro();
+      continue;
+    }
+    if (ch === "\n") {
+      linhaFisica++;
+      fecharRegistro();
+      continue;
+    }
+    if (!registroAberto && atual === "" && campos.length === 0) {
+      registroAberto = true;
+      linhaInicioRegistro = linhaFisica;
+    }
+    atual += ch;
   }
-  campos.push(atual);
-  return campos;
+
+  // Registro final sem quebra de linha, ou campo pendente.
+  if (registroAberto || atual !== "" || campos.length > 0) {
+    if (registroAberto || atual !== "" || campos.length > 0) fecharRegistro();
+  }
+  return registros;
 }
 
 /**
- * Leitura segura de CSV (UTF-8 strict).
+ * Leitura segura de CSV (UTF-8 strict, RFC 4180).
  * - Mesmos limites do XLSX.
- * - Preservação textual de CPF/CNPJ/CEP.
+ * - Campos quoted com quebra de linha interna são suportados.
+ * - Células CSV são sempre texto (tipoOrigem "texto").
  * - Detecta cabeçalhos duplicados.
  */
 export function lerCsv(arquivo: ArquivoEntrada, opcoes: OpcoesLeituraCsv = {}): ResultadoLeituraCsv {
@@ -105,24 +155,34 @@ export function lerCsv(arquivo: ArquivoEntrada, opcoes: OpcoesLeituraCsv = {}): 
     throw new LeituraSeguraError(`linhaCabecalho deve ser inteiro >= 1 (recebido: ${linhaCabecalho}).`);
   }
 
-  const linhasBrutas = texto.split(/\r\n|\n|\r/);
-  if (linhasBrutas.length < linhaCabecalho) {
+  const registros = parsearCsv(texto, delimitador);
+
+  const indiceCabecalho = registros.findIndex((r) => r.linhaFisica >= linhaCabecalho);
+  if (indiceCabecalho < 0) {
     throw new LeituraSeguraError(
-      `Arquivo tem ${linhasBrutas.length} linhas — insuficiente para o cabeçalho na linha ${linhaCabecalho}.`,
+      `Arquivo não contém linha de cabeçalho na posição ${linhaCabecalho}.`,
     );
   }
+  const registroCabecalho = registros[indiceCabecalho] as RegistroCsv;
+  // Um cabeçalho não pode conter quebra de linha interna (ambiguidade).
+  if (registroCabecalho.linhaFisica !== registros[indiceCabecalho]!.linhaFisica) {
+    throw new LeituraSeguraError("Cabeçalho ambíguo.");
+  }
 
-  const cabecalhos = dividirLinha(linhasBrutas[linhaCabecalho - 1] as string, delimitador);
+  const cabecalhos = registroCabecalho.campos;
   const duplicados = detectarCabecalhosDuplicados(cabecalhos);
 
   const linhas: LinhaDados[] = [];
-  for (let i = linhaCabecalho; i < linhasBrutas.length; i++) {
-    const bruta = linhasBrutas[i] as string;
-    // Pula linhas completamente vazias (comum no final do arquivo).
-    if (bruta.trim() === "") continue;
-    const campos = dividirLinha(bruta, delimitador);
-    const celulas: Celula[] = campos.map((texto, col) => ({ coluna: col, texto }));
-    linhas.push({ numero: i + 1, celulas });
+  for (let i = indiceCabecalho + 1; i < registros.length; i++) {
+    const registro = registros[i] as RegistroCsv;
+    // Registros de dados podem conter quebras legítimas dentro de aspas.
+    if (registro.campos.length === 1 && registro.campos[0] === "") continue;
+    const celulas: Celula[] = registro.campos.map((texto, col) => ({
+      coluna: col,
+      texto,
+      tipoOrigem: "texto" as const,
+    }));
+    linhas.push({ numero: registro.linhaFisica, celulas });
   }
 
   if (linhas.length > limites.maxLinhas) {
@@ -139,7 +199,7 @@ export function lerCsv(arquivo: ArquivoEntrada, opcoes: OpcoesLeituraCsv = {}): 
 
   const folha: FolhaExtraida = {
     nome: "CSV",
-    linhaCabecalho,
+    linhaCabecalho: registroCabecalho.linhaFisica,
     cabecalhos,
     linhas,
   };

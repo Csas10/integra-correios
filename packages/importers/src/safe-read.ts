@@ -26,12 +26,21 @@ export function sha256Arquivo(arquivo: ArquivoEntrada): string {
   return createHash("sha256").update(arquivo.bytes).digest("hex");
 }
 
+/**
+ * Tipo original da célula na planilha — evidência para política fail-closed:
+ * valores numéricos perdem zeros à esquerda no Excel, então CPF/CNPJ/CEP
+ * originados de célula numérica são sinalizados ao operador.
+ */
+export type TipoOrigemCelula = "texto" | "numero" | "booleano";
+
 /** Célula bruta: valor interpretado como texto, SEM conversão de tipo. */
 export interface Celula {
   /** Texto cru preservado (ex.: "06834140000100", "01234-567"). */
   readonly texto: string;
   /** Índice da coluna (0-based). */
   readonly coluna: number;
+  /** Tipo original da célula na planilha de entrada. */
+  readonly tipoOrigem: TipoOrigemCelula;
 }
 
 export interface LinhaDados {
@@ -47,6 +56,20 @@ export interface FolhaExtraida {
 }
 
 export class LeituraSeguraError extends Error {}
+
+/** Campos sensíveis a zeros à esquerda: célula numérica é bloqueada. */
+export const CAMPOS_SENSIVEIS_A_ZEROS: ReadonlySet<string> = new Set([
+  "CPF_CNPJ",
+  "CEP",
+]);
+
+/** Célula numérica mapeada para campo sensível a zeros à esquerda. */
+export interface AlertaCelulaNumerica {
+  readonly linha: number;
+  readonly coluna: number;
+  readonly campo: string;
+  readonly texto: string;
+}
 
 export function normalizarNomeFolha(nome: string): string {
   return nome.trim().toUpperCase();

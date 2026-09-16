@@ -10,6 +10,7 @@ import {
   type FolhaExtraida,
   type Limites,
   type LinhaDados,
+  type TipoOrigemCelula,
 } from "./safe-read.js";
 
 /**
@@ -63,8 +64,58 @@ function obterCelula(
   return sheet[addr] as XLSX.CellObject | undefined;
 }
 
-function celulaTexto(cell: XLSX.CellObject | undefined, linha: number, col: number): string {
-  if (!cell) return "";
+/*
+ * Assinaturas estruturais de conteúdo executável dentro do pacote:
+ * - OLE2/CFB (BIFF8 .xls): magic D0 CF 11 E0 A1 B1 1A E1;
+ * - OOXML com VBA: binário vbaProject.bin (magic de OLE CFB);
+ * - planilhas de macro do Excel 4/5 (macroEnabled);
+ * - controles ActiveX embutidos.
+ * A checagem é independente da extensão do nome do arquivo.
+ */
+const MAGIC_OLE_CFB = new Uint8Array([
+  0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1,
+]);
+
+function temMagicOle(bytes: Uint8Array): boolean {
+  if (bytes.length < MAGIC_OLE_CFB.length) return false;
+  return MAGIC_OLE_CFB.every((byte, index) => bytes[index] === byte);
+}
+
+/**
+ * Varre o ZIP do OOXML em busca de partes executáveis, sem depender da
+ * extensão: um .xlsm renomeado para .xlsx mantém vbaProject.bin no pacote.
+ * Busca direta no fluxo central do ZIP (método stored/deflate preserva os
+ * bytes do nome local do arquivo em ambos os headers).
+ */
+function detectarConteudoExecutavel(bytes: Uint8Array): void {
+  if (temMagicOle(bytes)) {
+    throw new LeituraSeguraError(
+      "Arquivo com estrutura OLE2/CFB (formato legado .xls ou macro-enabled) bloqueado. Reenvie como .xlsx sem macros.",
+    );
+  }
+  const marcadores: readonly string[] = [
+    "vbaProject.bin",
+    "vbaProjectSignature.bin",
+    "xl/macrosheets/",
+    "xl/activeX/",
+    "xl/vbaProject.bin",
+  ];
+  const texto = new TextDecoder("latin1").decode(bytes.subarray(0, 1_048_576));
+  for (const marcador of marcadores) {
+    if (texto.includes(marcador)) {
+      throw new LeituraSeguraError(
+        `Pacote contém conteúdo executável ("${marcador}") — macro ou controle ActiveX detectado por estrutura. Ingestão bloqueada.`,
+      );
+    }
+  }
+}
+
+function celulaTexto(
+  cell: XLSX.CellObject | undefined,
+  linha: number,
+  col: number,
+): { texto: string; tipoOrigem: TipoOrigemCelula } {
+  if (!cell) return { texto: "", tipoOrigem: "texto" };
   if (cell.t === "e") {
     // Célula de erro de fórmula (#REF!, #N/A, ...) — bloqueia a ingestão.
     throw new LeituraSeguraError(
@@ -77,10 +128,10 @@ function celulaTexto(cell: XLSX.CellObject | undefined, linha: number, col: numb
     );
   }
   const v = cell.v;
-  if (typeof v === "string") return v;
-  if (typeof v === "number") return String(v);
-  if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
-  return String(v ?? "");
+  if (typeof v === "string") return { texto: v, tipoOrigem: "texto" as const };
+  if (typeof v === "number") return { texto: String(v), tipoOrigem: "numero" as const };
+  if (typeof v === "boolean") return { texto: v ? "TRUE" : "FALSE", tipoOrigem: "booleano" as const };
+  return { texto: String(v ?? ""), tipoOrigem: "texto" as const };
 }
 
 /**
@@ -112,6 +163,9 @@ export function lerXlsx(
     );
   }
 
+  // Inspeção estrutural independente da extensão (macros/OLE renomeados).
+  detectarConteudoExecutavel(arquivo.bytes);
+
   let workbook: XLSX.WorkBook;
   try {
     // `dense: true` reduz consumo de memória; `cellText: false` evita gerar
@@ -124,7 +178,12 @@ export function lerXlsx(
   }
 
   // Workbooks criptografados/corrompidos: SheetJS devolve workbook sem folhas.
-  const nomesFolhas = workbook.SheetNames.slice(0, limites.maxFolhas);
+  if (workbook.SheetNames.length > limites.maxFolhas) {
+    throw new LeituraSeguraError(
+      `Arquivo contém ${workbook.SheetNames.length} folhas, acima do limite de ${limites.maxFolhas}. Rejeitado — divisão ou remoção é responsabilidade do operador.`,
+    );
+  }
+  const nomesFolhas = [...workbook.SheetNames];
   if (nomesFolhas.length === 0) {
     throw new LeituraSeguraError(
       "Arquivo não contém folhas legíveis. Pode estar criptografado ou corrompido — ingestão não autorizada.",
@@ -183,7 +242,7 @@ export function lerXlsx(
   const cabecalhos: string[] = [];
   for (let col = decoded.s.c; col <= decoded.e.c; col++) {
     const cell = obterCelula(sheet, linhaCabecalho - 1, col);
-    cabecalhos.push(celulaTexto(cell, linhaCabecalho, col));
+    cabecalhos.push(celulaTexto(cell, linhaCabecalho, col).texto);
   }
 
   const duplicados = detectarCabecalhosDuplicados(cabecalhos);
@@ -195,8 +254,8 @@ export function lerXlsx(
     const celulas: Celula[] = [];
     for (let col = decoded.s.c; col <= decoded.e.c; col++) {
       const cell = obterCelula(sheet, r, col);
-      const texto = celulaTexto(cell, numeroLinha, col);
-      celulas.push({ coluna: col, texto });
+      const info = celulaTexto(cell, numeroLinha, col);
+      celulas.push({ coluna: col, texto: info.texto, tipoOrigem: info.tipoOrigem });
     }
     linhas.push({ numero: numeroLinha, celulas });
   }

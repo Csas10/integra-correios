@@ -1,4 +1,12 @@
-import { normalizarCabecalho, type FolhaExtraida } from "./safe-read.js";
+import {
+  normalizarCabecalho,
+  CAMPOS_SENSIVEIS_A_ZEROS,
+  type FolhaExtraida,
+  type LinhaDados,
+} from "./safe-read.js";
+
+/** Origens com contrato próprio de obrigatoriedade. */
+export type OrigemMapeamento = "PF" | "PJ";
 
 /** Campos do domínio PF/PJ exigidos pela fundação (packages/domain). */
 export const CAMPOS_TODOS = [
@@ -20,16 +28,18 @@ export const CAMPOS_TODOS = [
 
 export type Campo = (typeof CAMPOS_TODOS)[number];
 
-export const CAMPOS_OBRIGATORIOS: readonly Campo[] = [
-  "ORIGEM",
-  "CODIGO",
-  "NOME",
-  "CPF_CNPJ",
-  "CEP",
-  "LOGRADOURO",
-  "CIDADE",
-  "UF",
-];
+/**
+ * Obrigatoriedade distinta por origem.
+ * - PF: campos do workflow de confirmação cadastral (pf-workflow).
+ * - PJ: razão social e fantasia, sem dependentes do fluxo PF.
+ * ORIGEM é sempre obrigatória (segregação de identidade).
+ */
+export const CAMPOS_OBRIGATORIOS: Readonly<
+  Record<OrigemMapeamento, readonly Campo[]>
+> = {
+  PF: ["ORIGEM", "CODIGO", "NOME", "CPF_CNPJ", "CEP", "LOGRADOURO", "CIDADE", "UF", "TELEFONE"],
+  PJ: ["ORIGEM", "CODIGO", "NOME", "NOME_FANTASIA", "CPF_CNPJ", "CEP", "LOGRADOURO", "CIDADE", "UF"],
+};
 
 /** Aliases canônicos usados na sugestão automática de mapeamento. */
 const ALIASES: Readonly<Record<Campo, readonly string[]>> = {
@@ -97,9 +107,15 @@ export interface Mapeamento {
   readonly itens: readonly ItemMapeamento[];
 }
 
+/**
+ * Valida o mapeamento contra a obrigatoriedade da origem informada.
+ * `origem` é a origem do fluxo de ingestão (PF ou PJ) — o mesmo conjunto
+ * de campos obrigatórios não se aplica às duas.
+ */
 export function validarMapeamento(
   mapeamento: Mapeamento,
   totalColunas: number,
+  origem: OrigemMapeamento,
 ): readonly string[] {
   const erros: string[] = [];
   const colunas = new Set<number>();
@@ -120,57 +136,98 @@ export function validarMapeamento(
     colunas.add(item.coluna);
     campos.add(item.campo);
   }
-  for (const obrigatorio of CAMPOS_OBRIGATORIOS) {
+  for (const obrigatorio of CAMPOS_OBRIGATORIOS[origem]) {
     if (!campos.has(obrigatorio)) {
-      erros.push(`Campo obrigatório não mapeado: ${obrigatorio}.`);
+      erros.push(`Campo obrigatório não mapeado (${origem}): ${obrigatorio}.`);
     }
   }
   return erros;
 }
 
-/** Perfil de mapeamento versionado (persistência e reuso entre importações). */
+/**
+ * Perfil de mapeamento versionado, reutilizável e auditável:
+ * registra a origem, a folha e a linha de cabeçalho para que a
+ * reaplicação a outro workbook seja inequívoca.
+ */
 export interface PerfilMapeamento {
   readonly nome: string;
   readonly versao: number;
+  readonly origem: OrigemMapeamento;
+  readonly folha: string | null;
+  readonly linhaCabecalho: number;
   readonly mapeamento: Mapeamento;
 }
 
 export function criarPerfil(
   nome: string,
   versao: number,
+  contexto: {
+    readonly origem: OrigemMapeamento;
+    readonly folha: string | null;
+    readonly linhaCabecalho: number;
+  },
   mapeamento: Mapeamento,
 ): PerfilMapeamento {
   if (!nome.trim()) throw new Error("Perfil exige nome.");
   if (!Number.isInteger(versao) || versao < 1) throw new Error("Versão deve ser inteiro >= 1.");
-  return { nome: nome.trim(), versao, mapeamento };
+  if (contexto.origem !== "PF" && contexto.origem !== "PJ") {
+    throw new Error("Perfil exige origem PF ou PJ.");
+  }
+  if (!Number.isInteger(contexto.linhaCabecalho) || contexto.linhaCabecalho < 1) {
+    throw new Error("linhaCabecalho do perfil deve ser inteiro >= 1.");
+  }
+  return {
+    nome: nome.trim(),
+    versao,
+    origem: contexto.origem,
+    folha: contexto.folha,
+    linhaCabecalho: contexto.linhaCabecalho,
+    mapeamento,
+  };
 }
 
 export interface LinhaMapeada {
   readonly numero: number;
   /** Valores por campo do domínio, preservados como texto cru. */
   readonly valores: Readonly<Partial<Record<Campo, string>>>;
+  /**
+   * Campos sensíveis a zeros à esquerda (CPF_CNPJ/CEP) cuja célula de
+   * origem era numérica — fail-closed, exige tratamento pelo operador.
+   */
+  readonly alertasNumericos: readonly string[];
 }
 
 export interface ResultadoAplicacao {
   readonly linhas: readonly LinhaMapeada[];
 }
 
-/** Aplica um mapeamento CONFIRMADO a uma folha extraída. */
+/**
+ * Aplica um mapeamento CONFIRMADO a uma folha extraída.
+ * Células numéricas mapeadas para campos sensíveis a zeros à esquerda
+ * (CPF_CNPJ, CEP) geram alerta — não são aceitas silenciosamente.
+ */
 export function aplicarMapeamento(
   folha: FolhaExtraida,
   mapeamento: Mapeamento,
+  origem: OrigemMapeamento,
 ): ResultadoAplicacao {
-  const erros = validarMapeamento(mapeamento, folha.cabecalhos.length);
+  const erros = validarMapeamento(mapeamento, folha.cabecalhos.length, origem);
   if (erros.length > 0) {
     throw new Error(`Mapeamento inválido: ${erros.join(" ")}`);
   }
-  const linhas = folha.linhas.map((linha) => {
+  const linhas = folha.linhas.map((linha: LinhaDados) => {
     const valores: Partial<Record<Campo, string>> = {};
+    const alertasNumericos: string[] = [];
     for (const item of mapeamento.itens) {
       const celula = linha.celulas[item.coluna];
       valores[item.campo] = celula ? celula.texto : "";
+      if (celula && celula.tipoOrigem === "numero" && CAMPOS_SENSIVEIS_A_ZEROS.has(item.campo)) {
+        alertasNumericos.push(
+          `${item.campo} (linha ${linha.numero}): célula numérica pode ter perdido zeros à esquerda — reformate a coluna como texto na planilha.`,
+        );
+      }
     }
-    return { numero: linha.numero, valores };
+    return { numero: linha.numero, valores, alertasNumericos };
   });
   return { linhas };
 }
@@ -183,20 +240,24 @@ export interface ResultadoValidacaoPfPj {
 
 /**
  * Validação PF/PJ das linhas mapeadas.
- * - ORIGEM deve ser PF ou PJ.
+ * - ORIGEM deve ser PF ou PJ e corresponder à origem do fluxo.
  * - CEP deve ter 8 dígitos (hífen tolerado).
- * - CPF/CNPJ devem ter dígitos verificadores válidos (se preenchidos).
+ * - CPF (PF) e CNPJ (PJ) têm validadores distintos.
  */
 export function validarLinhasPfPj(
   linhas: readonly LinhaMapeada[],
-  validarDocumento: (documento: string) => boolean,
+  origem: OrigemMapeamento,
+  validarCpf: (documento: string) => boolean,
+  validarCnpj: (documento: string) => boolean,
 ): readonly ResultadoValidacaoPfPj[] {
   return linhas.map((linha) => {
     const erros: string[] = [];
 
-    const origem = (linha.valores.ORIGEM ?? "").trim().toUpperCase();
-    if (origem !== "PF" && origem !== "PJ") {
-      erros.push(`ORIGEM inválida: "${linha.valores.ORIGEM ?? ""}" (use PF ou PJ).`);
+    const valorOrigem = (linha.valores.ORIGEM ?? "").trim().toUpperCase();
+    if (valorOrigem !== origem) {
+      erros.push(
+        `ORIGEM inválida: "${linha.valores.ORIGEM ?? ""}" (esperado ${origem} para este fluxo).`,
+      );
     }
 
     const cep = (linha.valores.CEP ?? "").replace(/\D/g, "");
@@ -205,8 +266,17 @@ export function validarLinhasPfPj(
     }
 
     const documento = (linha.valores.CPF_CNPJ ?? "").replace(/\D/g, "");
-    if (documento.length > 0 && !validarDocumento(documento)) {
-      erros.push(`CPF/CNPJ inválido: "${linha.valores.CPF_CNPJ ?? ""}".`);
+    const esperadoDigitos = origem === "PF" ? 11 : 14;
+    if (documento.length === 0) {
+      erros.push(`CPF/CNPJ vazio (obrigatório para ${origem}).`);
+    } else if (documento.length !== esperadoDigitos) {
+      erros.push(
+        `Documento com ${documento.length} dígitos — esperado ${esperadoDigitos} (${origem === "PF" ? "CPF" : "CNPJ"}).`,
+      );
+    } else if (origem === "PF" && !validarCpf(documento)) {
+      erros.push(`CPF inválido: "${linha.valores.CPF_CNPJ ?? ""}".`);
+    } else if (origem === "PJ" && !validarCnpj(documento)) {
+      erros.push(`CNPJ inválido: "${linha.valores.CPF_CNPJ ?? ""}".`);
     }
 
     if (!(linha.valores.CODIGO ?? "").trim()) {
@@ -216,4 +286,3 @@ export function validarLinhasPfPj(
     return { numeroLinha: linha.numero, valido: erros.length === 0, erros };
   });
 }
-

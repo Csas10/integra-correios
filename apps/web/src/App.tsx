@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { AppHeader } from "./components/AppHeader";
 import { AreaNavigation } from "./components/AreaNavigation";
+import { ConfirmationQueuePanel } from "./components/ConfirmationQueuePanel";
 import { MetricCard } from "./components/MetricCard";
 import { OriginFilter } from "./components/OriginFilter";
 import { WorkflowPanel } from "./components/WorkflowPanel";
+import { ConfirmationPage } from "./pages/ConfirmationPage";
 import {
   INDICADORES,
   obterArea,
@@ -21,6 +23,11 @@ const CONTROLES_FUNDACAO = [
 export function App() {
   const [areaAtiva, setAreaAtiva] = useState<AreaCockpit>("entrada");
   const [origem, setOrigem] = useState<ValorFiltroOrigem>("TODOS");
+
+  if (window.location.pathname.startsWith("/confirma/")) {
+    return <ConfirmationPage />;
+  }
+
   const area = obterArea(areaAtiva);
 
   return (
@@ -123,6 +130,8 @@ export function App() {
               </div>
             </aside>
           </div>
+
+          <ConfirmationQueuePanel />
 
           <WorkflowPanel ativa={areaAtiva} onChange={setAreaAtiva} />
         </main>

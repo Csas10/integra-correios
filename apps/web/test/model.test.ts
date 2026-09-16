@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AREAS_COCKPIT, FILTROS_ORIGEM, INDICADORES, obterArea } from "../src/model";
+import { AREAS_COCKPIT, FILTROS_ORIGEM, INDICADORES, PF_QUEUE_STAGES, obterArea } from "../src/model";
 
 describe("modelo do cockpit web", () => {
   it("mantém as cinco áreas na ordem operacional", () => {
@@ -23,5 +23,16 @@ describe("modelo do cockpit web", () => {
 
   it("resolve a configuração da área selecionada", () => {
     expect(obterArea("retornos").titulo).toBe("Reconciliar retornos");
+  });
+
+  it("expõe a fila PF sem valores cadastrais", () => {
+    expect(PF_QUEUE_STAGES.map((stage) => stage.id)).toEqual([
+      "triagem",
+      "aguardando",
+      "alteracoes",
+      "pendencias",
+      "aptos",
+    ]);
+    expect(PF_QUEUE_STAGES.every((stage) => !("valor" in stage))).toBe(true);
   });
 });

@@ -20,6 +20,8 @@
       "@integra-correios/correios": ["packages/correios/src/index.ts"],
       "@integra-correios/domain": ["packages/domain/src/index.ts"],
       "@integra-correios/importers": ["packages/importers/src/index.ts"],
+      "@integra-correios/mail": ["packages/mail/src/index.ts"],
+      "@integra-correios/pf-workflow": ["packages/pf-workflow/src/index.ts"],
       "@integra-correios/shared": ["packages/shared/src/index.ts"],
       "@integra-correios/validation": ["packages/validation/src/index.ts"]
     }

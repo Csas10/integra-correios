@@ -7,6 +7,8 @@
     { "path": "packages/audit" },
     { "path": "packages/importers" },
     { "path": "packages/correios" },
+    { "path": "packages/mail" },
+    { "path": "packages/pf-workflow" },
     { "path": "apps/web" },
     { "path": "apps/api" },
     { "path": "apps/worker" }

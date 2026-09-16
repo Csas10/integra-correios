@@ -94,11 +94,11 @@ d("round-trip OAuth em PostgreSQL real (sintético)", () => {
     );
     expect(new TextDecoder().decode(aberto)).toBe(`access-${id}`);
 
-    // Upsert atualiza sem duplicar (UNIQUE(provider, conta_fingerprint))
+    // Upsert idempotente: mesmo id + mesmo fingerprint atualiza os tokens
     await expect(
       repository.saveOauthConnection({
         connection: {
-          id: randomUUID(),
+          id,
           provider: "GMAIL",
           accountFingerprint: fingerprintHex,
           scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
@@ -111,7 +111,21 @@ d("round-trip OAuth em PostgreSQL real (sintético)", () => {
 
     const aposUpsert = await repository.loadGmailConnection(fingerprintHex);
     expect(aposUpsert?.scopes).toContain("https://www.googleapis.com/auth/gmail.readonly");
-    expect(aposUpsert?.id).toBe(id); // preserva o id original (WHERE id = EXCLUDED.id)
+    expect(aposUpsert?.id).toBe(id);
+
+    // Identidade estrita: id NOVO com fingerprint EXISTENTE é rejeitado
+    await expect(
+      repository.saveOauthConnection({
+        connection: {
+          id: randomUUID(),
+          provider: "GMAIL",
+          accountFingerprint: fingerprintHex,
+          scopes: ["https://www.googleapis.com/auth/gmail.send"],
+          accessToken: caixa.seal("outro-access", "oauth:access"),
+        },
+        auditEvent: { ...audit, id: randomUUID(), eventHash: "c".repeat(64) },
+      }),
+    ).rejects.toThrow("Conflito entre identidade OAuth e fingerprint");
 
     await pool.close();
   });

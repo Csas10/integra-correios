@@ -124,10 +124,17 @@ para importação, snapshots, confirmação, comunicação e auditoria. O docume
 recuperável, snapshots, payloads da outbox e tokens OAuth são cifrados na
 aplicação; deduplicação usa fingerprint HMAC, sem guardar CPF/CNPJ em texto.
 
-O clique futuro em “enviar” deverá somente criar confirmação, comunicação,
-outbox e eventos na mesma transação. O adapter Gmail e o worker de envio não
+O clique futuro em “enviar” deverá somente criar, atomicamente, na **mesma
+transação**: `lote_comunicacao`, `item_lote_comunicacao`, `confirmacao`,
+`comunicacao`, `outbox_email` e os `evento_auditoria` do lote e de cada item.
+Qualquer falha reverte o lote inteiro. O adapter Gmail e o worker de envio não
 fazem parte desta entrega. Consulte [database/README.md](database/README.md) e
 [ADR-004](docs/architecture/decisions/ADR-004-postgresql-futuro.md).
+
+Em produção, `integra_runtime` é uma role-grupo PostgreSQL `NOLOGIN`. A
+`DATABASE_URL` usa um login exclusivo do ambiente, provisionado fora do Git e
+associado por `GRANT integra_runtime`; o login administrativo de migrations é
+separado e não é usado pela aplicação.
 
 Consulte [docs/architecture/overview.md](docs/architecture/overview.md) para os
 limites completos da fundação.

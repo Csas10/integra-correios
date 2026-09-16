@@ -120,6 +120,15 @@ describe("rejeição de conteúdo perigoso", () => {
     injetado.set(new TextEncoder().encode("xl/vbaProject.bin"), bytes.length - 16);
     expect(() => lerXlsx({ nome: "com-vba.xlsx", bytes: injetado })).toThrow(/vbaProject/);
   });
+
+  it("detecta vbaProject.bin depois do primeiro MiB", () => {
+    const bytes = bytesXlsx(LINHAS);
+    const injetado = new Uint8Array(1_200_000);
+    injetado.set(bytes, 0);
+    injetado.set(new TextEncoder().encode("xl/vbaProject.bin"), 1_150_000);
+    expect(() => lerXlsx({ nome: "vba-tardio.xlsx", bytes: injetado }))
+      .toThrow(/vbaProject/);
+  });
 });
 
 describe("seleção de folha", () => {

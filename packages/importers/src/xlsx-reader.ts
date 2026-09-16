@@ -88,12 +88,18 @@ function detectarConteudoExecutavel(bytes: Uint8Array): void {
     "xl/activeX/",
     "xl/vbaProject.bin",
   ];
-  const texto = new TextDecoder("latin1").decode(bytes.subarray(0, 1_048_576));
-  for (const marcador of marcadores) {
-    if (texto.includes(marcador)) {
-      throw new LeituraSeguraError(
-        `Pacote contém conteúdo executável ("${marcador}") — macro ou controle ActiveX detectado por estrutura. Ingestão bloqueada.`,
-      );
+  const decoder = new TextDecoder("latin1");
+  const tamanhoBloco = 1_048_576;
+  const sobreposicao = Math.max(...marcadores.map((marcador) => marcador.length)) - 1;
+  for (let inicio = 0; inicio < bytes.length; inicio += tamanhoBloco) {
+    const fim = Math.min(bytes.length, inicio + tamanhoBloco + sobreposicao);
+    const texto = decoder.decode(bytes.subarray(inicio, fim));
+    for (const marcador of marcadores) {
+      if (texto.includes(marcador)) {
+        throw new LeituraSeguraError(
+          `Pacote contém conteúdo executável ("${marcador}") — macro ou controle ActiveX detectado por estrutura. Ingestão bloqueada.`,
+        );
+      }
     }
   }
 }

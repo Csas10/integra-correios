@@ -59,6 +59,27 @@ jobs:
       - name: PostgreSQL runtime roles migration
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0002_runtime_roles.sql
 
+      - name: PostgreSQL runtime role fail-closed regressions
+        shell: bash
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "ALTER ROLE integra_runtime INHERIT"
+          if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0002_runtime_roles.sql; then
+            echo "migration accepted integra_runtime with INHERIT" >&2
+            exit 1
+          fi
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "ALTER ROLE integra_runtime NOINHERIT"
+
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE integra_runtime_parent_test NOLOGIN"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "GRANT integra_runtime_parent_test TO integra_runtime"
+          if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0002_runtime_roles.sql; then
+            echo "migration accepted integra_runtime as member of another role" >&2
+            exit 1
+          fi
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "REVOKE integra_runtime_parent_test FROM integra_runtime"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "DROP ROLE integra_runtime_parent_test"
+
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0002_runtime_roles.sql
+
       - name: Tests
         run: npm test
 

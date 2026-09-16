@@ -35,98 +35,101 @@ d("round-trip OAuth em PostgreSQL real (sintético)", () => {
     const pool = new NodePostgresPool({
       connectionString: process.env.DATABASE_URL!,
     });
-    const repository = new PostgresOperationalRepository(pool);
-    const { id, access, refresh, fingerprintHex } = sintetico();
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      const { id, access, refresh, fingerprintHex } = sintetico();
 
-    const audit = {
-      id: randomUUID(),
-      aggregateType: "OAUTH_CONNECTION",
-      aggregateId: id,
-      type: "OAUTH_SINTETICO",
-      occurredAt: new Date().toISOString(),
-      eventHash: "8".repeat(64) + randomUUID().replaceAll("-", "").slice(0, 0) + "7".repeat(0),
-    };
-    // hash_evento é UNIQUE — garanta 64 hex distintos por execução
-    audit.eventHash = Array.from(
-      { length: 64 },
-      (_, i) => ((i + id.charCodeAt(i % id.length)) % 16).toString(16),
-    ).join("");
+      const audit = {
+        id: randomUUID(),
+        aggregateType: "OAUTH_CONNECTION",
+        aggregateId: id,
+        type: "OAUTH_SINTETICO",
+        occurredAt: new Date().toISOString(),
+        eventHash: "8".repeat(64) + randomUUID().replaceAll("-", "").slice(0, 0) + "7".repeat(0),
+      };
+      // hash_evento é UNIQUE — garanta 64 hex distintos por execução
+      audit.eventHash = Array.from(
+        { length: 64 },
+        (_, i) => ((i + id.charCodeAt(i % id.length)) % 16).toString(16),
+      ).join("");
 
-    await repository.saveOauthConnection({
-      connection: {
-        id,
-        provider: "GMAIL",
-        accountFingerprint: fingerprintHex,
-        scopes: ["https://www.googleapis.com/auth/gmail.send"],
-        accessToken: access,
-        refreshToken: refresh,
-        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-      },
-      auditEvent: audit,
-    });
-
-    const carregada = await repository.loadGmailConnection(fingerprintHex);
-    expect(carregada).toBeDefined();
-    expect(carregada!.id).toBe(id);
-    expect(carregada!.provider).toBe("GMAIL");
-    expect(carregada!.scopes).toContain("https://www.googleapis.com/auth/gmail.send");
-    expect(carregada!.accessToken.keyVersion).toBe("test-v1");
-    expect(carregada!.refreshToken?.keyVersion).toBe("test-v1");
-
-    // A coluna chave_versao NÃO contém ciphertext do refresh (bug corrigido)
-    const direto = await pool.query<{ chave_versao: string; refresh: Uint8Array | null }>(
-      `SELECT chave_versao, refresh_token_ciphertext AS refresh
-      FROM oauth_connection WHERE id = $1`,
-      [id],
-    );
-    expect(direto.rows[0]?.chave_versao).toBe("test-v1");
-    expect(Buffer.from(direto.rows[0]!.refresh!).equals(Buffer.from(refresh.ciphertext))).toBe(true);
-
-    // Decifração round-trip com os envelopes persistidos
-    const aberto = caixa.open(
-      {
-        ciphertext: carregada!.accessToken.ciphertext,
-        nonce: carregada!.accessToken.nonce,
-        authTag: carregada!.accessToken.authTag,
-        keyVersion: carregada!.accessToken.keyVersion,
-      },
-      "oauth:access",
-    );
-    expect(new TextDecoder().decode(aberto)).toBe(`access-${id}`);
-
-    // Upsert idempotente: mesmo id + mesmo fingerprint atualiza os tokens
-    await expect(
-      repository.saveOauthConnection({
+      await repository.saveOauthConnection({
         connection: {
           id,
           provider: "GMAIL",
           accountFingerprint: fingerprintHex,
-          scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
-          accessToken: caixa.seal("novo-access", "oauth:access"),
-          refreshToken: caixa.seal("novo-refresh", "oauth:refresh"),
-        },
-        auditEvent: { ...audit, id: randomUUID(), eventHash: "b".repeat(64) },
-      }),
-    ).resolves.toBeUndefined();
-
-    const aposUpsert = await repository.loadGmailConnection(fingerprintHex);
-    expect(aposUpsert?.scopes).toContain("https://www.googleapis.com/auth/gmail.readonly");
-    expect(aposUpsert?.id).toBe(id);
-
-    // Identidade estrita: id NOVO com fingerprint EXISTENTE é rejeitado
-    await expect(
-      repository.saveOauthConnection({
-        connection: {
-          id: randomUUID(),
-          provider: "GMAIL",
-          accountFingerprint: fingerprintHex,
           scopes: ["https://www.googleapis.com/auth/gmail.send"],
-          accessToken: caixa.seal("outro-access", "oauth:access"),
+          accessToken: access,
+          refreshToken: refresh,
+          expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
         },
-        auditEvent: { ...audit, id: randomUUID(), eventHash: "c".repeat(64) },
-      }),
-    ).rejects.toThrow("Conflito entre identidade OAuth e fingerprint");
+        auditEvent: audit,
+      });
 
-    await pool.close();
+      const carregada = await repository.loadGmailConnection(fingerprintHex);
+      expect(carregada).toBeDefined();
+      expect(carregada!.id).toBe(id);
+      expect(carregada!.provider).toBe("GMAIL");
+      expect(carregada!.scopes).toContain("https://www.googleapis.com/auth/gmail.send");
+      expect(carregada!.accessToken.keyVersion).toBe("test-v1");
+      expect(carregada!.refreshToken?.keyVersion).toBe("test-v1");
+
+      // A coluna chave_versao NÃO contém ciphertext do refresh (bug corrigido)
+      const direto = await pool.query<{ chave_versao: string; refresh: Uint8Array | null }>(
+        `SELECT chave_versao, refresh_token_ciphertext AS refresh
+        FROM oauth_connection WHERE id = $1`,
+        [id],
+      );
+      expect(direto.rows[0]?.chave_versao).toBe("test-v1");
+      expect(Buffer.from(direto.rows[0]!.refresh!).equals(Buffer.from(refresh.ciphertext))).toBe(true);
+
+      // Decifração round-trip com os envelopes persistidos
+      const aberto = caixa.open(
+        {
+          ciphertext: carregada!.accessToken.ciphertext,
+          nonce: carregada!.accessToken.nonce,
+          authTag: carregada!.accessToken.authTag,
+          keyVersion: carregada!.accessToken.keyVersion,
+        },
+        "oauth:access",
+      );
+      expect(new TextDecoder().decode(aberto)).toBe(`access-${id}`);
+
+      // Upsert idempotente: mesmo id + mesmo fingerprint atualiza os tokens
+      await expect(
+        repository.saveOauthConnection({
+          connection: {
+            id,
+            provider: "GMAIL",
+            accountFingerprint: fingerprintHex,
+            scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+            accessToken: caixa.seal("novo-access", "oauth:access"),
+            refreshToken: caixa.seal("novo-refresh", "oauth:refresh"),
+          },
+          auditEvent: { ...audit, id: randomUUID(), eventHash: "b".repeat(64) },
+        }),
+      ).resolves.toBeUndefined();
+
+      const aposUpsert = await repository.loadGmailConnection(fingerprintHex);
+      expect(aposUpsert?.scopes).toContain("https://www.googleapis.com/auth/gmail.readonly");
+      expect(aposUpsert?.id).toBe(id);
+
+      // Identidade estrita: id NOVO com fingerprint EXISTENTE é rejeitado
+      await expect(
+        repository.saveOauthConnection({
+          connection: {
+            id: randomUUID(),
+            provider: "GMAIL",
+            accountFingerprint: fingerprintHex,
+            scopes: ["https://www.googleapis.com/auth/gmail.send"],
+            accessToken: caixa.seal("outro-access", "oauth:access"),
+          },
+          auditEvent: { ...audit, id: randomUUID(), eventHash: "c".repeat(64) },
+        }),
+      ).rejects.toThrow("Conflito entre identidade OAuth e fingerprint");
+
+    } finally {
+      await pool.close();
+    }
   });
 });

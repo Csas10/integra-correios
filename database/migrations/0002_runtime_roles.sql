@@ -24,6 +24,29 @@ BEGIN
     -- fora da migration, recebe GRANT integra_runtime e permanece no
     -- gerenciador de segredos. Sem CREATEROLE/CREATEDB/BYPASSRLS.
     CREATE ROLE integra_runtime NOLOGIN NOINHERIT NOCREATEROLE NOCREATEDB NOSUPERUSER NOREPLICATION NOBYPASSRLS;
+  ELSIF EXISTS (
+    SELECT 1
+    FROM pg_roles
+    WHERE rolname = runtime_role_name
+      AND (
+        rolcanlogin OR rolinherit OR rolsuper OR rolcreaterole OR rolcreatedb OR
+        rolreplication OR rolbypassrls
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'role existente % viola os atributos de segurança do runtime',
+      runtime_role_name;
+  ELSIF EXISTS (
+    SELECT 1
+    FROM pg_auth_members membership
+    JOIN pg_roles member_role ON member_role.oid = membership.member
+    WHERE member_role.rolname = runtime_role_name
+  ) THEN
+    -- integra_runtime pode ser concedida a logins, mas não pode herdar outra
+    -- role: uma membership de saída ampliaria privilégios fora desta migration.
+    RAISE EXCEPTION
+      'role existente % não pode ser membro de outras roles',
+      runtime_role_name;
   END IF;
 END
 $$;

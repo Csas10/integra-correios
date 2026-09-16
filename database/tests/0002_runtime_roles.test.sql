@@ -24,9 +24,21 @@ BEGIN
   IF EXISTS (
     SELECT 1 FROM pg_roles
     WHERE rolname = runtime_role
-      AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls OR rolcanlogin)
+      AND (
+        rolcanlogin OR rolinherit OR rolsuper OR rolcreaterole OR rolcreatedb OR
+        rolreplication OR rolbypassrls
+      )
   ) THEN
-    RAISE EXCEPTION 'runtime deve ser NOLOGIN e sem privilégios administrativos';
+    RAISE EXCEPTION 'runtime deve ser NOLOGIN/NOINHERIT e sem privilégios administrativos';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_auth_members membership
+    JOIN pg_roles member_role ON member_role.oid = membership.member
+    WHERE member_role.rolname = runtime_role
+  ) THEN
+    RAISE EXCEPTION 'runtime não pode ser membro de outras roles';
   END IF;
 
   IF has_schema_privilege(runtime_role, 'public', 'CREATE') THEN

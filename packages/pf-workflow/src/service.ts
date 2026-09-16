@@ -16,6 +16,14 @@ function now(dependencies: PfWorkflowDependencies): Date {
   return dependencies.clock?.() ?? new Date();
 }
 
+function buildConfirmationUrl(baseUrl: string, plainToken: string): string {
+  const base = new URL(baseUrl);
+  if (base.protocol !== "https:" || base.username || base.password) {
+    throw new Error("confirmationBaseUrl deve usar HTTPS e não conter credenciais");
+  }
+  return new URL(`/confirma/${encodeURIComponent(plainToken)}`, base).toString();
+}
+
 function move(
   state: PfWorkflowState,
   to: PfConfirmationStatus,
@@ -54,14 +62,13 @@ export class PfConfirmationWorkflow {
     return move(state, "EMAIL_PENDENTE", this.dependencies);
   }
 
-  async sendEmail(state: PfWorkflowState): Promise<{ state: PfWorkflowState; token: string }> {
-    const prepared = move(state, "EMAIL_ENVIADO", this.dependencies);
+  async sendEmail(state: PfWorkflowState): Promise<PfWorkflowState> {
     const token = await this.dependencies.tokens.issue();
     const issuedAt = now(this.dependencies);
     const confirmationId = this.dependencies.idFactory?.() ?? crypto.randomUUID();
     const confirmation = {
       id: confirmationId,
-      professionalId: prepared.professional.id,
+      professionalId: state.professional.id,
       tokenHash: token.tokenHash,
       issuedAt: issuedAt.toISOString(),
       expiresAt: new Date(
@@ -72,24 +79,33 @@ export class PfConfirmationWorkflow {
     };
     const confirmationEvent: PfAuditEvent = {
       id: this.dependencies.auditIdFactory?.() ?? crypto.randomUUID(),
-      professionalId: prepared.professional.id,
+      professionalId: state.professional.id,
       type: "PF_CONFIRMATION_ISSUED",
       occurredAt: issuedAt.toISOString(),
       metadata: { confirmationId },
     };
+    const issued: PfWorkflowState = {
+      ...state,
+      confirmation,
+      audit: [...state.audit, confirmationEvent],
+    };
+    const confirmationUrl = buildConfirmationUrl(
+      this.dependencies.confirmationBaseUrl,
+      token.plainToken,
+    );
     const message = renderPfConfirmationMail({
       confirmationId,
-      professionalId: prepared.professional.id,
-      recipient: prepared.professional.original.email,
-      professionalName: prepared.professional.original.nome,
+      professionalId: state.professional.id,
+      recipient: state.professional.original.email,
+      professionalName: state.professional.original.nome,
       replyTo: "carteiras@instituicao.example",
-      confirmationPath: `/confirma/${token.plainToken}`,
+      confirmationUrl,
     });
     const receipt: MailReceipt = await this.dependencies.mail.send(message);
-    const awaiting = move(prepared, "AGUARDANDO_CONFIRMACAO", this.dependencies);
+    const sent = move(issued, "EMAIL_ENVIADO", this.dependencies);
     const communication = {
       id: this.dependencies.idFactory?.() ?? crypto.randomUUID(),
-      professionalId: awaiting.professional.id,
+      professionalId: sent.professional.id,
       confirmationId,
       provider: receipt.provider,
       providerMessageId: receipt.messageId,
@@ -99,20 +115,19 @@ export class PfConfirmationWorkflow {
     };
     const communicationEvent: PfAuditEvent = {
       id: this.dependencies.auditIdFactory?.() ?? crypto.randomUUID(),
-      professionalId: awaiting.professional.id,
+      professionalId: sent.professional.id,
       type: "PF_COMMUNICATION_ACCEPTED",
       occurredAt: receipt.acceptedAt,
       metadata: { provider: receipt.provider, messageId: receipt.messageId },
     };
-    return {
-      token: token.plainToken,
-      state: {
-        ...awaiting,
-        confirmation,
-        communication,
-        audit: [...awaiting.audit, confirmationEvent, communicationEvent],
-      },
+    const accepted: PfWorkflowState = {
+      ...sent,
+      communication,
+      audit: [...sent.audit, communicationEvent],
     };
+    const awaiting = move(accepted, "AGUARDANDO_CONFIRMACAO", this.dependencies);
+    await this.dependencies.confirmations.registerPending(confirmation);
+    return awaiting;
   }
 
   async submitConfirmation(
@@ -123,18 +138,27 @@ export class PfConfirmationWorkflow {
     const confirmation = state.confirmation;
     if (!confirmation) throw new Error("Confirmação inexistente");
     if (confirmation.status !== "PENDING") throw new Error("Token já utilizado");
-    if (new Date(confirmation.expiresAt) <= now(this.dependencies)) throw new Error("Token expirado");
-    if ((await this.dependencies.tokens.hash(plainToken)) !== confirmation.tokenHash) {
+    const consumedAt = now(this.dependencies);
+    if (new Date(confirmation.expiresAt) <= consumedAt) throw new Error("Token expirado");
+    const tokenHash = await this.dependencies.tokens.hash(plainToken);
+    if (tokenHash !== confirmation.tokenHash) {
       throw new Error("Token inválido");
     }
     const snapshot = submission.decision === "CONFIRMAR" ? state.professional.original : submission.snapshot;
     if (!snapshot) throw new Error("Dados atualizados ausentes");
     const nextStatus = submission.decision === "CONFIRMAR" ? "CONFIRMADO_SEM_ALTERACAO" : "CONFIRMADO_COM_ALTERACAO";
+    validarTransicaoPf(state.professional.status, nextStatus);
+    const consumed = await this.dependencies.confirmations.consumePending({
+      confirmationId: confirmation.id,
+      tokenHash,
+      usedAt: consumedAt.toISOString(),
+    });
+    if (!consumed) throw new Error("Token já utilizado ou expirado");
     const moved = move(state, nextStatus, this.dependencies, { decision: submission.decision });
     return {
       ...moved,
       professional: { ...moved.professional, confirmed: structuredClone(snapshot) },
-      confirmation: { ...confirmation, status: "SUBMITTED", usedAt: now(this.dependencies).toISOString() },
+      confirmation: consumed,
     };
   }
 

@@ -16,7 +16,9 @@ validável. A aplicação não deve ficar presa a um provedor de e-mail.
 - modelar o workflow PF com estados explícitos de triagem, comunicação,
   confirmação, validação e pré-postagem;
 - manter `original` e `confirmed` separados, sem sobrescrita silenciosa;
-- emitir tokens aleatórios, guardar apenas hash, expiração e uso;
+- emitir tokens aleatórios de 256 bits, guardar apenas hash, expiração e uso;
+- construir URL absoluta HTTPS a partir de `confirmationBaseUrl` injetada;
+- consumir o token pelo contrato atômico `ConfirmationOwnership`;
 - versionar o template `pf-confirmation-v1`;
 - depender de `MailGateway` e `ConversationGateway`, não de SDKs de provedor;
 - reservar adapters Gmail, Microsoft Graph e Resend para fases posteriores;
@@ -30,3 +32,7 @@ sintéticos, sem credenciais ou tráfego externo. A integração autorizada deve
 adicionar persistência, autenticação do formulário, idempotência de worker,
 webhooks de entrega e tratamento de respostas sem alterar os contratos do
 domínio.
+
+O adapter em memória garante compare-and-set somente no mesmo processo. A
+garantia entre réplicas ou workers depende do futuro adapter PostgreSQL e não é
+alegada por esta decisão.

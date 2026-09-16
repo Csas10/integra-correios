@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ufBrasileiraValida } from "@integra-correios/validation";
 
 interface ConfirmationForm {
   readonly decision: "CONFIRMAR" | "ATUALIZAR";
@@ -29,7 +30,7 @@ function validate(form: ConfirmationForm): string | undefined {
   if (!form.logradouro.trim() || !form.numero.trim() || !form.bairro.trim() || !form.cidade.trim()) {
     return "Preencha o endereço completo.";
   }
-  if (!/^[A-Za-z]{2}$/.test(form.uf.trim())) return "Informe uma UF válida.";
+  if (!ufBrasileiraValida(form.uf)) return "Informe uma UF válida.";
   if (form.cep.replace(/\D/g, "").length !== 8) return "Informe um CEP com 8 dígitos.";
   if (!form.telefone.trim()) return "Informe um telefone para contato.";
   return undefined;
@@ -51,7 +52,7 @@ export function ConfirmationPage() {
       setFeedback(error);
       return;
     }
-    setFeedback("Solicitação registrada para processamento seguro.");
+    setFeedback("Validação local concluída. O envio será habilitado após a integração autorizada.");
   }
 
   return (

@@ -9,13 +9,15 @@ describe("contratos de comunicação PF", () => {
       recipient: "teste@example.invalid",
       professionalName: "Pessoa <Teste>",
       replyTo: "carteiras@instituicao.example",
-      confirmationPath: "/confirma/token-sintetico",
+      confirmationUrl: "https://app.example.invalid/confirma/token-sintetico",
     });
 
     expect(message.templateVersion).toBe("pf-confirmation-v1");
     expect(message.idempotencyKey).toBe("pf-confirmation:confirmation-test-001");
     expect(message.htmlBody).toContain("Pessoa &lt;Teste&gt;");
     expect(message.htmlBody).not.toContain("Pessoa <Teste>");
+    expect(message.textBody).toContain("https://app.example.invalid/confirma/token-sintetico");
+    expect(message.htmlBody).toContain('href="https://app.example.invalid/confirma/token-sintetico"');
     expect(message.to).toBe("teste@example.invalid");
   });
 

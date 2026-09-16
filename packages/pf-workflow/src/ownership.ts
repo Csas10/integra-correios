@@ -1,9 +1,10 @@
-import type { ConfirmationRecord } from "./model.js";
+import type { ConfirmationDecision, ConfirmationRecord } from "./model.js";
 
 export interface ConsumePendingConfirmation {
   readonly confirmationId: string;
   readonly tokenHash: string;
   readonly usedAt: string;
+  readonly decision: ConfirmationDecision;
 }
 
 export interface ConfirmationOwnership {
@@ -42,6 +43,7 @@ export class InMemoryConfirmationOwnership implements ConfirmationOwnership {
       ...current,
       status: "SUBMITTED",
       usedAt: command.usedAt,
+      decision: command.decision,
     };
     this.confirmations.set(command.confirmationId, consumed);
     return structuredClone(consumed);

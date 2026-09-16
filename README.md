@@ -19,9 +19,11 @@ entrada, saída ou evidência; não são o estado transacional da aplicação.
 - cockpit Apps Script somente leitura para o ecossistema Sheets/Drive atual;
 - baseline Apps Script V1.8.5 preservada sem reformatação;
 - CI com gates independentes de typecheck, testes, build e política do repositório.
+- PostgreSQL transacional para intake, snapshots, confirmações, comunicações e auditoria;
+- outbox de e-mail persistente, ainda sem adapter Gmail nem envio operacional.
 
-Não existem neste repositório bases cadastrais, consultas SQL, migrations, seeds,
-credenciais, arquivos `.env`, templates XLSX binários nem chamadas reais ao PPN.
+Não existem neste repositório bases cadastrais, seeds, credenciais, arquivos `.env`,
+templates XLSX binários nem chamadas reais ao PPN.
 O envio de e-mail permanece desabilitado por padrão e não é executado pelos gates.
 
 ## Áreas do cockpit
@@ -54,6 +56,10 @@ packages/
   shared/                 tipos utilitários
   mail/                   MailGateway, ConversationGateway e templates versionados
   pf-workflow/            triagem, confirmação, validação e gate APTO_PREPOSTAGEM
+  persistence/            contratos, criptografia e adapter PostgreSQL
+database/
+  migrations/             schema operacional versionado
+  tests/                  regressões SQL transacionais sem dados reais
 assets/correios/templates/ manifesto dos originais mantidos fora do GitHub
 docs/                     arquitetura, decisões e homologação
 legacy/apps-script/       baseline V1.8.5 congelada
@@ -63,6 +69,7 @@ legacy/apps-script/       baseline V1.8.5 congelada
 
 - Node.js 22 ou 24
 - npm 10 ou superior
+- PostgreSQL 16 para os testes de constraints da migration
 
 ## Gates locais
 
@@ -85,7 +92,8 @@ compilação real e verificação de que artefatos proibidos não entraram no Gi
 | Google Sheets/Drive | adaptador do cockpit; sem IDs no código novo |
 | Correios PPN | contrato e serialização puros; rede desabilitada |
 | Resend | adapter de homologação; envio bloqueado sem modo, segredo e whitelist explícitos |
-| PostgreSQL | evolução documentada; não implementado nesta fase |
+| PostgreSQL | schema operacional e adapter implementados; sem dados ou conexão de produção |
+| Gmail | somente contratos de credencial/outbox; API e envio não implementados |
 | Vercel | Preview da branch; produção continua vinculada à `main` |
 
 ## Confirmação cadastral PF
@@ -108,6 +116,18 @@ identificadores, status e timestamp. Consulte
 
 Essa etapa não persiste confirmações, não cria outbox, não promove registros a
 `APTO_PREPOSTAGEM` e não autoriza comunicação com profissionais reais.
+
+## Persistência operacional
+
+A migration `0001_operational_persistence.sql` introduz a fronteira transacional
+para importação, snapshots, confirmação, comunicação e auditoria. O documento
+recuperável, snapshots, payloads da outbox e tokens OAuth são cifrados na
+aplicação; deduplicação usa fingerprint HMAC, sem guardar CPF/CNPJ em texto.
+
+O clique futuro em “enviar” deverá somente criar confirmação, comunicação,
+outbox e eventos na mesma transação. O adapter Gmail e o worker de envio não
+fazem parte desta entrega. Consulte [database/README.md](database/README.md) e
+[ADR-004](docs/architecture/decisions/ADR-004-postgresql-futuro.md).
 
 Consulte [docs/architecture/overview.md](docs/architecture/overview.md) para os
 limites completos da fundação.

@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@integra-correios/correios": "*",
-    "@integra-correios/domain": "*"
+    "@integra-correios/domain": "*",
+    "@integra-correios/mail": "*",
+    "@integra-correios/pf-workflow": "*"
   }
 }

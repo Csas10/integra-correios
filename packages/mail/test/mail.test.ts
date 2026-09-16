@@ -13,7 +13,9 @@ describe("contratos de comunicação PF", () => {
     });
 
     expect(message.templateVersion).toBe("pf-confirmation-v1");
-    expect(message.idempotencyKey).toBe("pf-confirmation:confirmation-test-001");
+    expect(message.idempotencyKey).toBe(
+      "pf-confirmation:confirmation-test-001:pf-confirmation-v1",
+    );
     expect(message.htmlBody).toContain("Pessoa &lt;Teste&gt;");
     expect(message.htmlBody).not.toContain("Pessoa <Teste>");
     expect(message.textBody).toContain("https://app.example.invalid/confirma/token-sintetico");

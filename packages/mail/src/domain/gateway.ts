@@ -11,3 +11,17 @@ export class MailProviderNaoConfiguradoError extends Error {
     this.name = "MailProviderNaoConfiguradoError";
   }
 }
+
+export class DestinatarioNaoAutorizadoError extends Error {
+  constructor() {
+    super("Destinatário fora da whitelist de homologação");
+    this.name = "DestinatarioNaoAutorizadoError";
+  }
+}
+
+export class MailProviderRequestError extends Error {
+  constructor(provider: string, operation: string) {
+    super(`Falha do provedor ${provider} durante ${operation}`);
+    this.name = "MailProviderRequestError";
+  }
+}

@@ -107,6 +107,7 @@ export interface PfWorkflowDependencies {
   readonly confirmations: import("./ownership.js").ConfirmationOwnership;
   readonly tokens: TokenService;
   readonly confirmationBaseUrl: string;
+  readonly confirmationReplyTo: string;
   readonly clock?: () => Date;
   readonly confirmationTtlMs?: number;
   readonly idFactory?: () => string;

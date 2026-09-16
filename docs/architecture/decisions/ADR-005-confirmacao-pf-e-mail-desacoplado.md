@@ -21,17 +21,17 @@ validável. A aplicação não deve ficar presa a um provedor de e-mail.
 - consumir o token pelo contrato atômico `ConfirmationOwnership`;
 - versionar o template `pf-confirmation-v1`;
 - depender de `MailGateway` e `ConversationGateway`, não de SDKs de provedor;
-- reservar adapters Gmail, Microsoft Graph e Resend para fases posteriores;
+- permitir adapters Gmail, Microsoft Graph e Resend atrás do `MailGateway`;
 - bloquear a criação de lote salvo estado `APTO_PREPOSTAGEM`;
 - registrar cada mudança e emissão/aceite da comunicação em eventos append-only.
 
 ## Consequências
 
 A fundação pode ser testada integralmente com gateways falsos e dados
-sintéticos, sem credenciais ou tráfego externo. A integração autorizada deverá
-adicionar persistência, autenticação do formulário, idempotência de worker,
-webhooks de entrega e tratamento de respostas sem alterar os contratos do
-domínio.
+sintéticos. A homologação técnica do Resend é regulada pela ADR-006 e não
+representa ativação operacional. A integração operacional deverá adicionar
+persistência, autenticação do formulário, idempotência de worker, outbox e
+tratamento de respostas sem alterar os contratos do domínio.
 
 O adapter em memória garante compare-and-set somente no mesmo processo. A
 garantia entre réplicas ou workers depende do futuro adapter PostgreSQL e não é

@@ -13,5 +13,9 @@
   },
   "scripts": {
     "build": "tsc -b"
+  },
+  "dependencies": {
+    "@integra-correios/validation": "*",
+    "resend": "^6.28.1"
   }
 }

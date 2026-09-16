@@ -110,6 +110,8 @@ describe("saveOauthConnection — correspondência placeholders × colunas", () 
     expect(placeholders).toHaveLength(11);
     expect(placeholders).toEqual(Array.from({ length: 11 }, (_, i) => i + 1));
     expect(call!.values).toHaveLength(11);
+    expect(call!.text).toContain("WHERE oauth_connection.id = EXCLUDED.id");
+    expect(call!.text).not.toContain("xmax");
   });
 
   it("vincula explicitamente cada campo cifrado à coluna correta", async () => {

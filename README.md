@@ -131,5 +131,10 @@ Qualquer falha reverte o lote inteiro. O adapter Gmail e o worker de envio não
 fazem parte desta entrega. Consulte [database/README.md](database/README.md) e
 [ADR-004](docs/architecture/decisions/ADR-004-postgresql-futuro.md).
 
+Em produção, `integra_runtime` é uma role-grupo PostgreSQL `NOLOGIN`. A
+`DATABASE_URL` usa um login exclusivo do ambiente, provisionado fora do Git e
+associado por `GRANT integra_runtime`; o login administrativo de migrations é
+separado e não é usado pela aplicação.
+
 Consulte [docs/architecture/overview.md](docs/architecture/overview.md) para os
 limites completos da fundação.

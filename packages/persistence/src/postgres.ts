@@ -380,8 +380,8 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
           expira_em = EXCLUDED.expira_em,
           revogada_em = NULL,
           atualizada_em = now()
-        RETURNING id,
-        (xmax = 0) AS inseriu`,
+        WHERE oauth_connection.id = EXCLUDED.id
+        RETURNING id`,
         [
           connection.id,
           connection.accountFingerprint,
@@ -403,10 +403,10 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
           connection.expiresAt ?? null,
         ],
       );
-      // Upsert idempotente: mesmo (provider, conta_fingerprint) atualiza a
-      // linha existente, preservando o id original. Um id NOVO enviado com
-      // fingerprint EXISTENTE indica violação de identidade — rejeita.
-      if (saved.rows[0]?.inseriu === false && saved.rows[0]!.id !== connection.id) {
+      // Mesmo id + fingerprint atualiza; novo id + fingerprint existente não
+      // satisfaz o WHERE do conflito e retorna zero linhas. A regra usa apenas
+      // semântica SQL pública, sem depender de colunas internas MVCC (xmax).
+      if (saved.rowCount !== 1 || saved.rows[0]?.id !== connection.id) {
         throw new Error("Conflito entre identidade OAuth e fingerprint da conta");
       }
       await insertAudit(sql, command.auditEvent);

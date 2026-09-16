@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/shared" },
+    { "path": "packages/domain" },
+    { "path": "packages/validation" },
+    { "path": "packages/audit" },
+    { "path": "packages/importers" },
+    { "path": "packages/correios" },
+    { "path": "apps/web" },
+    { "path": "apps/api" },
+    { "path": "apps/worker" }
+  ]
+}

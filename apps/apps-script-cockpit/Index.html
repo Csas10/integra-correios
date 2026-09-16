@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <base target="_top">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Integra Correios</title>
+    <style>
+      :root { color-scheme: light; font-family: Arial, sans-serif; background: #f4f7f6; color: #16352f; }
+      * { box-sizing: border-box; }
+      body { margin: 0; }
+      header { background: #0f5d50; color: #fff; padding: 20px 24px; }
+      h1 { margin: 0; font-size: 22px; }
+      nav { display: flex; gap: 8px; padding: 14px 24px; background: #fff; border-bottom: 1px solid #d8e2df; overflow-x: auto; }
+      nav button, .filters button { border: 1px solid #b7cbc5; background: #fff; color: #16483f; border-radius: 7px; padding: 9px 13px; cursor: pointer; }
+      nav button[aria-current="page"], .filters button[aria-pressed="true"] { background: #d9eee8; border-color: #0f5d50; }
+      main { max-width: 1080px; margin: 0 auto; padding: 28px 24px; }
+      .filters { display: flex; gap: 8px; margin: 18px 0; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; }
+      .card { background: #fff; border: 1px solid #d8e2df; border-radius: 10px; padding: 18px; }
+      .label { color: #4f6b65; font-size: 13px; }
+      .value { margin-top: 8px; font-size: 28px; font-weight: 700; }
+      .status { min-height: 22px; color: #4f6b65; }
+      .error { color: #a42222; }
+    </style>
+  </head>
+  <body>
+    <header><h1>Integra Correios</h1></header>
+    <nav aria-label="Fluxo operacional">
+      <button aria-current="page">Entrada</button>
+      <button disabled>Validação</button>
+      <button disabled>Lotes</button>
+      <button disabled>Retornos</button>
+      <button disabled>Gestão</button>
+    </nav>
+    <main>
+      <h2>Resumo da entrada</h2>
+      <p>Contagens agregadas da planilha autorizada. Nenhum cadastro é exibido.</p>
+      <div class="filters" aria-label="Origem">
+        <button data-origin="TODOS" aria-pressed="true">Todos</button>
+        <button data-origin="PF" aria-pressed="false">Profissionais</button>
+        <button data-origin="PJ" aria-pressed="false">Empresas</button>
+      </div>
+      <p id="status" class="status" role="status">Carregando…</p>
+      <section class="grid" aria-label="Indicadores">
+        <article class="card"><div class="label">Recebidos</div><div class="value" id="recebidos">—</div></article>
+        <article class="card"><div class="label">Documentos válidos</div><div class="value" id="documentosValidos">—</div></article>
+        <article class="card"><div class="label">CEPs válidos</div><div class="value" id="cepsValidos">—</div></article>
+        <article class="card"><div class="label">Pendências</div><div class="value" id="pendencias">—</div></article>
+        <article class="card"><div class="label">Prontos</div><div class="value" id="prontos">—</div></article>
+      </section>
+    </main>
+    <script>
+      let resumo;
+      let origem = 'TODOS';
+      const campos = ['recebidos', 'documentosValidos', 'cepsValidos', 'pendencias', 'prontos'];
+
+      function render() {
+        if (!resumo) return;
+        const valores = origem === 'TODOS'
+          ? Object.fromEntries(campos.map((campo) => [campo, resumo.PF[campo] + resumo.PJ[campo]]))
+          : resumo[origem];
+        campos.forEach((campo) => { document.getElementById(campo).textContent = valores[campo].toLocaleString('pt-BR'); });
+        document.getElementById('status').textContent = `Atualizado em ${new Date(resumo.geradoEm).toLocaleString('pt-BR')}`;
+      }
+
+      document.querySelectorAll('[data-origin]').forEach((button) => {
+        button.addEventListener('click', () => {
+          origem = button.dataset.origin;
+          document.querySelectorAll('[data-origin]').forEach((item) => item.setAttribute('aria-pressed', String(item === button)));
+          render();
+        });
+      });
+
+      google.script.run
+        .withSuccessHandler((data) => { resumo = data; render(); })
+        .withFailureHandler((error) => {
+          const status = document.getElementById('status');
+          status.className = 'status error';
+          status.textContent = error && error.message ? error.message : 'Não foi possível carregar o resumo.';
+        })
+        .obterResumoCockpit();
+    </script>
+  </body>
+</html>

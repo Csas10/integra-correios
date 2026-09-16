@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "composite": true,
+    "baseUrl": ".",
+    "paths": {
+      "@integra-correios/audit": ["packages/audit/src/index.ts"],
+      "@integra-correios/correios": ["packages/correios/src/index.ts"],
+      "@integra-correios/domain": ["packages/domain/src/index.ts"],
+      "@integra-correios/importers": ["packages/importers/src/index.ts"],
+      "@integra-correios/shared": ["packages/shared/src/index.ts"],
+      "@integra-correios/validation": ["packages/validation/src/index.ts"]
+    }
+  }
+}

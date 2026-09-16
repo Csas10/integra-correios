@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "rootDir": "src",
+    "outDir": ".tsc",
+    "tsBuildInfoFile": ".tsc/tsconfig.tsbuildinfo"
+  },
+  "references": [{ "path": "../../packages/domain" }],
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
+}

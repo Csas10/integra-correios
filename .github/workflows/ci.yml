@@ -45,4 +45,6 @@ jobs:
         run: npm run build:web
 
       - name: Git whitespace check
-        run: git diff --check HEAD^
+        # Vendor de terceiros (SheetJS) preserva o whitespace original do
+        # fornecedor — a verificação cobre apenas o código próprio.
+        run: git diff --check HEAD^ -- . ':(exclude)vendor/**'

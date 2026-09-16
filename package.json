@@ -26,5 +26,8 @@
     "@types/node": "22.20.3",
     "typescript": "5.9.3",
     "vitest": "3.2.7"
+  },
+  "dependencies": {
+    "xlsx": "file:vendor/xlsx-0.20.3.tgz"
   }
 }

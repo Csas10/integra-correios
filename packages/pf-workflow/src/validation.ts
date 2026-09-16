@@ -1,4 +1,9 @@
-import { cpfValido, normalizarCep } from "@integra-correios/validation";
+import {
+  cpfValido,
+  emailValido,
+  normalizarCep,
+  ufBrasileiraValida,
+} from "@integra-correios/validation";
 import type { PfCadastreSnapshot } from "./model.js";
 
 export interface PfValidationResult {
@@ -10,13 +15,13 @@ export function validarCadastroPf(snapshot: PfCadastreSnapshot): PfValidationRes
   const issues: string[] = [];
   if (!cpfValido(snapshot.documento)) issues.push("CPF inválido");
   if (snapshot.nome.trim().length < 2) issues.push("Nome obrigatório");
-  if (!snapshot.email.includes("@")) issues.push("E-mail inválido");
+  if (!emailValido(snapshot.email)) issues.push("E-mail inválido");
   if (!snapshot.telefone.trim()) issues.push("Telefone obrigatório");
   if (!snapshot.endereco.logradouro.trim()) issues.push("Logradouro obrigatório");
   if (!snapshot.endereco.numero.trim()) issues.push("Número obrigatório");
   if (!snapshot.endereco.bairro.trim()) issues.push("Bairro obrigatório");
   if (!snapshot.endereco.cidade.trim()) issues.push("Cidade obrigatória");
-  if (!/^[A-Z]{2}$/.test(snapshot.endereco.uf)) issues.push("UF inválida");
+  if (!ufBrasileiraValida(snapshot.endereco.uf)) issues.push("UF inválida");
   try {
     normalizarCep(snapshot.endereco.cep);
   } catch {

@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { MailGateway, OutboundMail } from "@integra-correios/mail";
 import {
   assertAptoParaPrePostagem,
+  createWebTokenService,
   criarProfissionalPf,
+  InMemoryConfirmationOwnership,
   PfConfirmationWorkflow,
+  validarCadastroPf,
   type PfCadastreSnapshot,
   type PfWorkflowState,
   type TokenPair,
@@ -75,9 +78,12 @@ class FakeMailGateway implements MailGateway {
 
 function criarCenario() {
   const mail = new FakeMailGateway();
+  const confirmations = new InMemoryConfirmationOwnership();
   const workflow = new PfConfirmationWorkflow({
     mail,
+    confirmations,
     tokens: new FakeTokenService(),
+    confirmationBaseUrl: "https://app.example.invalid",
     clock: () => new Date("2026-09-16T00:00:00.000Z"),
     confirmationTtlMs: 60_000,
   });
@@ -85,7 +91,7 @@ function criarCenario() {
     professional: criarProfissionalPf("TESTE-001", ORIGINAL),
     audit: [],
   };
-  return { mail, workflow, initial };
+  return { confirmations, mail, workflow, initial };
 }
 
 describe("workflow de confirmação cadastral PF", () => {
@@ -95,17 +101,30 @@ describe("workflow de confirmação cadastral PF", () => {
     const prepared = workflow.prepareEmail(triaged);
     const sent = await workflow.sendEmail(prepared);
 
-    expect(sent.state.professional.status).toBe("AGUARDANDO_CONFIRMACAO");
-    expect(sent.state.confirmation?.tokenHash).toBe("hash-opaque-digest");
-    expect(JSON.stringify(sent.state)).not.toContain("token-sintetico");
+    expect(sent.professional.status).toBe("AGUARDANDO_CONFIRMACAO");
+    expect(sent.confirmation?.tokenHash).toBe("hash-opaque-digest");
+    expect(JSON.stringify(sent)).not.toContain("token-sintetico");
     expect(mail.sent[0]?.templateVersion).toBe("pf-confirmation-v1");
+    expect(mail.sent[0]?.textBody).toContain(
+      "https://app.example.invalid/confirma/token-sintetico",
+    );
+    expect(
+      sent.audit.slice(-4).map((event) =>
+        event.type === "PF_STATUS_CHANGED" ? event.to : event.type,
+      ),
+    ).toEqual([
+      "PF_CONFIRMATION_ISSUED",
+      "EMAIL_ENVIADO",
+      "PF_COMMUNICATION_ACCEPTED",
+      "AGUARDANDO_CONFIRMACAO",
+    ]);
 
     const updated: PfCadastreSnapshot = {
       ...ORIGINAL,
       telefone: "0000000001",
       endereco: { ...ORIGINAL.endereco, cep: "87654-321" },
     };
-    const confirmed = await workflow.submitConfirmation(sent.state, "token-sintetico", {
+    const confirmed = await workflow.submitConfirmation(sent, "token-sintetico", {
       decision: "ATUALIZAR",
       snapshot: updated,
     });
@@ -124,17 +143,94 @@ describe("workflow de confirmação cadastral PF", () => {
     const { workflow, initial } = criarCenario();
     expect(() => assertAptoParaPrePostagem(initial)).toThrow("APTO_PREPOSTAGEM");
     const sent = await workflow.sendEmail(workflow.prepareEmail(workflow.triage(initial, true)));
-    await expect(workflow.submitConfirmation(sent.state, "token-incorreto", { decision: "CONFIRMAR" }))
+    await expect(workflow.submitConfirmation(sent, "token-incorreto", { decision: "CONFIRMAR" }))
       .rejects.toThrow("Token inválido");
   });
 
   it("mantém pendência quando a alteração cadastral é inválida", async () => {
     const { workflow, initial } = criarCenario();
     const sent = await workflow.sendEmail(workflow.prepareEmail(workflow.triage(initial, true)));
-    const confirmed = await workflow.submitConfirmation(sent.state, "token-sintetico", {
+    const confirmed = await workflow.submitConfirmation(sent, "token-sintetico", {
       decision: "ATUALIZAR",
       snapshot: { ...ORIGINAL, endereco: { ...ORIGINAL.endereco, cep: "000" } },
     });
     expect(workflow.validateForPrePostagem(confirmed).professional.status).toBe("PENDENCIA_CADASTRAL");
+  });
+
+  it("aceita exatamente uma de duas submissões concorrentes no mesmo owner", async () => {
+    const { workflow, initial } = criarCenario();
+    const state = await workflow.sendEmail(workflow.prepareEmail(workflow.triage(initial, true)));
+    const submission = { decision: "CONFIRMAR" as const };
+
+    const results = await Promise.allSettled([
+      workflow.submitConfirmation(state, "token-sintetico", submission),
+      workflow.submitConfirmation(state, "token-sintetico", submission),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+  });
+
+  it("não expõe estado parcial quando o gateway de e-mail falha", async () => {
+    const confirmations = new InMemoryConfirmationOwnership();
+    const workflow = new PfConfirmationWorkflow({
+      mail: {
+        async send() { throw new Error("Falha sintética de envio"); },
+        async getStatus() { throw new Error("Indisponível"); },
+      },
+      confirmations,
+      tokens: new FakeTokenService(),
+      confirmationBaseUrl: "https://app.example.invalid",
+      clock: () => new Date("2026-09-16T00:00:00.000Z"),
+      idFactory: () => "confirmation-test-failure",
+    });
+    const initial: PfWorkflowState = {
+      professional: criarProfissionalPf("TESTE-FALHA", ORIGINAL),
+      audit: [],
+    };
+    const prepared = workflow.prepareEmail(workflow.triage(initial, true));
+
+    await expect(workflow.sendEmail(prepared)).rejects.toThrow("Falha sintética de envio");
+    await expect(confirmations.consumePending({
+      confirmationId: "confirmation-test-failure",
+      tokenHash: "hash-opaque-digest",
+      usedAt: "2026-09-16T00:00:01.000Z",
+    })).resolves.toBeUndefined();
+    expect(prepared.professional.status).toBe("EMAIL_PENDENTE");
+  });
+
+  it("gera tokens URL-safe com 256 bits de entropia", async () => {
+    const tokens = createWebTokenService();
+    const token = await tokens.issue();
+    expect(token.plainToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(token.tokenHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(await tokens.hash(token.plainToken)).toBe(token.tokenHash);
+  });
+
+  it("reutiliza as validações centrais de UF e e-mail", () => {
+    expect(validarCadastroPf({ ...ORIGINAL, email: "user@" }).issues).toContain("E-mail inválido");
+    expect(validarCadastroPf({
+      ...ORIGINAL,
+      endereco: { ...ORIGINAL.endereco, uf: "ZZ" },
+    }).issues).toContain("UF inválida");
+  });
+
+  it("rejeita origem de confirmação sem HTTPS antes do envio", async () => {
+    const mail = new FakeMailGateway();
+    const workflow = new PfConfirmationWorkflow({
+      mail,
+      confirmations: new InMemoryConfirmationOwnership(),
+      tokens: new FakeTokenService(),
+      confirmationBaseUrl: "http://app.example.invalid",
+      clock: () => new Date("2026-09-16T00:00:00.000Z"),
+    });
+    const initial: PfWorkflowState = {
+      professional: criarProfissionalPf("TESTE-HTTPS", ORIGINAL),
+      audit: [],
+    };
+    const prepared = workflow.prepareEmail(workflow.triage(initial, true));
+
+    await expect(workflow.sendEmail(prepared)).rejects.toThrow("deve usar HTTPS");
+    expect(mail.sent).toHaveLength(0);
   });
 });

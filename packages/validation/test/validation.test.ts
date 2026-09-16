@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   cnpjValido,
   cpfValido,
+  emailValido,
   identificadorComZeros,
   normalizarCep,
+  UFS_BRASILEIRAS,
+  ufBrasileiraValida,
   validarCabecalhos,
 } from "../src/index.js";
 
@@ -61,5 +64,31 @@ describe("cabeçalhos", () => {
     expect(result.valid).toBe(false);
     expect(result.missing).toEqual(["Nome"]);
     expect(result.duplicated).toEqual(["CODIGO"]);
+  });
+});
+
+describe("contato e endereço", () => {
+  it("aceita somente as 27 UFs brasileiras", () => {
+    expect(UFS_BRASILEIRAS).toHaveLength(27);
+    expect(ufBrasileiraValida("sp")).toBe(true);
+    expect(ufBrasileiraValida("DF")).toBe(true);
+    expect(ufBrasileiraValida("ZZ")).toBe(false);
+  });
+
+  it.each([
+    "@",
+    "user@",
+    "@example.com",
+    " user@example.com",
+    "user@example.com ",
+    "user @example.com",
+    "user@ example.com",
+  ])(
+    "rejeita e-mail malformado: %s",
+    (value) => expect(emailValido(value)).toBe(false),
+  );
+
+  it("aceita e-mail com partes local e domínio", () => {
+    expect(emailValido("pessoa.sintetica@example.invalid")).toBe(true);
   });
 });

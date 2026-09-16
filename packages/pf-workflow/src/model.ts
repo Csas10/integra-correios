@@ -104,7 +104,9 @@ export interface TokenService {
 
 export interface PfWorkflowDependencies {
   readonly mail: import("@integra-correios/mail").MailGateway;
+  readonly confirmations: import("./ownership.js").ConfirmationOwnership;
   readonly tokens: TokenService;
+  readonly confirmationBaseUrl: string;
   readonly clock?: () => Date;
   readonly confirmationTtlMs?: number;
   readonly idFactory?: () => string;

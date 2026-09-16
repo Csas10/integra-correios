@@ -13,7 +13,7 @@ export async function sha256Token(value: string): Promise<string> {
 export function createWebTokenService(): import("./model.js").TokenService {
   return {
     async issue() {
-      const bytes = new Uint8Array(24);
+      const bytes = new Uint8Array(32);
       crypto.getRandomValues(bytes);
       const plainToken = bytesToBase64Url(bytes);
       return { plainToken, tokenHash: await sha256Token(plainToken) };

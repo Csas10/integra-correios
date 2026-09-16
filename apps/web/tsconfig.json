@@ -8,6 +8,9 @@
     "outDir": ".tsc",
     "tsBuildInfoFile": ".tsc/tsconfig.tsbuildinfo"
   },
-  "references": [{ "path": "../../packages/domain" }],
+  "references": [
+    { "path": "../../packages/domain" },
+    { "path": "../../packages/validation" }
+  ],
   "include": ["src/**/*.ts", "src/**/*.tsx"]
 }

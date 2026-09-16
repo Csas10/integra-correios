@@ -9,7 +9,8 @@ entrada, saída ou evidência; não são o estado transacional da aplicação.
 ## Escopo desta fundação
 
 - domínio PF/PJ e identidade operacional (`PF|CODIGO` ou `PJ|CODIGO`);
-- estados e gates para contato, confirmação, validação, lote, retorno e reteste;
+- estados e gates para triagem PF, confirmação, validação, lote, retorno e reteste;
+- workflow PF com token seguro, snapshot original/confirmado e comunicação desacoplada;
 - Perfil Ouro PPN como contrato tipado e testado;
 - contratos dos quatro templates oficiais, sem publicar as linhas de exemplo;
 - adaptador Correios sem rede, credenciais ou chamadas reais;
@@ -47,6 +48,8 @@ packages/
   validation/             CPF, CNPJ, CEP e cabeçalhos
   audit/                  SHA-256, gates e eventos
   shared/                 tipos utilitários
+  mail/                   MailGateway, ConversationGateway e templates versionados
+  pf-workflow/            triagem, confirmação, validação e gate APTO_PREPOSTAGEM
 assets/correios/templates/ manifesto dos originais mantidos fora do GitHub
 docs/                     arquitetura, decisões e homologação
 legacy/apps-script/       baseline V1.8.5 congelada
@@ -79,6 +82,15 @@ compilação real e verificação de que artefatos proibidos não entraram no Gi
 | Correios PPN | contrato e serialização puros; rede desabilitada |
 | PostgreSQL | evolução documentada; não implementado nesta fase |
 | Vercel | Preview da branch; produção continua vinculada à `main` |
+
+## Confirmação cadastral PF
+
+A carteira PF passa por `triagem → comunicação → confirmação/atualização →
+validação` antes de qualquer lote. O cockpit expõe a fila estrutural e uma rota
+de formulário `/confirma/:token`; os valores permanecem vazios nesta fase.
+Somente `APTO_PREPOSTAGEM` libera a entrada no lote. Consulte
+[docs/architecture/pf-confirmation-workflow.md](docs/architecture/pf-confirmation-workflow.md)
+e [ADR-005](docs/architecture/decisions/ADR-005-confirmacao-pf-e-mail-desacoplado.md).
 
 Consulte [docs/architecture/overview.md](docs/architecture/overview.md) para os
 limites completos da fundação.

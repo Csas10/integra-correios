@@ -62,6 +62,14 @@ export const INDICADORES = [
   { rotulo: "Em lote", detalhe: "Itens reservados para envio" },
 ] as const;
 
+export const PF_QUEUE_STAGES = [
+  { id: "triagem", rotulo: "Triagem PF", descricao: "Carteira aguardando análise" },
+  { id: "aguardando", rotulo: "Aguardando confirmação", descricao: "Contato enviado, sem resposta registrada" },
+  { id: "alteracoes", rotulo: "Com alteração", descricao: "Dados informados pelo profissional" },
+  { id: "pendencias", rotulo: "Pendência cadastral", descricao: "Exige correção ou nova validação" },
+  { id: "aptos", rotulo: "Aptos para pré-postagem", descricao: "Gate liberado para lote PF" },
+] as const;
+
 export function obterArea(id: AreaCockpit) {
   return AREAS_COCKPIT.find((area) => area.id === id) ?? AREAS_COCKPIT[0];
 }

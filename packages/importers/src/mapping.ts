@@ -107,6 +107,20 @@ export interface Mapeamento {
   readonly itens: readonly ItemMapeamento[];
 }
 
+/** Marca privada: somente confirmarMapeamento pode criar este contrato. */
+const MAPEAMENTO_CONFIRMADO: unique symbol = Symbol("MapeamentoConfirmado");
+
+/**
+ * Mapeamento validado e explicitamente confirmado pelo operador.
+ * A marca é privada ao módulo para impedir construção estrutural acidental.
+ */
+export interface MapeamentoConfirmado {
+  readonly itens: readonly ItemMapeamento[];
+  readonly origem: OrigemMapeamento;
+  readonly totalColunas: number;
+  readonly [MAPEAMENTO_CONFIRMADO]: true;
+}
+
 /**
  * Valida o mapeamento contra a obrigatoriedade da origem informada.
  * `origem` é a origem do fluxo de ingestão (PF ou PJ) — o mesmo conjunto
@@ -142,6 +156,30 @@ export function validarMapeamento(
     }
   }
   return erros;
+}
+
+/**
+ * Fronteira explícita da confirmação do operador. Valida e congela uma cópia
+ * do mapeamento; aplicarMapeamento não aceita o contrato estrutural comum.
+ */
+export function confirmarMapeamento(
+  mapeamento: Mapeamento,
+  totalColunas: number,
+  origem: OrigemMapeamento,
+): MapeamentoConfirmado {
+  const erros = validarMapeamento(mapeamento, totalColunas, origem);
+  if (erros.length > 0) {
+    throw new Error(`Mapeamento inválido: ${erros.join(" ")}`);
+  }
+  const itens = Object.freeze(
+    mapeamento.itens.map((item) => Object.freeze({ ...item })),
+  );
+  return Object.freeze({
+    itens,
+    origem,
+    totalColunas,
+    [MAPEAMENTO_CONFIRMADO]: true as const,
+  });
 }
 
 /**
@@ -208,12 +246,15 @@ export interface ResultadoAplicacao {
  */
 export function aplicarMapeamento(
   folha: FolhaExtraida,
-  mapeamento: Mapeamento,
-  origem: OrigemMapeamento,
+  mapeamento: MapeamentoConfirmado,
 ): ResultadoAplicacao {
-  const erros = validarMapeamento(mapeamento, folha.cabecalhos.length, origem);
-  if (erros.length > 0) {
-    throw new Error(`Mapeamento inválido: ${erros.join(" ")}`);
+  if (mapeamento[MAPEAMENTO_CONFIRMADO] !== true) {
+    throw new Error("Mapeamento não foi confirmado explicitamente pelo operador.");
+  }
+  if (mapeamento.totalColunas !== folha.cabecalhos.length) {
+    throw new Error(
+      `Mapeamento confirmado para ${mapeamento.totalColunas} colunas, mas a folha possui ${folha.cabecalhos.length}.`,
+    );
   }
   const linhas = folha.linhas.map((linha: LinhaDados) => {
     const valores: Partial<Record<Campo, string>> = {};
@@ -252,6 +293,10 @@ export function validarLinhasPfPj(
 ): readonly ResultadoValidacaoPfPj[] {
   return linhas.map((linha) => {
     const erros: string[] = [];
+
+    for (const alerta of linha.alertasNumericos) {
+      erros.push(`Bloqueio por célula numérica: ${alerta}`);
+    }
 
     const valorOrigem = (linha.valores.ORIGEM ?? "").trim().toUpperCase();
     if (valorOrigem !== origem) {

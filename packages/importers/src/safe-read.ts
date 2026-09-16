@@ -14,7 +14,12 @@ export const LIMITES_PADRAO = {
   maxFolhas: 20,
 } as const;
 
-export type Limites = Partial<typeof LIMITES_PADRAO>;
+export interface Limites {
+  readonly maxArquivoBytes?: number;
+  readonly maxLinhas?: number;
+  readonly maxColunas?: number;
+  readonly maxFolhas?: number;
+}
 
 export interface ArquivoEntrada {
   readonly nome: string;

@@ -13,18 +13,6 @@ import {
   type TipoOrigemCelula,
 } from "./safe-read.js";
 
-/**
- * Extensões com risco de macro/conteúdo executável.
- */
-const EXTENSOES_BLOQUEADAS = new Set([
-  ".xls",
-  ".xlsm",
-  ".xlsb",
-  ".xla",
-  ".xltm",
-  ".xlt",
-]);
-
 export interface ResultadoLeituraXlsx {
   readonly sha256: string;
   readonly folhasDisponiveis: readonly string[];
@@ -136,7 +124,7 @@ function celulaTexto(
 
 /**
  * Leitura segura de XLSX.
- * - Rejeita extensões de macro/executável (.xls, .xlsm, .xlsb, ...).
+ * - Aceita somente a extensão .xlsx.
  * - Rejeita arquivos acima do limite de tamanho.
  * - Rejeita workbooks sem folhas legíveis (criptografados/corrompidos).
  * - Preserva CPF/CNPJ/CEP como texto cru (sem conversão de tipo).
@@ -148,13 +136,10 @@ export function lerXlsx(
 ): ResultadoLeituraXlsx {
   const limites = { ...LIMITES_PADRAO, ...opcoes.limites };
 
-  const nomeLower = arquivo.nome.toLowerCase();
-  for (const ext of EXTENSOES_BLOQUEADAS) {
-    if (nomeLower.endsWith(ext)) {
-      throw new LeituraSeguraError(
-        `Formato com risco de macro/executável bloqueado: "${ext}". Use .xlsx (sem macros).`,
-      );
-    }
+  if (!arquivo.nome.toLowerCase().endsWith(".xlsx")) {
+    throw new LeituraSeguraError(
+      'Formato não permitido. A ingestão aceita somente arquivos com extensão ".xlsx".',
+    );
   }
 
   if (arquivo.bytes.length > limites.maxArquivoBytes) {
@@ -226,6 +211,12 @@ export function lerXlsx(
   }
 
   const decoded = XLSX.utils.decode_range(range);
+  const indiceCabecalho = linhaCabecalho - 1;
+  if (indiceCabecalho < decoded.s.r || indiceCabecalho > decoded.e.r) {
+    throw new LeituraSeguraError(
+      `linhaCabecalho ${linhaCabecalho} fora do intervalo real da folha (${decoded.s.r + 1}..${decoded.e.r + 1}).`,
+    );
+  }
   const totalColunas = decoded.e.c + 1;
   if (totalColunas > limites.maxColunas) {
     throw new LeituraSeguraError(

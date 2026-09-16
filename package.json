@@ -28,6 +28,6 @@
     "vitest": "3.2.7"
   },
   "dependencies": {
-    "xlsx": "file:vendor/package"
+    "xlsx": "file:vendor/xlsx-0.20.3.tgz"
   }
 }

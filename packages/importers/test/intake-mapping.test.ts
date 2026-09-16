@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as XLSX from "xlsx";
 import {
   detectarCabecalhosDuplicados,
+  confirmarMapeamento,
   lerCsv,
   lerXlsx,
   normalizarCabecalho,
@@ -54,6 +55,18 @@ const MAPEAMENTO_PADRAO: Mapeamento = {
   ],
 };
 
+function aplicarPadrao(
+  folha: ReturnType<typeof lerXlsx>["folha"],
+  origem: "PF" | "PJ",
+) {
+  const confirmado = confirmarMapeamento(
+    MAPEAMENTO_PADRAO,
+    folha.cabecalhos.length,
+    origem,
+  );
+  return aplicarMapeamento(folha, confirmado);
+}
+
 function bytesXlsx(linhas: string[][], cabecalhos: string[] = CABECALHOS): Uint8Array {
   const ws = XLSX.utils.aoa_to_sheet([cabecalhos, ...linhas]);
   const wb = XLSX.utils.book_new();
@@ -77,8 +90,15 @@ describe("sha256 do arquivo original", () => {
 describe("rejeição de conteúdo perigoso", () => {
   it("rejeita extensões de macro/executável", () => {
     const arquivo = { nome: "planilha.xlsm", bytes: new Uint8Array(10) };
-    expect(() => lerXlsx(arquivo)).toThrow(/macro/i);
+    expect(() => lerXlsx(arquivo)).toThrow(/somente.*\.xlsx/i);
   });
+
+  it.each(["planilha.csv", "planilha.txt", "planilha.xlsx.exe"])(
+    "aceita somente extensão .xlsx: %s",
+    (nome) => {
+      expect(() => lerXlsx({ nome, bytes: bytesXlsx(LINHAS) })).toThrow(/somente.*\.xlsx/i);
+    },
+  );
 
   it("rejeita arquivo acima do limite de tamanho", () => {
     const arquivo = { nome: "grande.csv", bytes: new Uint8Array(21 * 1024 * 1024) };
@@ -153,6 +173,27 @@ describe("linha de cabeçalho", () => {
     const bytes = bytesXlsx(LINHAS);
     expect(() => lerXlsx({ nome: "f.xlsx", bytes }, { linhaCabecalho: 0 })).toThrow(/inteiro/);
   });
+
+  it("rejeita linhaCabecalho fora do range real da worksheet", () => {
+    const bytes = bytesXlsx(LINHAS);
+    expect(() => lerXlsx({ nome: "f.xlsx", bytes }, { linhaCabecalho: 99 }))
+      .toThrow(/fora do intervalo real/);
+
+    const ws: XLSX.WorkSheet = {
+      A3: { t: "s", v: "Origem" },
+      B3: { t: "s", v: "Código" },
+      A4: { t: "s", v: "PF" },
+      B4: { t: "s", v: "PF001" },
+      "!ref": "A3:B4",
+    };
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Planilha1");
+    const deslocado = new Uint8Array(
+      XLSX.write(wb, { type: "array", bookType: "xlsx" }) as ArrayBuffer,
+    );
+    expect(() => lerXlsx({ nome: "f.xlsx", bytes: deslocado }, { linhaCabecalho: 1 }))
+      .toThrow(/fora do intervalo real/);
+  });
 });
 
 describe("preservação de tipos textuais", () => {
@@ -174,36 +215,46 @@ describe("preservação de tipos textuais", () => {
   });
 
   it("célula NUMÉRICA em coluna mapeada para CPF_CNPJ gera alerta fail-closed", () => {
-    // CPF armazenado como número no Excel: zero à esquerda perdido (12345678900).
+    // CPF válido armazenado como número ainda é bloqueado por risco de perda de zeros.
     const ws = XLSX.utils.aoa_to_sheet([
       CABECALHOS,
-      ["PF", "PF001", "Fulano", 12345678900, "01234567", "Rua A", "São Paulo", "SP", "11999990000", ""],
+      ["PF", "PF001", "Fulano", 52998224725, "01234567", "Rua A", "São Paulo", "SP", "11999990000", ""],
     ]);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Planilha1");
     const bytes = new Uint8Array(XLSX.write(wb, { type: "array", bookType: "xlsx" }) as ArrayBuffer);
     const leitura = lerXlsx({ nome: "f.xlsx", bytes });
-    const aplicado = aplicarMapeamento(leitura.folha, MAPEAMENTO_PADRAO, "PF");
+    const aplicado = aplicarPadrao(leitura.folha, "PF");
     expect(aplicado.linhas[0]!.alertasNumericos.length).toBe(1);
     expect(aplicado.linhas[0]!.alertasNumericos[0]).toMatch(/CPF_CNPJ/);
+    const validacao = validarLinhasPfPj(aplicado.linhas, "PF", cpfValido, cnpjValido);
+    expect(validacao[0]!.valido).toBe(false);
+    expect(validacao[0]!.erros).toEqual(
+      expect.arrayContaining([expect.stringMatching(/Bloqueio por célula numérica.*CPF_CNPJ/)]),
+    );
   });
 
   it("célula NUMÉRICA em coluna mapeada para CEP gera alerta fail-closed", () => {
     const ws = XLSX.utils.aoa_to_sheet([
       CABECALHOS,
-      ["PF", "PF001", "Fulano", "52998224725", 1234567, "Rua A", "São Paulo", "SP", "11999990000", ""],
+      ["PF", "PF001", "Fulano", "52998224725", 12345678, "Rua A", "São Paulo", "SP", "11999990000", ""],
     ]);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Planilha1");
     const bytes = new Uint8Array(XLSX.write(wb, { type: "array", bookType: "xlsx" }) as ArrayBuffer);
     const leitura = lerXlsx({ nome: "f.xlsx", bytes });
-    const aplicado = aplicarMapeamento(leitura.folha, MAPEAMENTO_PADRAO, "PF");
+    const aplicado = aplicarPadrao(leitura.folha, "PF");
     expect(aplicado.linhas[0]!.alertasNumericos[0]).toMatch(/CEP/);
+    const validacao = validarLinhasPfPj(aplicado.linhas, "PF", cpfValido, cnpjValido);
+    expect(validacao[0]!.valido).toBe(false);
+    expect(validacao[0]!.erros).toEqual(
+      expect.arrayContaining([expect.stringMatching(/Bloqueio por célula numérica.*CEP/)]),
+    );
   });
 
   it("célula textual nas colunas sensíveis NÃO gera alerta", () => {
     const leitura = lerXlsx({ nome: "f.xlsx", bytes: bytesXlsx(LINHAS) });
-    const aplicado = aplicarMapeamento(leitura.folha, MAPEAMENTO_PADRAO, "PF");
+    const aplicado = aplicarPadrao(leitura.folha, "PF");
     expect(aplicado.linhas[0]!.alertasNumericos).toEqual([]);
   });
 });
@@ -281,20 +332,35 @@ describe("sugestão e confirmação de mapeamento", () => {
         { campo: "CODIGO", coluna: 0 },
       ],
     };
-    expect(() =>
-      aplicarMapeamento(
-        { nome: "f", linhaCabecalho: 1, cabecalhos: CABECALHOS, linhas: [] },
-        m,
-        "PF",
-      ),
-    ).toThrow(/já mapeada/);
+    expect(() => confirmarMapeamento(m, CABECALHOS.length, "PF"))
+      .toThrow(/já mapeada/);
   });
 
-  it("aplicação exige confirmação: usa apenas mapeamento validado", () => {
+  it("aplicação aceita somente MapeamentoConfirmado opaco", () => {
     const bytes = bytesXlsx(LINHAS);
     const leitura = lerXlsx({ nome: "f.xlsx", bytes });
-    const aplicado = aplicarMapeamento(leitura.folha, MAPEAMENTO_PADRAO, "PF");
+    const confirmado = confirmarMapeamento(
+      MAPEAMENTO_PADRAO,
+      leitura.folha.cabecalhos.length,
+      "PF",
+    );
+    const aplicado = aplicarMapeamento(leitura.folha, confirmado);
     expect(aplicado.linhas[0]!.valores.CPF_CNPJ).toBe("529.982.247-25");
+    expect(() =>
+      aplicarMapeamento(
+        leitura.folha,
+        // @ts-expect-error Um Mapeamento estrutural não cruza a fronteira confirmada.
+        MAPEAMENTO_PADRAO,
+      ),
+    ).toThrow(/não foi confirmado/);
+  });
+
+  it("rejeita reaplicação do confirmado quando o layout muda", () => {
+    const confirmado = confirmarMapeamento(MAPEAMENTO_PADRAO, CABECALHOS.length, "PF");
+    expect(() => aplicarMapeamento(
+      { nome: "f", linhaCabecalho: 1, cabecalhos: CABECALHOS.slice(0, -1), linhas: [] },
+      confirmado,
+    )).toThrow(/confirmado para 10 colunas/);
   });
 });
 
@@ -331,7 +397,7 @@ describe("validação PF/PJ", () => {
   it("aceita linha PF válida no fluxo PF", () => {
     const bytes = bytesXlsx(LINHAS);
     const leitura = lerXlsx({ nome: "f.xlsx", bytes });
-    const aplicado = aplicarMapeamento(leitura.folha, MAPEAMENTO_PADRAO, "PF");
+    const aplicado = aplicarPadrao(leitura.folha, "PF");
     const resultados = validarLinhasPfPj(aplicado.linhas, "PF", cpfValido, cnpjValido);
     expect(resultados[0]!.valido).toBe(true);
   });
@@ -339,7 +405,7 @@ describe("validação PF/PJ", () => {
   it("valida CNPJ no fluxo PJ e CPF no fluxo PF (validadores distintos)", () => {
     const bytes = bytesXlsx(LINHAS);
     const leitura = lerXlsx({ nome: "f.xlsx", bytes });
-    const aplicado = aplicarMapeamento(leitura.folha, MAPEAMENTO_PADRAO, "PJ");
+    const aplicado = aplicarPadrao(leitura.folha, "PJ");
     const resultados = validarLinhasPfPj(aplicado.linhas, "PJ", cpfValido, cnpjValido);
     expect(resultados[1]!.valido).toBe(true);
     // CPF (11 dígitos) na linha do fluxo PJ falha por tamanho (esperado 14).
@@ -389,5 +455,27 @@ describe("CSV RFC 4180: campos quoted com quebra de linha", () => {
     const resultado = lerCsv({ nome: "crlf.csv", bytes: csv });
     expect(resultado.folha.linhas).toHaveLength(1);
     expect(resultado.folha.linhas[0]!.celulas[0]!.texto).toBe("linha1\r\nlinha2");
+  });
+
+  it("rejeita EOF com campo quoted não fechado", () => {
+    const csv = new TextEncoder().encode('nome,endereco\nJoão,"Rua A\n');
+    expect(() => lerCsv({ nome: "aspas-abertas.csv", bytes: csv }))
+      .toThrow(/não foi fechado antes do fim do arquivo/);
+  });
+
+  it("interrompe durante o parsing ao exceder maxLinhas", () => {
+    const csv = new TextEncoder().encode("a,b\n1,2\n3,4\n");
+    expect(() => lerCsv(
+      { nome: "linhas.csv", bytes: csv },
+      { limites: { maxLinhas: 1 } },
+    )).toThrow(/limite de 1 linhas.*durante o parsing/);
+  });
+
+  it("interrompe durante o parsing ao exceder maxColunas", () => {
+    const csv = new TextEncoder().encode("a,b,c\n1,2,3\n");
+    expect(() => lerCsv(
+      { nome: "colunas.csv", bytes: csv },
+      { limites: { maxColunas: 2 } },
+    )).toThrow(/limite de 2 colunas.*durante o parsing/);
   });
 });

@@ -39,16 +39,29 @@ interface RegistroCsv {
   readonly campos: string[];
   /** Número 1-based da linha física onde o registro começa. */
   readonly linhaFisica: number;
+  /** Número 1-based da linha física onde o registro termina. */
+  readonly linhaFisicaFinal: number;
+}
+
+interface ResultadoParseCsv {
+  readonly cabecalho: RegistroCsv;
+  readonly dados: readonly RegistroCsv[];
 }
 
 /**
- * Parser RFC 4180 por estado sobre o arquivo inteiro:
+ * Parser RFC 4180 por estado com limites aplicados durante a leitura:
  * - campos entre aspas podem conter delimitador, aspas ("") e quebras
  *   de linha — o registro só termina fora de aspas;
  * - linha física inicial de cada registro é preservada para auditoria.
  */
-function parsearCsv(texto: string, delimitador: string): readonly RegistroCsv[] {
-  const registros: RegistroCsv[] = [];
+function parsearCsv(
+  texto: string,
+  delimitador: string,
+  linhaCabecalho: number,
+  limites: { readonly maxLinhas: number; readonly maxColunas: number },
+): ResultadoParseCsv {
+  let cabecalho: RegistroCsv | undefined;
+  const dados: RegistroCsv[] = [];
   let campos: string[] = [];
   let atual = "";
   let dentroAspas = false;
@@ -57,15 +70,35 @@ function parsearCsv(texto: string, delimitador: string): readonly RegistroCsv[] 
   let registroAberto = false;
 
   const fecharCampo = (): void => {
+    if (campos.length >= limites.maxColunas) {
+      throw new LeituraSeguraError(
+        `Arquivo excede o limite de ${limites.maxColunas} colunas durante o parsing.`,
+      );
+    }
     campos.push(atual);
     atual = "";
   };
   const fecharRegistro = (): void => {
     fecharCampo();
-    registros.push({ campos, linhaFisica: linhaInicioRegistro });
+    const registro: RegistroCsv = {
+      campos,
+      linhaFisica: linhaInicioRegistro,
+      linhaFisicaFinal: linhaFisica,
+    };
     campos = [];
     registroAberto = false;
-    linhaInicioRegistro = linhaFisica + 1;
+
+    if (!cabecalho) {
+      if (registro.linhaFisica >= linhaCabecalho) cabecalho = registro;
+      return;
+    }
+    if (registro.campos.length === 1 && registro.campos[0] === "") return;
+    if (dados.length >= limites.maxLinhas) {
+      throw new LeituraSeguraError(
+        `Arquivo excede o limite de ${limites.maxLinhas} linhas de dados durante o parsing.`,
+      );
+    }
+    dados.push(registro);
   };
 
   for (let i = 0; i < texto.length; i++) {
@@ -79,7 +112,7 @@ function parsearCsv(texto: string, delimitador: string): readonly RegistroCsv[] 
           dentroAspas = false;
         }
       } else {
-        if (ch === "\n") linhaFisica++;
+        if (ch === "\n" || (ch === "\r" && texto[i + 1] !== "\n")) linhaFisica++;
         atual += ch;
       }
       continue;
@@ -97,11 +130,14 @@ function parsearCsv(texto: string, delimitador: string): readonly RegistroCsv[] 
     if (ch === "\r") {
       if (texto[i + 1] === "\n") i++;
       fecharRegistro();
+      linhaFisica++;
+      linhaInicioRegistro = linhaFisica;
       continue;
     }
     if (ch === "\n") {
-      linhaFisica++;
       fecharRegistro();
+      linhaFisica++;
+      linhaInicioRegistro = linhaFisica;
       continue;
     }
     if (!registroAberto && atual === "" && campos.length === 0) {
@@ -111,11 +147,22 @@ function parsearCsv(texto: string, delimitador: string): readonly RegistroCsv[] 
     atual += ch;
   }
 
+  if (dentroAspas) {
+    throw new LeituraSeguraError(
+      `CSV inválido: campo entre aspas iniciado na linha ${linhaInicioRegistro} não foi fechado antes do fim do arquivo.`,
+    );
+  }
+
   // Registro final sem quebra de linha, ou campo pendente.
   if (registroAberto || atual !== "" || campos.length > 0) {
-    if (registroAberto || atual !== "" || campos.length > 0) fecharRegistro();
+    fecharRegistro();
   }
-  return registros;
+  if (!cabecalho) {
+    throw new LeituraSeguraError(
+      `Arquivo não contém linha de cabeçalho na posição ${linhaCabecalho}.`,
+    );
+  }
+  return { cabecalho, dados };
 }
 
 /**
@@ -155,17 +202,10 @@ export function lerCsv(arquivo: ArquivoEntrada, opcoes: OpcoesLeituraCsv = {}): 
     throw new LeituraSeguraError(`linhaCabecalho deve ser inteiro >= 1 (recebido: ${linhaCabecalho}).`);
   }
 
-  const registros = parsearCsv(texto, delimitador);
-
-  const indiceCabecalho = registros.findIndex((r) => r.linhaFisica >= linhaCabecalho);
-  if (indiceCabecalho < 0) {
-    throw new LeituraSeguraError(
-      `Arquivo não contém linha de cabeçalho na posição ${linhaCabecalho}.`,
-    );
-  }
-  const registroCabecalho = registros[indiceCabecalho] as RegistroCsv;
+  const registros = parsearCsv(texto, delimitador, linhaCabecalho, limites);
+  const registroCabecalho = registros.cabecalho;
   // Um cabeçalho não pode conter quebra de linha interna (ambiguidade).
-  if (registroCabecalho.linhaFisica !== registros[indiceCabecalho]!.linhaFisica) {
+  if (registroCabecalho.linhaFisica !== registroCabecalho.linhaFisicaFinal) {
     throw new LeituraSeguraError("Cabeçalho ambíguo.");
   }
 
@@ -173,28 +213,13 @@ export function lerCsv(arquivo: ArquivoEntrada, opcoes: OpcoesLeituraCsv = {}): 
   const duplicados = detectarCabecalhosDuplicados(cabecalhos);
 
   const linhas: LinhaDados[] = [];
-  for (let i = indiceCabecalho + 1; i < registros.length; i++) {
-    const registro = registros[i] as RegistroCsv;
-    // Registros de dados podem conter quebras legítimas dentro de aspas.
-    if (registro.campos.length === 1 && registro.campos[0] === "") continue;
+  for (const registro of registros.dados) {
     const celulas: Celula[] = registro.campos.map((texto, col) => ({
       coluna: col,
       texto,
       tipoOrigem: "texto" as const,
     }));
     linhas.push({ numero: registro.linhaFisica, celulas });
-  }
-
-  if (linhas.length > limites.maxLinhas) {
-    throw new LeituraSeguraError(
-      `Arquivo excede o limite de ${limites.maxLinhas} linhas de dados (${linhas.length}).`,
-    );
-  }
-  const totalColunas = Math.max(cabecalhos.length, ...linhas.map((l) => l.celulas.length), 0);
-  if (totalColunas > limites.maxColunas) {
-    throw new LeituraSeguraError(
-      `Arquivo excede o limite de ${limites.maxColunas} colunas (${totalColunas}).`,
-    );
   }
 
   const folha: FolhaExtraida = {

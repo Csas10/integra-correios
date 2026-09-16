@@ -19,12 +19,15 @@ nem de `postinstall`, o tarball oficial é versionado neste repositório.
 
 ## Instalação
 
-`package.json` referencia `"xlsx": "file:vendor/package"`. O diretório
-`vendor/package` é a extração do tarball acima com **uma única modificação
-aplicada e documentada**: remoção do bloco `devDependencies` do
-`package.json` do fornecedor (ferramentas de dev dele — alex, mocha 2.x,
-request — traziam 34 vulnerabilidades transitivas para o `npm install`, sem
-nenhum efeito no código de runtime `xlsx.js`/`xlsx.mjs`).
+`package.json` referencia diretamente
+`"xlsx": "file:vendor/xlsx-0.20.3.tgz"`. O repositório não mantém uma cópia
+extraída nem modifica o `package.json` do fornecedor. Dependências de
+desenvolvimento declaradas dentro do pacote não são instaladas quando o
+tarball é consumido como dependência da aplicação.
+
+`npm run policy:repo` recalcula o SHA-256 do tarball e confere a referência
+exata do `package.json`. Qualquer alteração do binário ou troca silenciosa da
+origem falha no quality gate.
 
 Resultado do `npm audit` após a mudança: as vulnerabilidades atribuídas a
 `xlsx` deixam de existir; restam apenas 2 moderadas em `@vitest/mocker`
@@ -33,10 +36,10 @@ upgrade breaking para vitest 5 — tratado em PR própria).
 
 ## Atualização
 
-1. Baixe o novo tarball do CDN oficial e atualize o hash em `vendor/xlsx-0.20.3.tgz`.
-2. Extraia em `vendor/package` sem editar arquivos.
+1. Baixe o novo tarball do CDN oficial e versione-o em `vendor/`.
+2. Atualize a referência `file:` no `package.json` e o hash esperado no gate.
 3. Atualize este documento com URL, versão e SHA-256.
-4. Rode `npm audit` e registre o resultado no PR.
+4. Rode `npm install`, `npm run policy:repo` e `npm audit`.
 
 ## Política de uso
 

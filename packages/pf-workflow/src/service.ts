@@ -152,6 +152,7 @@ export class PfConfirmationWorkflow {
       confirmationId: confirmation.id,
       tokenHash,
       usedAt: consumedAt.toISOString(),
+      decision: submission.decision,
     });
     if (!consumed) throw new Error("Token já utilizado ou expirado");
     const moved = move(state, nextStatus, this.dependencies, { decision: submission.decision });

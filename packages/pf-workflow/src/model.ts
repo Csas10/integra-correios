@@ -55,6 +55,7 @@ export interface ConfirmationRecord {
   readonly issuedAt: string;
   readonly expiresAt: string;
   readonly usedAt?: string;
+  readonly decision?: ConfirmationDecision;
   readonly status: "PENDING" | "SUBMITTED" | "EXPIRED";
   readonly templateVersion: string;
 }

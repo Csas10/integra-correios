@@ -197,6 +197,7 @@ describe("workflow de confirmação cadastral PF", () => {
       confirmationId: "confirmation-test-failure",
       tokenHash: "hash-opaque-digest",
       usedAt: "2026-09-16T00:00:01.000Z",
+      decision: "CONFIRMAR",
     })).resolves.toBeUndefined();
     expect(prepared.professional.status).toBe("EMAIL_PENDENTE");
   });

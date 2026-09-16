@@ -18,7 +18,10 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
 - tokens de confirmação persistem somente como SHA-256; o payload temporário da
   outbox, que contém o link, também é cifrado;
 - tokens OAuth são sempre cifrados;
-- `evento_auditoria` rejeita `UPDATE` e `DELETE` por trigger;
+- `evento_auditoria` rejeita `UPDATE` e `DELETE` por trigger **e** a role de
+  runtime (`integra_runtime`) só tem `INSERT`/`SELECT` sobre ela — a imutabilidade
+  não depende do trigger (o owner pode desabilitá-lo); migrations aplicam-se com
+  a role admin, a aplicação opera com a role runtime;
 - nenhuma FK usa `ON DELETE CASCADE`;
 - o índice parcial em `item_lote_comunicacao` impede duas reservas ativas para o
   mesmo profissional.

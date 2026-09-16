@@ -386,7 +386,16 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
           connection.id,
           connection.accountFingerprint,
           connection.scopes,
-          ...encryptedParameters(connection.accessToken),
+          // Vínculo EXPLÍCITO entre placeholders e colunas — sem spread.
+          // encryptedParameters() inclui keyVersion; espalhá-lo aqui deslocava
+          // refresh_token_* e chave_versao, quebrando a correspondência
+          // 11 placeholders × 11 valores. Ordem exigida pelo INSERT acima:
+          //   $4 access_ciphertext, $5 access_nonce, $6 access_auth_tag,
+          //   $7 refresh_ciphertext, $8 refresh_nonce, $9 refresh_auth_tag,
+          //   $10 chave_versao, $11 expira_em
+          Buffer.from(connection.accessToken.ciphertext),
+          Buffer.from(connection.accessToken.nonce),
+          Buffer.from(connection.accessToken.authTag),
           refresh ? Buffer.from(refresh.ciphertext) : null,
           refresh ? Buffer.from(refresh.nonce) : null,
           refresh ? Buffer.from(refresh.authTag) : null,

@@ -53,14 +53,20 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Tests
-        run: npm test
-
       - name: PostgreSQL migration
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0001_operational_persistence.sql
 
+      - name: PostgreSQL runtime roles migration
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0002_runtime_roles.sql
+
+      - name: Tests
+        run: npm test
+
       - name: PostgreSQL constraints
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/tests/0001_operational_persistence.test.sql
+
+      - name: PostgreSQL runtime roles
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/tests/0002_runtime_roles.test.sql
 
       - name: Build
         run: npm run build

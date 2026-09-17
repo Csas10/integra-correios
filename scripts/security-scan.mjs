@@ -52,6 +52,20 @@ const ALLOWLIST_NARROW = [
     motivo: "fixture sintética de CPF exercitada pelo importador",
   },
   {
+    file: "tests/operational-validation-v0.test.ts",
+    rule: "cpf-sem-mascara",
+    matches: new Set([IMPORTER_TEST_CPF]),
+    motivo: "fixture sintética de CPF com dígitos válidos usada pela suíte de validação operacional V0",
+  },
+  {
+    file: "tests/operational-validation-v0.test.ts",
+    rule: "cpf-formatado",
+    // IMPORTANTE: Set recebe um ARRAY com o valor completo — new Set(string)
+    // iteraria caractere a caractere e nunca casaria.
+    matches: new Set([["529", ".982", ".247", "-25"].join("")]),
+    motivo: "mesma fixture sintética da suíte V0, em notação formatada",
+  },
+  {
     file: "packages/importers/test/intake-mapping.test.ts",
     rule: "cnpj-sem-mascara",
     matches: new Set([IMPORTER_TEST_CNPJ]),

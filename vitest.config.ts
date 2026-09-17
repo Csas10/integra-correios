@@ -19,6 +19,7 @@ export default defineConfig({
     include: [
       "apps/*/test/**/*.test.ts",
       "packages/*/test/**/*.test.ts",
+      "tests/**/*.test.ts",
       "tests/**/*.test.mjs",
     ],
     passWithNoTests: false,

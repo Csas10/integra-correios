@@ -9,6 +9,7 @@ export default defineConfig({
       "@integra-correios/domain": fileURLToPath(new URL("./packages/domain/src/index.ts", import.meta.url)),
       "@integra-correios/importers": fileURLToPath(new URL("./packages/importers/src/index.ts", import.meta.url)),
       "@integra-correios/mail": fileURLToPath(new URL("./packages/mail/src/index.ts", import.meta.url)),
+      "@integra-correios/persistence": fileURLToPath(new URL("./packages/persistence/src/index.ts", import.meta.url)),
       "@integra-correios/pf-workflow": fileURLToPath(new URL("./packages/pf-workflow/src/index.ts", import.meta.url)),
       "@integra-correios/shared": fileURLToPath(new URL("./packages/shared/src/index.ts", import.meta.url)),
       "@integra-correios/validation": fileURLToPath(new URL("./packages/validation/src/index.ts", import.meta.url)),
@@ -19,6 +20,7 @@ export default defineConfig({
     include: [
       "apps/*/test/**/*.test.ts",
       "packages/*/test/**/*.test.ts",
+      "tests/**/*.test.ts",
       "tests/**/*.test.mjs",
     ],
     passWithNoTests: false,

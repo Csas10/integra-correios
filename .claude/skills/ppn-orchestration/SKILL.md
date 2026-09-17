@@ -68,6 +68,24 @@ These concepts must be described as audit events, lot milestones,
 artifact state or reconciliation results — and must never be persisted
 as `profissional.status`.
 
+### Known divergence (do not widen)
+
+The `CHECK` constraint on `profissional.status` in
+`database/migrations/0001_operational_persistence.sql` currently accepts
+additional values that are NOT in `STATUS_OPERACIONAIS`:
+`CARTEIRA_IDENTIFICADA`, `PENDENCIA_TRIAGEM`, `EMAIL_PENDENTE`,
+`PENDENCIA_CADASTRAL`, `INCLUIDO_EM_LOTE` and `POSTADO`.
+
+These are legacy/future-state values kept by the migration for schema
+evolution; they are not valid transitions in
+`packages/domain/src/status.ts` and must not be produced by PPN
+orchestration code. In particular, `INCLUIDO_EM_LOTE` and `POSTADO` are
+lot/artifact milestones and remain forbidden as `profissional.status`.
+
+Aligning the TypeScript contract and the migration requires an explicit
+domain change: ADR, new migration and human approval (see rule above).
+Do not emit, map to, or normalize onto these values from this skill.
+
 ## Lots
 
 Persist lot ID, origin, selected count, timestamp, JSON artifact name/hash,

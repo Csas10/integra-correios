@@ -15,14 +15,42 @@ import path from "node:path";
 
 const mode = process.argv[2];
 
-// Arquivos que contêm padrões sintéticos/estruturais legítimos (o próprio
-// scanner, seus testes e a baseline de skills que define as regras).
-const ALLOWLIST = new Set([
-  "scripts/security-scan.mjs",
-  "tests/security-scan.test.mjs",
-  "docs/security/scan-rules.md",
-  ".github/workflows/ci.yml",
-]);
+// Exceções NARROW por arquivo+regra — nunca por arquivo inteiro.
+// Cada entrada indica: arquivo (caminho POSIX), regra que pode casar e o
+// motivo sintético conhecido. Qualquer OUTRA regra no mesmo arquivo segue
+// sendo reportada normalmente. Adições exigem revisão humana na PR.
+const ALLOWLIST_NARROW = [
+  {
+    // Valores sintéticos de teste do PostgreSQL na CI — não são credenciais
+    // reais; só a regra dsn-with-credentials é relevar para este arquivo.
+    file: ".github/workflows/ci.yml",
+    rules: new Set(["dsn-with-credentials"]),
+    motivo: "DSNs sintéticos de service container efêmero de teste",
+  },
+  {
+    // O scanner e os testes definem/exercitam as próprias regras com
+    // padrões sintéticos; a baseline de skills documenta os padrões.
+    file: "scripts/security-scan.mjs",
+    rules: new Set(["*"]),
+    motivo: "fonte das próprias regras (padrões sintéticos)",
+  },
+  {
+    file: "tests/security-scan.test.mjs",
+    rules: new Set(["*"]),
+    motivo: "fixtures sintéticas dos testes do scanner",
+  },
+  {
+    file: "docs/security/scan-rules.md",
+    rules: new Set(["*"]),
+    motivo: "documentação dos padrões (formas, não valores)",
+  },
+];
+
+function permitido(file, ruleName) {
+  const entry = ALLOWLIST_NARROW.find((e) => e.file === file);
+  if (!entry) return false;
+  return entry.rules.has("*") || entry.rules.has(ruleName);
+}
 
 const tracked = execFileSync("git", ["ls-files", "--cached", "-z"], {
   encoding: "utf8",
@@ -64,13 +92,7 @@ const PII_RULES = [
 
 function scanFiles(rules) {
   for (const file of tracked) {
-    if (ALLOWLIST.has(file.split(path.sep).join("/"))) continue;
-    // PII scan foca fixtures/testes/docs; secrets scan cobre tudo rastreado.
-    if (mode === "pii") {
-      const n = file.split(path.sep).join("/");
-      if (!/(?:test|tests|fixture|fixtures|docs|example|samples?|\.md$)/i.test(n)) continue;
-      if (/packages\/domain\/test|packages\/validation\/test/.test(n)) continue; // fixtures sintéticas homologadas (zeros/repetidos)
-    }
+    const rel = file.split(path.sep).join("/");
     let content;
     try {
       // Lê do working tree (gate pré-commit); fallback para HEAD quando o
@@ -89,7 +111,7 @@ function scanFiles(rules) {
     const lines = content.split(/\r?\n/);
     for (const [ruleName, rule] of rules) {
       lines.forEach((line, i) => {
-        if (rule.test(line)) {
+        if (rule.test(line) && !permitido(rel, ruleName)) {
           // Saída NÃO reproduz o match completo — apenas local + regra.
           console.error(`VIOLATION [${ruleName}] ${file}:${i + 1} (conteúdo omitido)`);
           process.exitCode = 1;

@@ -26,7 +26,12 @@ Cobre no mínimo:
 | resend-api-key | `re_...` (30+ chars) |
 | slack-token | `xox...` |
 | dsn-with-credentials | `postgres://user:senha@...` e similares |
-| config-sensivel-nao-vazio | `.env.example` não vazio (fora de política) |
+
+A regra `config-sensivel-nao-vazio` **não está ativa**: a política
+estrutural (`npm run policy:repo`) já é a barreira primária contra arquivos
+de ambiente não permitidos; se um dia forem admitidos outros arquivos de
+configuração sensíveis, a regra deve ser implementada em
+`SENSITIVE_CONFIG_NONEMPTY` com padrões explícitos e documentada aqui.
 
 ## PII scan (`security:pii`)
 
@@ -44,14 +49,20 @@ Exclui por política: fixtures sintéticas homologadas de
 propositalmente — zeros/repetidos — usados pelos testes de dígito
 verificador).
 
-## Allowlist mínima
+## Exceções (narrow, por arquivo + regra)
 
-`scripts/security-scan.mjs` (define as regras),
-`tests/security-scan.test.mjs` (testes),
-`docs/security/scan-rules.md` (esta página),
-`.github/workflows/ci.yml`.
+A allowlist NUNCA exclui um arquivo inteiro do scan — cada exceção é
+por arquivo **e** por regra, com motivo declarado:
 
-Qualquer adição à allowlist exige revisão humana na PR.
+| Arquivo | Regras | Motivo |
+| --- | --- | --- |
+| `scripts/security-scan.mjs` | todas | fonte das próprias regras (padrões sintéticos) |
+| `tests/security-scan.test.mjs` | todas | fixtures sintéticas dos testes do scanner |
+| `docs/security/scan-rules.md` | todas | documentação das formas dos padrões |
+| `.github/workflows/ci.yml` | somente `dsn-with-credentials` | DSNs sintéticos do service container efêmero de teste |
+
+Qualquer OUTRA regra que casar nesses arquivos continua sendo
+reportada. Qualquer adição à lista exige revisão humana na PR.
 
 ## Limitações
 

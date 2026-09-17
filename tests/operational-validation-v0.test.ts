@@ -254,6 +254,9 @@ describe("V0 dominio — transicoes e validacao", () => {
 d("V0 persistencia — PostgreSQL real (sintetico)", () => {
   it("cenario feliz: profissional → lote → confirmacao/comunicacao/outbox/auditoria → consumo; persistencia apos recriacao de runtime/conexao", async () => {
     const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    // O teste transfere a responsabilidade do fechamento para poolReiniciado;
+    // o finally externo só fecha quando a recriação ainda não aconteceu.
+    let poolSubstituida = false;
     try {
       const repository = new PostgresOperationalRepository(pool);
       const profissionalId = randomUUID();
@@ -373,10 +376,14 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           (SELECT count(*) FROM outbox_email WHERE id = $3) AS outbox,
           (SELECT count(*) FROM item_lote_comunicacao WHERE lote_comunicacao_id = $4) AS itens,
           (SELECT count(*) FROM evento_auditoria
-            WHERE (agregado_tipo = 'PROFISSIONAL' AND agregado_id = $5)
-               OR (agregado_tipo = 'LOTE_COMUNICACAO' AND agregado_id = $4)
-               OR (agregado_tipo = 'PROFISSIONAL' AND agregado_id = $6)) AS eventos`,
-        [confirmationId, communicationId, outboxId, loteId, profissionalId, profissionalId],
+            WHERE hash_evento = ANY($5::text[])) AS eventos`,
+        [
+          confirmationId,
+          communicationId,
+          outboxId,
+          loteId,
+          [hash64(profissionalId), hash64(loteId), hash64(confirmationId)],
+        ],
       );
       // 1 evento de importação + 1 do lote + 1 da confirmação emitida.
       expect(contagens.rows[0]).toEqual({
@@ -390,6 +397,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       // ---- Persistência após recriação de runtime/conexão: pool fechada e
       // nova pool criada, estado idêntico ao anterior.
       await pool.close();
+      poolSubstituida = true;
       const poolReiniciado = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
       try {
         const contagensAposRestart = await poolReiniciado.query<{
@@ -439,7 +447,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         await poolReiniciado.close();
       }
     } finally {
-      await pool.close();
+      if (!poolSubstituida) await pool.close();
     }
   });
 
@@ -475,6 +483,11 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       const confirmationId = randomUUID();
       const loteId = randomUUID();
       const tokenHash = hash64("token-expirado");
+      // A confirmacao é criada VÁLIDA (expira_em > emitida_em, exigido pelo
+      // CHECK da migration); a expiração é simulada avançando o relógio do
+      // consumo para além do prazo — exatamente o comportamento operacional.
+      const emitidaEm = new Date();
+      const expiraEm = new Date(emitidaEm.getTime() + 60_000);
 
       // Lote válido para registrar a confirmação...
       await repository.enqueueCommunicationBatch({
@@ -500,9 +513,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
             communicationId: randomUUID(),
             outboxId: randomUUID(),
             tokenHash,
-            // Expira no passado → tentativa de consumo deve falhar.
-            expiresAt: new Date(Date.now() - 60_000).toISOString(),
-            recipientFingerprint: hash64("email-exp"),
+            expiresAt: expiraEm.toISOString(),
+            recipientFingerprint: hash64(`email-exp:${codigo}`),
             idempotencyKey: `pf-confirmation:v0:${confirmationId}`,
             encryptedPayload: caixa.seal("payload", "outbox:email"),
             auditEvent: {
@@ -520,24 +532,30 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
 
       const ownership = new PostgresConfirmationOwnership(pool);
 
-      // PF-006: expirada → FAIL.
+      // PF-006: expirada — o consumo ocorre DEPOIS do prazo → FAIL.
+      const aposExpiracao = new Date(expiraEm.getTime() + 60_000).toISOString();
       const expirada = await ownership.consumePending({
         confirmationId,
         tokenHash,
-        usedAt: new Date().toISOString(),
+        usedAt: aposExpiracao,
         decision: "CONFIRMAR",
       });
       expect(expirada).toBeUndefined();
 
-      // PF-007: status continua PENDING? Não — a consulta usa expira_em > now,
-      // portanto permanece PENDING no banco mas inutilizável. Duplicada também FAIL.
+      // PF-007: replay com o mesmo token após a janela — permanece FAIL e o
+      // registro continua PENDING no banco (inutilizável, não consumido).
       const duplicada = await ownership.consumePending({
         confirmationId,
         tokenHash,
-        usedAt: new Date().toISOString(),
+        usedAt: new Date(expiraEm.getTime() + 120_000).toISOString(),
         decision: "CONFIRMAR",
       });
       expect(duplicada).toBeUndefined();
+      const status = await pool.query<{ status: string }>(
+        `SELECT status FROM confirmacao WHERE id = $1`,
+        [confirmationId],
+      );
+      expect(status.rows[0]!.status).toBe("PENDING");
     } finally {
       await pool.close();
     }

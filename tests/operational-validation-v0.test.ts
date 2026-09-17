@@ -744,14 +744,17 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         ],
       });
 
-      // Claim reserva o item (SKIP LOCKED).
-      const reservadas = await repository.claimOutbox("worker-v0", 10, agora);
-      expect(reservadas).toHaveLength(1);
-      expect(reservadas[0]!.id).toBe(outboxId);
+      // Claim reserva o item. O banco é compartilhado entre cenários
+      // paralelos, então a asserção filtra pelos itens deste cenário —
+      // o SKIP LOCKED é provado no cenário de concorrência.
+      const reservadas = await repository.claimOutbox("worker-v0", 100, agora);
+      const minhasReservadas = reservadas.filter((item) => item.id === outboxId);
+      expect(minhasReservadas).toHaveLength(1);
+      expect(reservadas.find((item) => item.id === outboxId)).toBeDefined();
 
-      // Claim duplicada não pega o item já PROCESSING.
-      const segundaTentativa = await repository.claimOutbox("worker-v0-2", 10, agora);
-      expect(segundaTentativa).toHaveLength(0);
+      // Claim subsequente não re-reserva o item já PROCESSING deste cenário.
+      const segundaTentativa = await repository.claimOutbox("worker-v0-2", 100, agora);
+      expect(segundaTentativa.find((item) => item.id === outboxId)).toBeUndefined();
 
       // Aceitação idempotente: segunda chamada com os mesmos dados não falha.
       const receipt = {
@@ -982,10 +985,12 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       ]);
 
       const reservadasTotal = [...claimA, ...claimB];
-      const idsReservados = reservadasTotal.map((item) => item.id).sort();
-      expect(idsReservados).toEqual([...outboxIds].sort());
-      // Nenhum item em ambas as claims (sem duplicação).
-      expect(new Set(idsReservados).size).toBe(idsReservados.length);
+      const idsReservados = reservadasTotal.map((item) => item.id);
+      // Cada item deste cenário reservado exatamente uma vez — SKIP LOCKED
+      // impede duplicação e deadlock. O banco é compartilhado, então extraímos
+      // apenas os itens próprios (outros cenários podem aparecer nas claims).
+      const idsProprios = outboxIds.map((id) => idsReservados.filter((x) => x === id).length);
+      expect(idsProprios.every((n) => n === 1)).toBe(true);
 
       // Estado: ambos PROCESSING, nenhum duplicado.
       const estado = await pool.query<{ processando: string }>(

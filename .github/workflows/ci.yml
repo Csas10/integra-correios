@@ -50,6 +50,12 @@ jobs:
       - name: Repository policy
         run: npm run policy:repo
 
+      - name: Secret scan
+        run: npm run security:secrets
+
+      - name: PII scan
+        run: npm run security:pii
+
       - name: Typecheck
         run: npm run typecheck
 

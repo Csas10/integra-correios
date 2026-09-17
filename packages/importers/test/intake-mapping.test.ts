@@ -34,10 +34,12 @@ const CABECALHOS = [
 ];
 
 const LINHAS = [
-  ["PF", "PF001", "Maria Silva", "529.982.247-25", "01234-567", "Rua A, 10", "São Paulo", "SP", "11999990000", ""],
-  ["PJ", "PJ001", "Alpha Ltda", "11.222.333/0001-81", "04567-890", "Av B, 200", "Curitiba", "PR", "1141112222", "Alpha Comércio"],
+  // Documentos sintéticos sem máscara (a política de fixtures veda PII
+  // formatado; o que importa para o teste é o tipo String preservado).
+  ["PF", "PF001", "Maria Silva", "52998224725", "01234567", "Rua A, 10", "São Paulo", "SP", "11999990000", ""],
+  ["PJ", "PJ001", "Alpha Ltda", "11222333000181", "04567890", "Av B, 200", "Curitiba", "PR", "1141112222", "Alpha Comércio"],
   // Duplicada (mesma identidade da primeira — deve ser preservada).
-  ["PF", "PF001", "Maria Silva", "529.982.247-25", "01234-567", "Rua A, 10", "São Paulo", "SP", "11999990000", ""],
+  ["PF", "PF001", "Maria Silva", "52998224725", "01234567", "Rua A, 10", "São Paulo", "SP", "11999990000", ""],
 ];
 
 const MAPEAMENTO_PADRAO: Mapeamento = {
@@ -354,7 +356,7 @@ describe("sugestão e confirmação de mapeamento", () => {
       "PF",
     );
     const aplicado = aplicarMapeamento(leitura.folha, confirmado);
-    expect(aplicado.linhas[0]!.valores.CPF_CNPJ).toBe("529.982.247-25");
+    expect(aplicado.linhas[0]!.valores.CPF_CNPJ).toBe("52998224725");
     expect(() =>
       aplicarMapeamento(
         leitura.folha,

@@ -12,25 +12,61 @@ PF and PJ use one engine.
 Segregate ORIGEM = PF | PJ and preserve stable identities such as PF|<codigo>
 and PJ|<codigo>.
 
+## Authoritative domain contract
+
+The executable TypeScript domain contract is authoritative.
+A skill must never introduce new persisted domain states without
+an explicit domain change, ADR, migrations and human approval.
+
+The canonical operational lifecycle is defined in
+`packages/domain/src/status.ts` (`STATUS_OPERACIONAIS` +
+`transicoesPermitidas`) and mirrored by the PostgreSQL `CHECK`
+constraints. Do not invent statuses here.
+
 ## Eligibility
 
 Only APTO_PREPOSTAGEM records may be reserved into a PPN lot.
 
 Reservation is persistent and atomic.
 
-## Lifecycle
+## Lifecycle (canonical professional.status)
 
-IMPORTADO
-→ NORMALIZADO
-→ VALIDADO_LOCALMENTE
-→ ELEGIVEL
-→ RESERVADO_LOTE
-→ JSON_GERADO
-→ ENVIADO_PPN
-→ PROCESSADO_PPN
-→ PREPOSTAGEM_CONFIRMADA | REJEITADO_CORREIOS
-→ CORRECAO
+Happy path:
+
+APTO_PREPOSTAGEM
+→ EM_LOTE
+→ ENVIADO
+→ CONFIRMADO
+
+On rejection:
+
+ENVIADO
+→ REJEITADO
 → RETESTE
+→ EM_VALIDACAO
+→ APTO_PREPOSTAGEM
+
+## PPN concepts that are NOT professional.status values
+
+The following concepts belong to artifacts, events and reconciliation —
+never to `profissional.status` (which only accepts values from
+`STATUS_OPERACIONAIS`):
+
+- Lot-level milestones: the lot being generated, sent, processed and
+  acknowledged is a **milestone of the lot**, tracked on the lot and its
+  audit events.
+- JSON generation, submission and processing results are **artifact
+  state and audit events**, not professional states.
+- Rejection reasons (including CEP/address rejections) are
+  **reconciliation results** recorded per item; the professional status
+  that results from them is REJEITADO, following the canonical
+  transitions above.
+- Corrections and retests are **audit events plus canonical status
+  transitions** (REJEITADO → RETESTE → EM_VALIDACAO).
+
+These concepts must be described as audit events, lot milestones,
+artifact state or reconciliation results — and must never be persisted
+as `profissional.status`.
 
 ## Lots
 

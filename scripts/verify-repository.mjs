@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { parseSkillFrontmatter, REQUIRED_SKILLS } from "./lib/skill-frontmatter.mjs";
 
 const tracked = execFileSync(
   "git",
@@ -19,33 +20,8 @@ const sheetJsSha256 = "8dc73fc3b00203e72d176e85b50938627c7b086e607c682e8d3c22c02
 
 // Baseline canônica de skills versionadas em .claude/skills/.
 // Validação estrutural apenas: existência do diretório, presença de
-// SKILL.md e YAML frontmatter mínimo. NÃO valida conteúdo semântico.
-const REQUIRED_SKILLS = [
-  "agent-operating-model",
-  "correios-golden-profile",
-  "gmail-integration",
-  "intake-mapping-engine",
-  "legacy-regression",
-  "operational-persistence",
-  "pf-workflow",
-  "ppn-orchestration",
-  "quality-gate",
-  "repo-governance",
-  "security-privacy",
-  "web-operational-flow",
-];
-
-function parseSkillFrontmatter(content) {
-  // Frontmatter YAML mínimo: abre com --- na linha 1, fecha com --- e
-  // contém `name:` e `description:` não vazios. Sem parser semântico.
-  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(content);
-  if (!match) return null;
-  const frontmatter = match[1];
-  const name = /^name:\s*(\S.*)$/m.exec(frontmatter)?.[1]?.trim();
-  const description = /^description:\s*(\S.*)$/m.exec(frontmatter)?.[1]?.trim();
-  if (!name || !description) return null;
-  return { name, description };
-}
+// SKILL.md e frontmatter mínimo válido para o contrato de skills.
+// NÃO valida conteúdo semântico.
 
 for (const skill of REQUIRED_SKILLS) {
   const skillPath = `.claude/skills/${skill}/SKILL.md`;
@@ -53,9 +29,9 @@ for (const skill of REQUIRED_SKILLS) {
     violations.push(`${skillPath}: skill obrigatória ausente`);
     continue;
   }
-  const frontmatter = parseSkillFrontmatter(readFileSync(skillPath, "utf8"));
+  const frontmatter = parseSkillFrontmatter(readFileSync(skillPath, "utf8"), skill);
   if (!frontmatter) {
-    violations.push(`${skillPath}: YAML frontmatter inválido (name/description obrigatórios)`);
+    violations.push(`${skillPath}: frontmatter mínimo válido ausente (contrato de skills: name único = diretório, description single-line não vazia, sem campos extras)`);
     continue;
   }
   if (frontmatter.name !== skill) {

@@ -18,6 +18,8 @@
     "policy:repo": "node scripts/verify-repository.mjs",
     "typecheck": "tsc -p tsconfig.typecheck.json --noEmit --pretty false",
     "test": "vitest run",
+    "security:secrets": "node scripts/security-scan.mjs secrets",
+    "security:pii": "node scripts/security-scan.mjs pii",
     "build": "tsc -b --force --pretty false",
     "build:web": "npm run build --workspace=@integra-correios/web",
     "mail:homologation": "npm run build && node apps/worker/dist/mail-homologation.js"

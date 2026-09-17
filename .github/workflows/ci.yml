@@ -51,9 +51,17 @@ jobs:
         run: npm run policy:repo
 
       - name: Secret scan
+        # Snapshot atual + todos os commits introduzidos pela PR/push.
+        env:
+          SECURITY_SCAN_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          SECURITY_SCAN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: npm run security:secrets
 
       - name: PII scan
+        # Mesmo intervalo completo do secret scan; nunca somente HEAD^.
+        env:
+          SECURITY_SCAN_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          SECURITY_SCAN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: npm run security:pii
 
       - name: Typecheck

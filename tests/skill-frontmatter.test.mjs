@@ -21,6 +21,12 @@ describe("contrato de frontmatter das skills", () => {
     expect(valida("---\nname: skill-exemplo\ndescription: x\nextra: y\n---\n")).toBeNull();
   });
 
+  it("rejeita casing não canônico nas chaves", () => {
+    expect(valida("---\nName: skill-exemplo\ndescription: x\n---\n")).toBeNull();
+    expect(valida("---\nname: skill-exemplo\nDESCRIPTION: x\n---\n")).toBeNull();
+    expect(valida("---\nNAME: skill-exemplo\nDescription: x\n---\n")).toBeNull();
+  });
+
   it("rejeita name com formato inválido ou divergente do diretório", () => {
     expect(valida("---\nname: Skill_Exemplo\ndescription: x\n---\n")).toBeNull();
     expect(valida("---\nname: -skill\ndescription: x\n---\n")).toBeNull();

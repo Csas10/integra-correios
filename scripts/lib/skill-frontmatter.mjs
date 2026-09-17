@@ -33,7 +33,9 @@ export function parseSkillFrontmatter(content, expectedDirectory) {
     if (!line.trim()) continue;
     const keyValue = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
     if (!keyValue) return null; // linha fora do formato chave: valor
-    const key = keyValue[1].toLowerCase();
+    // O contrato é canônico e case-sensitive: somente `name` e
+    // `description` em minúsculas são aceitos.
+    const key = keyValue[1];
     const valueRaw = keyValue[2];
     if (!ALLOWED_KEYS.has(key)) return null; // campo inesperado
     if (seen.has(key)) return null; // chave duplicada

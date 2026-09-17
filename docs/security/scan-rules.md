@@ -8,10 +8,18 @@ npm run security:secrets
 npm run security:pii
 ```
 
-Ambos varrem apenas arquivos rastreados pelo git (`git ls-files --cached`),
-lendo o working tree com fallback para `HEAD`. Saída exibe somente arquivo,
-linha e a regra que casou — **nunca o conteúdo do match**. Exit code != 0
-em qualquer violação.
+Ambos sempre varrem o snapshot dos arquivos rastreados pelo git
+(`git ls-files --cached`), lendo o working tree com fallback para `HEAD`.
+Também verificam cada blob alterado em todos os commits introduzidos no
+intervalo base → head: na CI, o intervalo vem de
+`SECURITY_SCAN_BASE_SHA`/`SECURITY_SCAN_HEAD_SHA`; localmente, usa-se
+`origin/main..HEAD` quando essa referência existe. Assim, adicionar um valor
+sensível em um commit e removê-lo em outro não faz o gate passar.
+
+A saída exibe somente arquivo, linha, regra e, para histórico, o SHA abreviado
+do commit — **nunca o conteúdo do match**. Exit code != 0 em qualquer
+violação. Informar apenas um dos dois SHAs ou um intervalo que não possa ser
+resolvido também falha o gate.
 
 ## Secret scan (`security:secrets`)
 
@@ -59,6 +67,8 @@ por arquivo **e** por regra, com motivo declarado:
 | --- | --- | --- |
 | `.github/workflows/ci.yml` | somente `dsn-with-credentials`, e somente o valor sintético exato | DSN do service container efêmero de teste |
 | `packages/importers/test/intake-mapping.test.ts` | `cpf-sem-mascara` e `cnpj-sem-mascara`, somente os matches sintéticos exatos já usados pelo teste | preservação tipada e validação do importador |
+| `docs/security/scan-rules.md` | `cpf-formatado`, `cnpj-formatado` e `dsn-with-credentials`, somente no histórico e para notações sintéticas exatas presentes em commits anteriores da PR #9 | varredura histórica sem classificar placeholders conhecidos como PII/secret real |
+| `tests/security-scan.test.mjs` | `cpf-formatado` e `dsn-with-credentials`, somente no histórico e para fixtures sintéticas exatas presentes em commit anterior da PR #9 | varredura histórica da regressão do próprio scanner |
 
 Não existe wildcard de regra nem exclusão integral de arquivo. Qualquer outro
 match, inclusive outra credencial no mesmo arquivo, continua sendo reportado.
@@ -71,6 +81,7 @@ secrets/PII:
 
 - padrões simples podem escapar (secrets codificados, divididos,
   ofuscados ou de provedores não listados);
+- o histórico anterior ao intervalo base → head não é revarrido por esse gate;
 - CPF/CNPJ sem máscara são cobertos apenas em test/tests/fixtures/docs e
   exigem dígito verificador válido; outros tipos de PII podem escapar;
 - a allowlist reduz falso-positivos mas também limita a cobertura.

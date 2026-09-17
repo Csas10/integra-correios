@@ -13,6 +13,11 @@ const DSN_SINTETICO = [
   ":integra_test_ephemeral",
   "@localhost:5432/integra_correios_test",
 ].join(""); // dsn-with-credentials permitido somente na CI
+const DSN_HISTORICO_DOCUMENTADO = [
+  "postgres://user",
+  ":senha",
+  "@...",
+].join("");
 const PII_FIXTURE = ["123", ".456", ".789", "-09"].join(""); // cpf-formatado
 
 function calcularDigito(base, pesos) {
@@ -44,16 +49,46 @@ function criarRepoTemp(arquivos) {
     writeFileSync(abs, conteudo);
   }
   execFileSync("git", ["init", "-q"], { cwd: dir });
-  // O scanner usa git ls-files --cached: basta indexar, sem commit.
+  // O snapshot usa git ls-files --cached: basta indexar, sem commit.
   execFileSync("git", ["add", "-A"], { cwd: dir });
   return dir;
 }
 
-function rodarScanner(mode, cwd) {
+function commitRepo(cwd, message) {
+  execFileSync("git", ["add", "-A"], { cwd });
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=Integra Test",
+      "-c",
+      "user.email=integra-test@example.invalid",
+      "commit",
+      "-q",
+      "-m",
+      message,
+    ],
+    { cwd },
+  );
+  return execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd,
+    encoding: "utf8",
+  }).trim();
+}
+
+function rodarScanner(mode, cwd, range = null) {
+  const env = { ...process.env };
+  delete env.SECURITY_SCAN_BASE_SHA;
+  delete env.SECURITY_SCAN_HEAD_SHA;
+  if (range) {
+    env.SECURITY_SCAN_BASE_SHA = range.base;
+    env.SECURITY_SCAN_HEAD_SHA = range.head;
+  }
   try {
     const out = execFileSync("node", [SCANNER, mode], {
       cwd,
       encoding: "utf8",
+      env,
     });
     return { code: 0, out };
   } catch (error) {
@@ -128,6 +163,20 @@ describe("security scan — contrato executável", () => {
     }
   });
 
+  it("exceção histórica exata não libera o mesmo match no snapshot atual", () => {
+    const dir = criarRepoTemp({
+      "docs/security/scan-rules.md": `exemplo: ${DSN_HISTORICO_DOCUMENTADO}\n`,
+    });
+    try {
+      const r = rodarScanner("secrets", dir);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("VIOLATION [dsn-with-credentials]");
+      expect(r.out).not.toContain(DSN_HISTORICO_DOCUMENTADO);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   for (const arquivo of [
     "scripts/security-scan.mjs",
     "tests/security-scan.test.mjs",
@@ -178,6 +227,35 @@ describe("security scan — contrato executável", () => {
       const r = rodarScanner("pii", dir);
       expect(r.code).toBe(0);
       expect(r.out).toContain("PII scan: PASS");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("detecta secret e PII removidos do snapshot, mas presentes em commit intermediário", () => {
+    const cpf = cpfSintetico("314159265");
+    const dir = criarRepoTemp({ "docs/historico.md": "# limpo\n" });
+    try {
+      const base = commitRepo(dir, "base limpa");
+      writeFileSync(
+        path.join(dir, "docs/historico.md"),
+        `chave: ${SECRET_FIXTURE}\ncpf: ${cpf}\n`,
+      );
+      const exposed = commitRepo(dir, "adiciona fixture bloqueada");
+      writeFileSync(path.join(dir, "docs/historico.md"), "# limpo novamente\n");
+      const head = commitRepo(dir, "remove fixture bloqueada");
+
+      const secretResult = rodarScanner("secrets", dir, { base, head });
+      expect(secretResult.code).toBe(1);
+      expect(secretResult.out).toContain("VIOLATION [resend-api-key]");
+      expect(secretResult.out).toContain(`commit ${exposed.slice(0, 12)}:docs/historico.md:1`);
+      expect(secretResult.out).not.toContain(SECRET_FIXTURE);
+
+      const piiResult = rodarScanner("pii", dir, { base, head });
+      expect(piiResult.code).toBe(1);
+      expect(piiResult.out).toContain("VIOLATION [cpf-sem-mascara]");
+      expect(piiResult.out).toContain(`commit ${exposed.slice(0, 12)}:docs/historico.md:2`);
+      expect(piiResult.out).not.toContain(cpf);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

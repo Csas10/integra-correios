@@ -26,6 +26,15 @@ const CI_TEST_DSN = [
 ].join("");
 const IMPORTER_TEST_CPF = ["529", "982", "247", "25"].join("");
 const IMPORTER_TEST_CNPJ = ["11", "222", "333", "0001", "81"].join("");
+const HISTORICAL_DOC_CPF = ["000", ".000", ".000", "-00"].join("");
+const HISTORICAL_DOC_CNPJ = ["00", ".000", ".000", "/0000", "-00"].join("");
+const HISTORICAL_TEST_CPF = ["123", ".456", ".789", "-09"].join("");
+const HISTORICAL_DOC_DSN = ["postgres://user", ":senha", "@..."].join("");
+const HISTORICAL_TEST_DSN = [
+  "postgresql://integra_test",
+  ":integra_test_ephemeral",
+  "@localhost:5432/db",
+].join("");
 
 const ALLOWLIST_NARROW = [
   {
@@ -48,20 +57,65 @@ const ALLOWLIST_NARROW = [
     matches: new Set([IMPORTER_TEST_CNPJ]),
     motivo: "fixture sintética de CNPJ exercitada pelo importador",
   },
+  {
+    file: "docs/security/scan-rules.md",
+    rule: "cpf-formatado",
+    matches: new Set([HISTORICAL_DOC_CPF]),
+    historyOnly: true,
+    motivo: "notação sintética presente em commits anteriores desta PR",
+  },
+  {
+    file: "docs/security/scan-rules.md",
+    rule: "cnpj-formatado",
+    matches: new Set([HISTORICAL_DOC_CNPJ]),
+    historyOnly: true,
+    motivo: "notação sintética presente em commits anteriores desta PR",
+  },
+  {
+    file: "docs/security/scan-rules.md",
+    rule: "dsn-with-credentials",
+    matches: new Set([HISTORICAL_DOC_DSN]),
+    historyOnly: true,
+    motivo: "notação sintética presente em commits anteriores desta PR",
+  },
+  {
+    file: "tests/security-scan.test.mjs",
+    rule: "cpf-formatado",
+    matches: new Set([HISTORICAL_TEST_CPF]),
+    historyOnly: true,
+    motivo: "fixture sintética presente em commit anterior desta PR",
+  },
+  {
+    file: "tests/security-scan.test.mjs",
+    rule: "dsn-with-credentials",
+    matches: new Set([HISTORICAL_TEST_DSN]),
+    historyOnly: true,
+    motivo: "fixture sintética presente em commit anterior desta PR",
+  },
 ];
 
-function permitido(file, ruleName, matchedValue) {
+function permitido(file, ruleName, matchedValue, source) {
   return ALLOWLIST_NARROW.some(
     (entry) =>
       entry.file === file &&
       entry.rule === ruleName &&
-      entry.matches.has(matchedValue),
+      entry.matches.has(matchedValue) &&
+      (!entry.historyOnly || source !== null),
   );
 }
 
-const tracked = execFileSync("git", ["ls-files", "--cached", "-z"], {
-  encoding: "utf8",
-})
+const MAX_GIT_OUTPUT = 20 * 1024 * 1024;
+const SHA_FORMAT = /^[0-9a-f]{40}$/i;
+
+function executarGit(args) {
+  return execFileSync("git", args, {
+    encoding: "utf8",
+    maxBuffer: MAX_GIT_OUTPUT,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+}
+
+const tracked = executarGit(["ls-files", "--cached", "-z"])
   .split("\0")
   .filter(Boolean);
 
@@ -76,7 +130,7 @@ const SECRET_RULES = [
   ["slack-token", /\bxox[abpr]-[A-Za-z0-9-]{10,}\b/],
   [
     "dsn-with-credentials",
-    /(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|amqps?|redis):\/\/[^\s/:@]+:[^\s/@]+@[^\s]+/,
+    /(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|amqps?|redis):\/\/[^\s/:@'"`<>]+:[^\s/@'"`<>]+@[^\s'"`<>]+/,
   ],
 ];
 
@@ -139,9 +193,40 @@ function extrairMatches(rule, line, file) {
   return Array.from(line.matchAll(new RegExp(rule.source, flags)), (match) => match[0]);
 }
 
-function scanFiles(rules) {
+function scanContent(rules, file, content, source = null) {
+  const rel = file.split(path.sep).join("/");
+  const location = source ? `${source}:${rel}` : rel;
+  const lines = content.split(/\r?\n/);
+  for (const [ruleName, rule] of rules) {
+    lines.forEach((line, i) => {
+      const matches = extrairMatches(rule, line, rel);
+      if (
+        matches.some(
+          (matchedValue) => !permitido(rel, ruleName, matchedValue, source),
+        )
+      ) {
+        // Saída NÃO reproduz o match completo — apenas local + regra.
+        console.error(
+          `VIOLATION [${ruleName}] ${location}:${i + 1} (conteúdo omitido)`,
+        );
+        process.exitCode = 1;
+      }
+    });
+  }
+  if (mode === "secrets") {
+    for (const pattern of SENSITIVE_CONFIG_NONEMPTY) {
+      if (pattern.test(rel) && content.trim().length > 0) {
+        console.error(
+          `VIOLATION [config-sensivel-nao-vazio] ${location} (conteúdo omitido)`,
+        );
+        process.exitCode = 1;
+      }
+    }
+  }
+}
+
+function scanSnapshot(rules) {
   for (const file of tracked) {
-    const rel = file.split(path.sep).join("/");
     let content;
     try {
       // Lê do working tree (gate pré-commit); fallback para HEAD quando o
@@ -149,34 +234,118 @@ function scanFiles(rules) {
       content = readFileSync(file, "utf8");
     } catch {
       try {
-        content = execFileSync("git", ["show", `HEAD:${file}`], {
-          encoding: "utf8",
-          maxBuffer: 10 * 1024 * 1024,
-        });
+        content = executarGit(["show", `HEAD:${file}`]);
       } catch {
         continue;
       }
     }
-    const lines = content.split(/\r?\n/);
-    for (const [ruleName, rule] of rules) {
-      lines.forEach((line, i) => {
-        const matches = extrairMatches(rule, line, rel);
-        if (matches.some((matchedValue) => !permitido(rel, ruleName, matchedValue))) {
-          // Saída NÃO reproduz o match completo — apenas local + regra.
-          console.error(`VIOLATION [${ruleName}] ${file}:${i + 1} (conteúdo omitido)`);
-          process.exitCode = 1;
-        }
-      });
+    scanContent(rules, file, content);
+  }
+}
+
+function resolveHistoryRange() {
+  const baseFromEnv = process.env.SECURITY_SCAN_BASE_SHA?.trim();
+  const headFromEnv = process.env.SECURITY_SCAN_HEAD_SHA?.trim();
+  if (Boolean(baseFromEnv) !== Boolean(headFromEnv)) {
+    console.error(
+      "ERROR [security-scan-range] base/head devem ser informados em conjunto",
+    );
+    process.exitCode = 2;
+    return null;
+  }
+  if (baseFromEnv && headFromEnv) {
+    if (!SHA_FORMAT.test(baseFromEnv) || !SHA_FORMAT.test(headFromEnv)) {
+      console.error(
+        "ERROR [security-scan-range] base/head devem ser SHAs completos",
+      );
+      process.exitCode = 2;
+      return null;
     }
-    if (mode === "secrets") {
-      for (const pattern of SENSITIVE_CONFIG_NONEMPTY) {
-        if (pattern.test(file.split(path.sep).join("/")) && content.trim().length > 0) {
-          console.error(`VIOLATION [config-sensivel-nao-vazio] ${file} (conteúdo omitido)`);
-          process.exitCode = 1;
-        }
+    return { base: baseFromEnv, head: headFromEnv };
+  }
+
+  try {
+    return {
+      base: executarGit(["rev-parse", "--verify", "origin/main^{commit}"]).trim(),
+      head: executarGit(["rev-parse", "--verify", "HEAD^{commit}"]).trim(),
+    };
+  } catch {
+    // Repositórios temporários sem origin/main continuam cobertos pelo snapshot.
+    return null;
+  }
+}
+
+function changedFilesAtCommit(commit) {
+  const ancestry = executarGit(["rev-list", "--parents", "-n", "1", commit])
+    .trim()
+    .split(/\s+/);
+  const parent = ancestry[1];
+  const output = parent
+    ? executarGit([
+        "diff",
+        "--name-only",
+        "--diff-filter=ACMR",
+        "-z",
+        parent,
+        commit,
+        "--",
+      ])
+    : executarGit(["ls-tree", "-r", "--name-only", "-z", commit]);
+  return [...new Set(output.split("\0").filter(Boolean))];
+}
+
+function scanHistory(rules) {
+  const range = resolveHistoryRange();
+  if (!range || process.exitCode === 2) return 0;
+
+  let commits;
+  try {
+    commits = executarGit([
+      "rev-list",
+      "--reverse",
+      `${range.base}..${range.head}`,
+    ])
+      .split(/\r?\n/)
+      .filter(Boolean);
+  } catch {
+    console.error(
+      "ERROR [security-scan-range] não foi possível resolver o intervalo",
+    );
+    process.exitCode = 2;
+    return 0;
+  }
+
+  for (const commit of commits) {
+    let files;
+    try {
+      files = changedFilesAtCommit(commit);
+    } catch {
+      console.error(
+        "ERROR [security-scan-history] não foi possível enumerar um commit",
+      );
+      process.exitCode = 2;
+      return commits.length;
+    }
+    for (const file of files) {
+      try {
+        const objectType = executarGit([
+          "cat-file",
+          "-t",
+          `${commit}:${file}`,
+        ]).trim();
+        if (objectType !== "blob") continue;
+        const content = executarGit(["show", `${commit}:${file}`]);
+        scanContent(rules, file, content, `commit ${commit.slice(0, 12)}`);
+      } catch {
+        console.error(
+          "ERROR [security-scan-history] não foi possível ler um blob alterado",
+        );
+        process.exitCode = 2;
+        return commits.length;
       }
     }
   }
+  return commits.length;
 }
 
 const label = mode === "secrets" ? "Secret scan" : mode === "pii" ? "PII scan" : null;
@@ -185,8 +354,13 @@ if (!label) {
   process.exit(2);
 }
 
-scanFiles(mode === "secrets" ? SECRET_RULES : PII_RULES);
+const selectedRules = mode === "secrets" ? SECRET_RULES : PII_RULES;
+scanSnapshot(selectedRules);
+const scannedCommits = scanHistory(selectedRules);
 
-if (process.exitCode !== 1) {
-  console.log(`${label}: PASS (nenhuma violação em ${tracked.length} arquivos rastreados)`);
+if (!process.exitCode) {
+  console.log(
+    `${label}: PASS (nenhuma violação em ${tracked.length} arquivos rastreados; ` +
+      `${scannedCommits} commits do intervalo revisado)`,
+  );
 }

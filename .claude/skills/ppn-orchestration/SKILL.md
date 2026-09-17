@@ -52,8 +52,10 @@ ENVIADO
 ## PPN concepts that are NOT professional.status values
 
 The following concepts belong to artifacts, events and reconciliation —
-never to `profissional.status` (which only accepts values from
-`STATUS_OPERACIONAIS`):
+never to `profissional.status`. The TypeScript domain contract restricts PPN
+orchestration to the values in `STATUS_OPERACIONAIS`; the current PostgreSQL
+`CHECK` remains broader, as documented under **Known divergence** below, and
+must not be interpreted as authorization to emit additional values:
 
 - Lot-level milestones: the lot being generated, sent, processed and
   acknowledged is a **milestone of the lot**, tracked on the lot and its

@@ -8,9 +8,33 @@ const SCANNER = path.resolve("scripts/security-scan.mjs");
 
 // Fixtures sintéticas (nunca valores reais).
 const SECRET_FIXTURE = `re_${"A".repeat(30)}`; // casa com resend-api-key
-const DSN_SINTETICO =
-  "postgresql://integra_test:integra_test_ephemeral@localhost:5432/db"; // dsn-with-credentials
-const PII_FIXTURE = "123.456.789-09"; // casa com cpf-formatado
+const DSN_SINTETICO = [
+  "postgresql://integra_test",
+  ":integra_test_ephemeral",
+  "@localhost:5432/integra_correios_test",
+].join(""); // dsn-with-credentials permitido somente na CI
+const PII_FIXTURE = ["123", ".456", ".789", "-09"].join(""); // cpf-formatado
+
+function calcularDigito(base, pesos) {
+  const soma = pesos.reduce(
+    (total, peso, indice) => total + Number(base[indice]) * peso,
+    0,
+  );
+  const resto = soma % 11;
+  return resto < 2 ? 0 : 11 - resto;
+}
+
+function cpfSintetico(base) {
+  const primeiro = calcularDigito(base, [10, 9, 8, 7, 6, 5, 4, 3, 2]);
+  const segundo = calcularDigito(`${base}${primeiro}`, [11, 10, 9, 8, 7, 6, 5, 4, 3, 2]);
+  return `${base}${primeiro}${segundo}`;
+}
+
+function cnpjSintetico(base) {
+  const primeiro = calcularDigito(base, [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]);
+  const segundo = calcularDigito(`${base}${primeiro}`, [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]);
+  return `${base}${primeiro}${segundo}`;
+}
 
 function criarRepoTemp(arquivos) {
   const dir = mkdtempSync(path.join(tmpdir(), "scan-test-"));
@@ -99,6 +123,61 @@ describe("security scan — contrato executável", () => {
       expect(r.code).toBe(1);
       expect(r.out).toContain("VIOLATION [resend-api-key]");
       expect(r.out).toContain(".github/workflows/ci.yml:2");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const arquivo of [
+    "scripts/security-scan.mjs",
+    "tests/security-scan.test.mjs",
+    "docs/security/scan-rules.md",
+  ]) {
+    it(`não desabilita todas as regras em ${arquivo}`, () => {
+      const dir = criarRepoTemp({
+        [arquivo]: `chave: ${SECRET_FIXTURE}\n`,
+      });
+      try {
+        const r = rodarScanner("secrets", dir);
+        expect(r.code).toBe(1);
+        expect(r.out).toContain("VIOLATION [resend-api-key]");
+        expect(r.out).toContain(`${arquivo}:1`);
+        expect(r.out).not.toContain(SECRET_FIXTURE);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("detecta CPF e CNPJ válidos sem máscara em docs/fixtures", () => {
+    const cpf = cpfSintetico("314159265");
+    const cnpj = cnpjSintetico("271828180001");
+    const dir = criarRepoTemp({
+      "docs/identificadores.md": `cpf: ${cpf}\ncnpj: ${cnpj}\n`,
+    });
+    try {
+      const r = rodarScanner("pii", dir);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("VIOLATION [cpf-sem-mascara]");
+      expect(r.out).toContain("VIOLATION [cnpj-sem-mascara]");
+      expect(r.out).not.toContain(cpf);
+      expect(r.out).not.toContain(cnpj);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("não sinaliza sequências sem máscara com DV inválido ou fora do escopo", () => {
+    const cpf = cpfSintetico("314159265");
+    const cnpj = cnpjSintetico("271828180001");
+    const dir = criarRepoTemp({
+      "docs/invalidos.md": "cpf: 31415926500\ncnpj: 27182818000100\nrepetido: 11111111111\n",
+      "src/fora-do-escopo.txt": `cpf: ${cpf}\ncnpj: ${cnpj}\n`,
+    });
+    try {
+      const r = rodarScanner("pii", dir);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("PII scan: PASS");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

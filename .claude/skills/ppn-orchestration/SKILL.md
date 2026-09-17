@@ -20,8 +20,11 @@ an explicit domain change, ADR, migrations and human approval.
 
 The canonical operational lifecycle is defined in
 `packages/domain/src/status.ts` (`STATUS_OPERACIONAIS` +
-`transicoesPermitidas`) and mirrored by the PostgreSQL `CHECK`
-constraints. Do not invent statuses here.
+`transicoesPermitidas`). Do not invent statuses here.
+
+The PostgreSQL `CHECK` is currently broader than `STATUS_OPERACIONAIS`.
+That broader persistence constraint must not be interpreted as authorization
+for PPN orchestration to emit additional `profissional.status` values.
 
 ## Eligibility
 
@@ -76,9 +79,8 @@ additional values that are NOT in `STATUS_OPERACIONAIS`:
 `CARTEIRA_IDENTIFICADA`, `PENDENCIA_TRIAGEM`, `EMAIL_PENDENTE`,
 `PENDENCIA_CADASTRAL`, `INCLUIDO_EM_LOTE` and `POSTADO`.
 
-These are legacy/future-state values kept by the migration for schema
-evolution; they are not valid transitions in
-`packages/domain/src/status.ts` and must not be produced by PPN
+These additional values are present in the migration but are not valid
+transitions in `packages/domain/src/status.ts` and must not be produced by PPN
 orchestration code. In particular, `INCLUIDO_EM_LOTE` and `POSTADO` are
 lot/artifact milestones and remain forbidden as `profissional.status`.
 

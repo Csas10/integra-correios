@@ -25,7 +25,7 @@ Cobre no mínimo:
 | google-api-key | `AIza...` |
 | resend-api-key | `re_...` (30+ chars) |
 | slack-token | `xox...` |
-| dsn-with-credentials | `postgres://user:senha@...` e similares |
+| dsn-with-credentials | forma `<esquema>://<usuário>:<senha>@<host>` para esquemas suportados |
 
 A regra `config-sensivel-nao-vazio` **não está ativa**: a política
 estrutural (`npm run policy:repo`) já é a barreira primária contra arquivos
@@ -39,15 +39,16 @@ Foca testes, fixtures, docs e exemplos. Cobre:
 
 | Regra | Padrão |
 | --- | --- |
-| cpf-formatado | `000.000.000-00` |
-| cnpj-formatado | `00.000.000/0000-00` |
+| cpf-formatado | forma `DDD.DDD.DDD-DD` |
+| cnpj-formatado | forma `DD.DDD.DDD/DDDD-DD` |
+| cpf-sem-mascara | 11 dígitos, somente em test/tests/fixtures/docs e com DV válido |
+| cnpj-sem-mascara | 14 dígitos, somente em test/tests/fixtures/docs e com DV válido |
 | email-institucional | domínios institucionais conhecidos |
 | telefone-br | formatos brasileiros com/sem +55 |
 
-Exclui por política: fixtures sintéticas homologadas de
-`packages/domain/test` e `packages/validation/test` (valores inválidos
-propositalmente — zeros/repetidos — usados pelos testes de dígito
-verificador).
+Sequências repetidas ou com dígito verificador inválido não são tratadas como
+CPF/CNPJ sem máscara. Isso mantém fixtures negativas sintéticas — como zeros e
+repetidos — sem reduzir a detecção de identificadores válidos.
 
 ## Exceções (narrow, por arquivo + regra)
 
@@ -56,13 +57,12 @@ por arquivo **e** por regra, com motivo declarado:
 
 | Arquivo | Regras | Motivo |
 | --- | --- | --- |
-| `scripts/security-scan.mjs` | todas | fonte das próprias regras (padrões sintéticos) |
-| `tests/security-scan.test.mjs` | todas | fixtures sintéticas dos testes do scanner |
-| `docs/security/scan-rules.md` | todas | documentação das formas dos padrões |
-| `.github/workflows/ci.yml` | somente `dsn-with-credentials` | DSNs sintéticos do service container efêmero de teste |
+| `.github/workflows/ci.yml` | somente `dsn-with-credentials`, e somente o valor sintético exato | DSN do service container efêmero de teste |
+| `packages/importers/test/intake-mapping.test.ts` | `cpf-sem-mascara` e `cnpj-sem-mascara`, somente os matches sintéticos exatos já usados pelo teste | preservação tipada e validação do importador |
 
-Qualquer OUTRA regra que casar nesses arquivos continua sendo
-reportada. Qualquer adição à lista exige revisão humana na PR.
+Não existe wildcard de regra nem exclusão integral de arquivo. Qualquer outro
+match, inclusive outra credencial no mesmo arquivo, continua sendo reportado.
+Qualquer adição à lista exige revisão humana na PR.
 
 ## Limitações
 
@@ -71,7 +71,8 @@ secrets/PII:
 
 - padrões simples podem escapar (secrets codificados, divididos,
   ofuscados ou de provedores não listados);
-- o PII scan é focado em fixtures/docs e não cobre todos os formatos;
+- CPF/CNPJ sem máscara são cobertos apenas em test/tests/fixtures/docs e
+  exigem dígito verificador válido; outros tipos de PII podem escapar;
 - a allowlist reduz falso-positivos mas também limita a cobertura.
 
 A política estrutural (`npm run policy:repo`) continua sendo a barreira

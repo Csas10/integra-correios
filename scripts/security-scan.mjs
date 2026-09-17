@@ -227,19 +227,24 @@ function scanContent(rules, file, content, source = null) {
 
 function scanSnapshot(rules) {
   for (const file of tracked) {
-    let content;
+    const versions = new Set();
     try {
-      // Lê do working tree (gate pré-commit); fallback para HEAD quando o
-      // arquivo foi deletado. Binários/não-UTF8 caem no catch e são ignorados.
-      content = readFileSync(file, "utf8");
+      // O índice é a fonte autoritativa do que será commitado. Ler apenas o
+      // working tree permitiria ocultar um secret staged com uma edição local.
+      versions.add(executarGit(["show", `:${file}`]));
     } catch {
-      try {
-        content = executarGit(["show", `HEAD:${file}`]);
-      } catch {
-        continue;
-      }
+      continue;
     }
-    scanContent(rules, file, content);
+    try {
+      // Também cobre alterações ainda não indexadas. O Set evita varrer duas
+      // vezes o conteúdo quando índice e working tree são idênticos.
+      versions.add(readFileSync(file, "utf8"));
+    } catch {
+      // Arquivo removido do working tree: a versão staged já foi examinada.
+    }
+    for (const content of versions) {
+      scanContent(rules, file, content);
+    }
   }
 }
 

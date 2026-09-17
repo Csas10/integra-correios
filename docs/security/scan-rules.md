@@ -9,7 +9,10 @@ npm run security:pii
 ```
 
 Ambos sempre varrem o snapshot dos arquivos rastreados pelo git
-(`git ls-files --cached`), lendo o working tree com fallback para `HEAD`.
+(`git ls-files --cached`). Para cada caminho, examinam a versão do índice
+(`git show :<caminho>`) e a versão do working tree; conteúdos idênticos são
+deduplicados. Assim, tanto o que está staged para o próximo commit quanto
+alterações locais ainda não indexadas passam pelo gate.
 Também verificam cada blob alterado em todos os commits introduzidos no
 intervalo base → head: na CI, o intervalo vem de
 `SECURITY_SCAN_BASE_SHA`/`SECURITY_SCAN_HEAD_SHA`; localmente, usa-se

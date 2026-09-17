@@ -131,6 +131,31 @@ describe("security scan — contrato executável", () => {
     }
   });
 
+  it("varre separadamente índice e working tree quando o conteúdo diverge", () => {
+    const dir = criarRepoTemp({
+      "docs/staged.md": `chave: ${SECRET_FIXTURE}\n`,
+      "docs/working.md": "# limpo no índice\n",
+    });
+    try {
+      // O primeiro secret existe apenas no índice; o segundo, apenas no
+      // working tree. Ambos precisam bloquear o gate pré-commit.
+      writeFileSync(path.join(dir, "docs/staged.md"), "# limpo no working tree\n");
+      writeFileSync(
+        path.join(dir, "docs/working.md"),
+        `chave: ${SECRET_FIXTURE}\n`,
+      );
+
+      const r = rodarScanner("secrets", dir);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("docs/staged.md:1");
+      expect(r.out).toContain("docs/working.md:1");
+      expect(r.out.match(/VIOLATION \[resend-api-key\]/g)).toHaveLength(2);
+      expect(r.out).not.toContain(SECRET_FIXTURE);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("saída NUNCA reproduz o valor casado", () => {
     const dir = criarRepoTemp({
       "docs/exemplo.md": `chave: ${SECRET_FIXTURE}\ncpf: ${PII_FIXTURE}\n`,

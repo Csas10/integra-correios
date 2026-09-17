@@ -267,7 +267,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         status: "CARTEIRA_IDENTIFICADA",
         document: {
           documentType: "CPF",
-          fingerprint: fingerprinter.fingerprint("cpf-v0", CPF_VALIDO),
+          fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${CPF_VALIDO}`),
           encrypted: caixa.seal(CPF_VALIDO_FORMATADO, "documento:cpf"),
         },
         originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
@@ -337,7 +337,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         },
         items: [
           {
-            professionalId: `PF|${codigo}`,
+            professionalId: profissionalId,
             confirmationId,
             communicationId,
             outboxId,
@@ -457,7 +457,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         status: "CARTEIRA_IDENTIFICADA",
         document: {
           documentType: "CPF",
-          fingerprint: fingerprinter.fingerprint("cpf-v0", CPF_VALIDO),
+          fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${CPF_VALIDO}`),
           encrypted: caixa.seal(CPF_VALIDO_FORMATADO, "documento:cpf"),
         },
         originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
@@ -495,7 +495,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         },
         items: [
           {
-            professionalId: `PF|${codigo}`,
+            professionalId: profissionalId,
             confirmationId,
             communicationId: randomUUID(),
             outboxId: randomUUID(),
@@ -557,7 +557,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         status: "CARTEIRA_IDENTIFICADA",
         document: {
           documentType: "CPF",
-          fingerprint: fingerprinter.fingerprint("cpf-v0", CPF_VALIDO),
+          fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${CPF_VALIDO}`),
           encrypted: caixa.seal(CPF_VALIDO_FORMATADO, "documento:cpf"),
         },
         originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
@@ -575,6 +575,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       // Lote cujo item referencia um profissional inexistente → erro no meio
       // da transação do lote (constraint FK da confirmacao).
       const loteId = randomUUID();
+      const profissionalIdInexistente = randomUUID();
       const loteFracassadoId = randomUUID();
       const loteFracassadoOutboxId = randomUUID();
       await expect(
@@ -596,7 +597,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           },
           items: [
             {
-              professionalId: `PF|${codigo}-INEXISTENTE`,
+              professionalId: profissionalIdInexistente,
               confirmationId: loteFracassadoId,
               communicationId: randomUUID(),
               outboxId: loteFracassadoOutboxId,
@@ -664,7 +665,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         status: "CARTEIRA_IDENTIFICADA",
         document: {
           documentType: "CPF",
-          fingerprint: fingerprinter.fingerprint("cpf-v0", CPF_VALIDO),
+          fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${CPF_VALIDO}`),
           encrypted: caixa.seal(CPF_VALIDO_FORMATADO, "documento:cpf"),
         },
         originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
@@ -703,7 +704,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         },
         items: [
           {
-            professionalId: `PF|${codigo}`,
+            professionalId: profissionalId,
             confirmationId,
             communicationId,
             outboxId,
@@ -791,7 +792,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         status: "CARTEIRA_IDENTIFICADA",
         document: {
           documentType: "CPF",
-          fingerprint: fingerprinter.fingerprint("cpf-v0", CPF_VALIDO),
+          fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${CPF_VALIDO}`),
           encrypted: caixa.seal(CPF_VALIDO_FORMATADO, "documento:cpf"),
         },
         originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
@@ -828,7 +829,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         },
         items: [
           {
-            professionalId: `PF|${codigo}`,
+            professionalId: profissionalId,
             confirmationId,
             communicationId: randomUUID(),
             outboxId: randomUUID(),
@@ -899,7 +900,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           status: "CARTEIRA_IDENTIFICADA",
           document: {
             documentType: "CPF",
-            fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${id}`),
+            fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${CPF_VALIDO}`),
             encrypted: caixa.seal(CPF_VALIDO_FORMATADO, "documento:cpf"),
           },
           originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
@@ -934,7 +935,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           eventHash: hash64(loteId),
         },
         items: outboxIds.map((outboxId, indice) => ({
-          professionalId: `PF|${indice === 0 ? codigoA : codigoB}`,
+          professionalId: indice === 0 ? profissionalAId : profissionalBId,
           confirmationId: randomUUID(),
           communicationId: randomUUID(),
           outboxId,

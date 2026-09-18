@@ -174,6 +174,11 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
 
   async enqueueCommunicationBatch(command: EnqueueCommunicationBatchCommand): Promise<void> {
     if (command.items.length === 0) throw new Error("Lote de comunicação vazio");
+    // F7: modo obrigatório — lote sem modo declarado é erro de contrato
+    // (fail-closed), nunca um DEFAULT silencioso.
+    if (command.mode !== "DRY_RUN" && command.mode !== "LIVE_PILOT") {
+      throw new Error("mode do lote obrigatório (DRY_RUN | LIVE_PILOT)");
+    }
     const professionalIds = new Set(command.items.map((item) => item.professionalId));
     if (professionalIds.size !== command.items.length) {
       throw new Error("Profissional duplicado no lote de comunicação");
@@ -491,7 +496,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         modo: string;
       }>(
         `WITH candidatas AS (
-          SELECT outbox.id
+          SELECT outbox.id, lote.modo
           FROM outbox_email outbox
           JOIN comunicacao comunicacao ON comunicacao.id = outbox.comunicacao_id
           JOIN lote_comunicacao lote ON lote.id = comunicacao.lote_comunicacao_id
@@ -511,7 +516,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         WHERE outbox.id = candidatas.id
         RETURNING outbox.id, outbox.comunicacao_id, outbox.idempotency_key,
           outbox.payload_ciphertext, outbox.payload_nonce, outbox.payload_auth_tag,
-          outbox.chave_versao, outbox.tentativas, lote.modo`,
+          outbox.chave_versao, outbox.tentativas, candidatas.modo`,
         [now, limit, workerId],
       );
       if (result.rows.length > 0) {

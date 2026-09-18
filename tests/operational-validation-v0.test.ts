@@ -327,6 +327,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigo}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
         createdBy: "validacao-v0",
         createdAt: new Date().toISOString(),
         auditEvent: {
@@ -495,6 +496,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigo}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
         createdBy: "validacao-v0",
         createdAt: new Date().toISOString(),
         auditEvent: {
@@ -602,6 +604,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           code: `PF-MAIL-V0-${codigo}`,
           origin: "PF",
           templateVersion: "pf-confirmation-v1",
+          mode: "DRY_RUN",
           createdBy: "validacao-v0",
           createdAt: new Date().toISOString(),
           auditEvent: {
@@ -709,6 +712,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigo}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
         createdBy: "validacao-v0",
         createdAt: agora,
         auditEvent: {
@@ -877,6 +881,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigo}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
         createdBy: "validacao-v0",
         createdAt: new Date().toISOString(),
         auditEvent: {
@@ -984,6 +989,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigoA}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
         createdBy: "validacao-v0",
         createdAt: agora,
         auditEvent: {
@@ -1108,6 +1114,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           code: `PF-MAIL-V0-${randomUUID().slice(0, 8).toUpperCase()}-${suffix}`,
           origin: "PF",
           templateVersion: "pf-confirmation-v1",
+          mode: "DRY_RUN",
           createdBy: "validacao-v0",
           createdAt: agora,
           auditEvent: {
@@ -1239,6 +1246,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       // Segunda linha rompe a UNIQUE (origem, documento_fingerprint): falha
       // PROVOCADA no meio da escrita (após arquivo/importação/1ª linha).
       const sha256 = hash64(`rollback-import-${randomUUID()}`);
+      const idLinha1 = randomUUID();
+      const idLinha2 = randomUUID();
       const linhaValida = {
         numeroLinha: 1,
         dadosBrutos: caixa.seal(JSON.stringify({ CODIGO: "RB-1", CPF: CPF_VALIDO }), "linha:bruta"),
@@ -1246,21 +1255,21 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         statusLinha: "VALIDA" as const,
         inconsistencias: [],
         profissional: {
-          id: randomUUID(),
+          id: idLinha1,
           codigoOperacional: `RB-${randomUUID().slice(0, 8).toUpperCase()}`,
           status: "CARTEIRA_IDENTIFICADA",
           documento: caixa.seal(CPF_VALIDO, "documento:cpf"),
           originalSnapshot: caixa.seal(JSON.stringify({ nome: "Rollback Um" }), "snapshot:original"),
         },
       };
-      const mesmaDigitacao = (numero: number, codigo: string): typeof linhaValida => ({
+      const mesmaDigitacao = (numero: number, codigo: string, id: string): typeof linhaValida => ({
         numeroLinha: numero,
         dadosBrutos: caixa.seal(JSON.stringify({ CODIGO: codigo, CPF: CPF_VALIDO }), "linha:bruta"),
         documentoFingerprint: fingerprinter.fingerprint("cpf-v0-rb", "rb-unico-1"),
         statusLinha: "VALIDA",
         inconsistencias: [],
         profissional: {
-          id: randomUUID(),
+          id,
           codigoOperacional: codigo,
           status: "CARTEIRA_IDENTIFICADA",
           documento: caixa.seal(CPF_VALIDO, "documento:cpf"),
@@ -1276,7 +1285,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         folha: "PROFISSIONAIS",
         operador: "validacao-v0",
         agora: new Date().toISOString(),
-        linhas: [linhaValida, mesmaDigitacao(2, `RB-${randomUUID().slice(0, 8).toUpperCase()}`)],
+        linhas: [linhaValida, mesmaDigitacao(2, `RB-${randomUUID().slice(0, 8).toUpperCase()}`, idLinha2)],
       };
       await expect(repository.registrarImportacaoPf(command)).rejects.toThrow();
 
@@ -1293,10 +1302,10 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           (SELECT count(*) FROM arquivo_importacao WHERE sha256 = $1) AS arquivo,
           (SELECT count(*) FROM importacao i JOIN arquivo_importacao a ON a.id = i.arquivo_importacao_id WHERE a.sha256 = $1) AS importacao,
           (SELECT count(*) FROM linha_importada li JOIN importacao i ON i.id = li.importacao_id JOIN arquivo_importacao a ON a.id = i.arquivo_importacao_id WHERE a.sha256 = $1) AS linha,
-          (SELECT count(*) FROM profissional p WHERE p.origem = 'PF' AND p.codigo_operacional LIKE 'RB-%') AS profissional,
-          (SELECT count(*) FROM snapshot_cadastral s JOIN profissional p ON p.id = s.profissional_id WHERE p.codigo_operacional LIKE 'RB-%') AS snapshot,
-          (SELECT count(*) FROM evento_auditoria e WHERE e.metadados->>'importacaoId' IS NOT NULL AND e.agregado_tipo = 'PROFISSIONAL' AND NOT EXISTS (SELECT 1 FROM profissional p WHERE p.id = e.agregado_id)) AS evento`,
-        [sha256],
+          (SELECT count(*) FROM profissional WHERE id = ANY($2::uuid[])) AS profissional,
+          (SELECT count(*) FROM snapshot_cadastral WHERE profissional_id = ANY($2::uuid[])) AS snapshot,
+          (SELECT count(*) FROM evento_auditoria WHERE agregado_id = ANY($2::uuid[])) AS evento`,
+        [sha256, [idLinha1, idLinha2]],
       );
       expect(residuos.rows[0]).toEqual({
         arquivo: "0",
@@ -1385,7 +1394,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       const contagens = await pool.query<{ total: string; validas: string; pendentes: string }>(
         `SELECT total_linhas, linhas_validas, linhas_pendentes
         FROM importacao WHERE arquivo_importacao_id = (SELECT id FROM arquivo_importacao WHERE sha256 = $1)
-        ORDER BY criada_em`,
+        ORDER BY iniciada_em`,
         [sha256],
       );
       expect(contagens.rows).toHaveLength(2);

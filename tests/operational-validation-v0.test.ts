@@ -1391,7 +1391,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       expect(segunda.profissionaisCriados).toBe(0);
       expect(segunda.linhasValidas).toBe(2);
 
-      const contagens = await pool.query<{ validas: string; pendentes: string }>(
+      const contagens = await pool.query<{ validas: number; pendentes: number }>(
         `SELECT linhas_validas AS validas, linhas_pendentes AS pendentes
         FROM importacao WHERE arquivo_importacao_id = (SELECT id FROM arquivo_importacao WHERE sha256 = $1)
         ORDER BY iniciada_em`,
@@ -1399,8 +1399,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       );
       expect(contagens.rows).toHaveLength(2);
       for (const row of contagens.rows) {
-        expect(row.validas).toBe("2");
-        expect(row.pendentes).toBe("1");
+        expect(Number(row.validas)).toBe(2);
+        expect(Number(row.pendentes)).toBe(1);
       }
 
       // F7: lote nasce com modo DRY_RUN inequívoco no banco.

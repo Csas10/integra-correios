@@ -1404,16 +1404,12 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       }
 
       // F7: lote nasce com modo DRY_RUN inequívoco no banco.
+      // (A confirmacao PENDING é criada pelo próprio enqueueCommunicationBatch.)
       const loteId = randomUUID();
       const outboxId = randomUUID();
       const communicationId = randomUUID();
       const profissionalId = (command.linhas[0]!.profissional as { id: string }).id;
       const confirmationId = randomUUID();
-      await pool.query(
-        `INSERT INTO confirmacao (id, profissional_id, token_hash, template_versao, status, emitida_em, expira_em)
-         VALUES ($1, $2, $3, 'pf-pilot-crtba-v1', 'PENDING', $4, $5)`,
-        [confirmationId, profissionalId, hash64(`ct-token-${loteId}`), agora, new Date(Date.now() + 3_600_000).toISOString()],
-      );
       await repository.enqueueCommunicationBatch({
         id: loteId,
         code: `PF-MAIL-CT-${randomUUID().slice(0, 8).toUpperCase()}`,

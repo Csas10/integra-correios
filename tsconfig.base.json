@@ -24,7 +24,8 @@
       "@integra-correios/persistence": ["packages/persistence/src/index.ts"],
       "@integra-correios/pf-workflow": ["packages/pf-workflow/src/index.ts"],
       "@integra-correios/shared": ["packages/shared/src/index.ts"],
-      "@integra-correios/validation": ["packages/validation/src/index.ts"]
+      "@integra-correios/validation": ["packages/validation/src/index.ts"],
+      "@integra-correios/worker": ["apps/worker/src/index.ts"]
     }
   }
 }

@@ -1222,8 +1222,277 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         JOIN outbox_email o ON o.comunicacao_id = c.id
         WHERE l.id = $1`,
         [preparacao.loteId],
+      );        expect(estado.rows[0]).toEqual({ status: "PREPARACAO", outbox: "PENDING" });
+    } finally {
+      await pool.close();
+    }
+  });
+
+  // ==========================================================================
+  // Kernel B — regressões dos findings F4/F7/F8/F9.
+  // ==========================================================================
+
+  it("F8: falha no meio da importação → ROLLBACK integral nas 6 tabelas", async () => {
+    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      // Segunda linha rompe a UNIQUE (origem, documento_fingerprint): falha
+      // PROVOCADA no meio da escrita (após arquivo/importação/1ª linha).
+      const sha256 = hash64(`rollback-import-${randomUUID()}`);
+      const linhaValida = {
+        numeroLinha: 1,
+        dadosBrutos: caixa.seal(JSON.stringify({ CODIGO: "RB-1", CPF: CPF_VALIDO }), "linha:bruta"),
+        documentoFingerprint: fingerprinter.fingerprint("cpf-v0-rb", "rb-unico-1"),
+        statusLinha: "VALIDA" as const,
+        inconsistencias: [],
+        profissional: {
+          id: randomUUID(),
+          codigoOperacional: `RB-${randomUUID().slice(0, 8).toUpperCase()}`,
+          status: "CARTEIRA_IDENTIFICADA",
+          documento: caixa.seal(CPF_VALIDO, "documento:cpf"),
+          originalSnapshot: caixa.seal(JSON.stringify({ nome: "Rollback Um" }), "snapshot:original"),
+        },
+      };
+      const mesmaDigitacao = (numero: number, codigo: string): typeof linhaValida => ({
+        numeroLinha: numero,
+        dadosBrutos: caixa.seal(JSON.stringify({ CODIGO: codigo, CPF: CPF_VALIDO }), "linha:bruta"),
+        documentoFingerprint: fingerprinter.fingerprint("cpf-v0-rb", "rb-unico-1"),
+        statusLinha: "VALIDA",
+        inconsistencias: [],
+        profissional: {
+          id: randomUUID(),
+          codigoOperacional: codigo,
+          status: "CARTEIRA_IDENTIFICADA",
+          documento: caixa.seal(CPF_VALIDO, "documento:cpf"),
+          originalSnapshot: caixa.seal(JSON.stringify({ nome: `Rollback ${numero}` }), "snapshot:original"),
+        },
+      });
+      const command = {
+        nomeArquivo: "sintetico-rollback.xlsx",
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        bytesLength: 100,
+        sha256,
+        storageKey: `mem://pf/${sha256}`,
+        folha: "PROFISSIONAIS",
+        operador: "validacao-v0",
+        agora: new Date().toISOString(),
+        linhas: [linhaValida, mesmaDigitacao(2, `RB-${randomUUID().slice(0, 8).toUpperCase()}`)],
+      };
+      await expect(repository.registrarImportacaoPf(command)).rejects.toThrow();
+
+      // ROLLBACK integral: NENHUM resíduo relativo a esta importação.
+      const residuos = await pool.query<{
+        arquivo: string;
+        importacao: string;
+        linha: string;
+        profissional: string;
+        snapshot: string;
+        evento: string;
+      }>(
+        `SELECT
+          (SELECT count(*) FROM arquivo_importacao WHERE sha256 = $1) AS arquivo,
+          (SELECT count(*) FROM importacao i JOIN arquivo_importacao a ON a.id = i.arquivo_importacao_id WHERE a.sha256 = $1) AS importacao,
+          (SELECT count(*) FROM linha_importada li JOIN importacao i ON i.id = li.importacao_id JOIN arquivo_importacao a ON a.id = i.arquivo_importacao_id WHERE a.sha256 = $1) AS linha,
+          (SELECT count(*) FROM profissional p WHERE p.origem = 'PF' AND p.codigo_operacional LIKE 'RB-%') AS profissional,
+          (SELECT count(*) FROM snapshot_cadastral s JOIN profissional p ON p.id = s.profissional_id WHERE p.codigo_operacional LIKE 'RB-%') AS snapshot,
+          (SELECT count(*) FROM evento_auditoria e WHERE e.metadados->>'importacaoId' IS NOT NULL AND e.agregado_tipo = 'PROFISSIONAL' AND NOT EXISTS (SELECT 1 FROM profissional p WHERE p.id = e.agregado_id)) AS evento`,
+        [sha256],
       );
-      expect(estado.rows[0]).toEqual({ status: "PREPARACAO", outbox: "PENDING" });
+      expect(residuos.rows[0]).toEqual({
+        arquivo: "0",
+        importacao: "0",
+        linha: "0",
+        profissional: "0",
+        snapshot: "0",
+        evento: "0",
+      });
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("F9: contagens semanticamente corretas (reimportação do mesmo SHA, linha pendente/inválida) + F4/F7: modo DRY_RUN e threadId persistidos", async () => {
+    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      const sha256 = hash64(`contagens-${randomUUID()}`);
+      const agora = new Date().toISOString();
+      const base = {
+        nomeArquivo: "sintetico-contagens.xlsx",
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        bytesLength: 100,
+        sha256,
+        storageKey: `mem://pf/${sha256}`,
+        folha: "PROFISSIONAIS",
+        operador: "validacao-v0",
+        agora,
+      };
+
+      const linha = (
+        numero: number,
+        codigo: string,
+        doc: string,
+        statusLinha: "VALIDA" | "PENDENTE" | "INVALIDA",
+      ) => ({
+        numeroLinha: numero,
+        dadosBrutos: caixa.seal(JSON.stringify({ CODIGO: codigo }), "linha:bruta"),
+        documentoFingerprint: doc ? fingerprinter.fingerprint("cpf-v0-ct", doc) : null,
+        statusLinha,
+        inconsistencias: [],
+        ...(statusLinha === "INVALIDA"
+          ? {}
+          : {
+              profissional: {
+                id: randomUUID(),
+                codigoOperacional: codigo,
+                status: "CARTEIRA_IDENTIFICADA",
+                documento: caixa.seal(doc, "documento:cpf"),
+                originalSnapshot: caixa.seal(JSON.stringify({ nome: `Contagem ${numero}` }), "snapshot:original"),
+              },
+            }),
+      });
+
+      const command = {
+        ...base,
+        linhas: [
+          linha(1, `CT-${randomUUID().slice(0, 8).toUpperCase()}`, "rb-contagem-1", "VALIDA"),
+          linha(2, `CT-${randomUUID().slice(0, 8).toUpperCase()}`, "rb-contagem-2", "PENDENTE"),
+          linha(3, `CT-${randomUUID().slice(0, 8).toUpperCase()}`, "", "INVALIDA"),
+        ],
+      };
+
+      // 1ª importação: 2 válidas, 1 pendente, 1 inválida, 2 criados.
+      const primeira = await repository.registrarImportacaoPf(command);
+      expect(primeira.linhasValidas).toBe(2);
+      expect(primeira.linhasPendentes).toBe(1);
+      expect(primeira.linhasInvalidas).toBe(1);
+      expect(primeira.profissionaisCriados).toBe(2);
+
+      // Reimportação do MESMO SHA: determinística; criados = 0, válidas = 2.
+      const segunda = await repository.registrarImportacaoPf({
+        ...command,
+        agora: new Date(Date.now() + 1_000).toISOString(),
+        linhas: command.linhas.map((l, i) => ({
+          ...l,
+          profissional: command.linhas[i]!.profissional
+            ? { ...command.linhas[i]!.profissional!, id: randomUUID() }
+            : undefined,
+        })),
+      });
+      expect(segunda.profissionaisCriados).toBe(0);
+      expect(segunda.linhasValidas).toBe(2);
+
+      const contagens = await pool.query<{ total: string; validas: string; pendentes: string }>(
+        `SELECT total_linhas, linhas_validas, linhas_pendentes
+        FROM importacao WHERE arquivo_importacao_id = (SELECT id FROM arquivo_importacao WHERE sha256 = $1)
+        ORDER BY criada_em`,
+        [sha256],
+      );
+      expect(contagens.rows).toHaveLength(2);
+      for (const row of contagens.rows) {
+        expect(row.validas).toBe("2");
+        expect(row.pendentes).toBe("1");
+      }
+
+      // F7: lote nasce com modo DRY_RUN inequívoco no banco.
+      const loteId = randomUUID();
+      const outboxId = randomUUID();
+      const communicationId = randomUUID();
+      const profissionalId = (command.linhas[0]!.profissional as { id: string }).id;
+      const confirmationId = randomUUID();
+      await pool.query(
+        `INSERT INTO confirmacao (id, profissional_id, token_hash, template_versao, status, emitida_em, expira_em)
+         VALUES ($1, $2, $3, 'pf-pilot-crtba-v1', 'PENDING', $4, $5)`,
+        [confirmationId, profissionalId, hash64(`ct-token-${loteId}`), agora, new Date(Date.now() + 3_600_000).toISOString()],
+      );
+      await repository.enqueueCommunicationBatch({
+        id: loteId,
+        code: `PF-MAIL-CT-${randomUUID().slice(0, 8).toUpperCase()}`,
+        origin: "PF",
+        templateVersion: "pf-pilot-crtba-v1",
+        mode: "DRY_RUN",
+        createdBy: "validacao-v0",
+        createdAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_CRIADO_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(loteId),
+        },
+        items: [
+          {
+            professionalId: profissionalId,
+            confirmationId,
+            communicationId,
+            outboxId,
+            tokenHash: hash64(`ct-token-${loteId}`),
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+            recipientFingerprint: hash64("ct-email"),
+            idempotencyKey: `pf-pilot:ct:${outboxId}`,
+            encryptedPayload: caixa.seal(
+              JSON.stringify({ confirmationId, confirmationBaseUrl: "https://app.exemplo.test", nome: "Contagem Um", destinatario: "sintetico@exemplo.test", enderecoApresentado: "Rua de Teste, 100", telefone: "00000000000" }),
+              "outbox:email",
+            ),
+            auditEvent: {
+              id: randomUUID(),
+              aggregateType: "PROFISSIONAL",
+              aggregateId: profissionalId,
+              type: "PF_CONFIRMACAO_EMITIDA_V0",
+              occurredAt: agora,
+              metadata: {},
+              eventHash: hash64(outboxId),
+            },
+          },
+        ],
+      });
+      const modoLote = await pool.query<{ modo: string }>(
+        `SELECT modo FROM lote_comunicacao WHERE id = $1`,
+        [loteId],
+      );
+      expect(modoLote.rows[0]!.modo).toBe("DRY_RUN");
+
+      // F4: threadId do receipt é propagado até comunicacao.provider_thread_id.
+      await repository.ativarLoteComunicacao({
+        batchId: loteId,
+        origin: "PF",
+        actorId: "validacao-v0",
+        activatedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_ATIVADO_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`ativ:${loteId}`),
+        },
+      });
+      await repository.claimOutbox("worker-ct", 10, agora);
+      await repository.markOutboxAccepted({
+        outboxId,
+        communicationId,
+        provider: "DRY_RUN" as const,
+        providerMessageId: "sintetico-msg-ct-001",
+        providerThreadId: "sintetico-thread-001",
+        acceptedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "COMUNICACAO",
+          aggregateId: communicationId,
+          type: "PF_COMMUNICATION_ACCEPTED_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(communicationId),
+        },
+      });
+      const receipt = await pool.query<{ provider: string; thread: string | null }>(
+        `SELECT provider, provider_thread_id AS thread FROM comunicacao WHERE id = $1`,
+        [communicationId],
+      );
+      expect(receipt.rows[0]).toEqual({ provider: "DRY_RUN", thread: "sintetico-thread-001" });
     } finally {
       await pool.close();
     }

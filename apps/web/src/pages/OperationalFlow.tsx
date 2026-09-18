@@ -11,7 +11,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
  *  - REAL_SEND_ENABLED=false — nenhum botão de envio real existe.
  */
 
-const API_BASE = (import.meta as unknown as { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE ?? "http://localhost:8787";
+// F1: mesma origem no Preview (o adapter serverless publica /api);
+// localhost permanece apenas para dev local com o servidor Node da apps/api.
+const API_BASE =
+  (import.meta as unknown as { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE ??
+  (typeof window !== "undefined" && !window.location.origin.startsWith("http://localhost")
+    ? ""
+    : "http://localhost:8787");
 const PILOT_MAX = 5;
 
 interface Sugestao {

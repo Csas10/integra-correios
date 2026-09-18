@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
+import { DryRunMailGateway } from "@integra-correios/mail";
 import {
   Aes256GcmSecretBox,
   HmacSha256Fingerprinter,
@@ -7,7 +8,6 @@ import {
   PostgresOperationalRepository,
 } from "@integra-correios/persistence";
 import {
-  DryRunMailGateway,
   criarGatewayDoAmbiente,
   processarOutboxUmaVez,
   executarWorkerUmaVez,
@@ -142,6 +142,7 @@ d("executarWorkerUmaVez (motor completo, PostgreSQL real)", () => {
         code: `PF-MAIL-WK-${codigo}`,
         origin: "PF",
         templateVersion: "pf-pilot-crtba-v1",
+        mode: "DRY_RUN",
         createdBy: "worker-test",
         createdAt: agora,
         auditEvent: {
@@ -190,7 +191,6 @@ d("executarWorkerUmaVez (motor completo, PostgreSQL real)", () => {
 
       // Antes da liberação: nada é processado (GATE 2).
       const bloqueado = await executarWorkerUmaVez({
-        dryRun: true,
         workerId: "worker-wk-pre",
         env: envPronto,
       });
@@ -217,7 +217,6 @@ d("executarWorkerUmaVez (motor completo, PostgreSQL real)", () => {
 
       // Motor completo: claim → render → gateway sintético → receipt → auditoria.
       const { resultado } = await executarWorkerUmaVez({
-        dryRun: true,
         workerId: "worker-wk",
         env: envPronto,
       });
@@ -277,6 +276,7 @@ d("executarWorkerUmaVez (motor completo, PostgreSQL real)", () => {
         code: `PF-MAIL-WF-${codigo}`,
         origin: "PF",
         templateVersion: "pf-pilot-crtba-v1",
+        mode: "DRY_RUN",
         createdBy: "worker-test",
         createdAt: agora,
         auditEvent: {

@@ -88,17 +88,21 @@ export async function avaliarDatabase(
 export async function avaliarReadiness(
   env: Environment,
   sondarDatabase: () => Promise<boolean>,
+  lerConexaoOauth?: () => Promise<boolean>,
 ): Promise<ReadinessReport> {
+  // F2: quando o chamador injeta a leitura da oauth_connection persistida,
+  // o status CONNECTED passa a refletir a conexão real (não mais um
+  // `connected = false` fixo). Sem banco, permanece NOT_CONNECTED.
   const encryptionReady =
     Boolean(env.DATA_ENCRYPTION_KEY_BASE64?.trim()) &&
     Boolean(env.DOCUMENT_FINGERPRINT_KEY_BASE64?.trim()) &&
     Boolean(env.DATA_ENCRYPTION_KEY_VERSION?.trim());
   const database = await avaliarDatabase(sondarDatabase);
   const oauthConfig = loadGmailOauthConfig(env);
-  const oauthStatus = oauthStatusFromEnvironment(env, false);
+  const oauthStatus = oauthStatusFromEnvironment(env, await (lerConexaoOauth?.() ?? Promise.resolve(false)));
   const realSendEnabled = env.REAL_SEND_ENABLED === "true";
   const pilotMode = env.PILOT_MODE === "true";
-  const connected = false; // conexão real é verificada pelo titular em gate humano
+  const connected = oauthStatus === "CONNECTED"; // F2: leitura da oauth_connection persistida
 
   const cryptoItem = encryptionReady
     ? item("Cryptography", "READY", "Chaves de criptografia e fingerprint presentes.")

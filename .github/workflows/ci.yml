@@ -73,6 +73,9 @@ jobs:
       - name: PostgreSQL runtime roles migration
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0002_runtime_roles.sql
 
+      - name: PostgreSQL batch mode migration (DRY_RUN/LIVE_PILOT)
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0003_batch_mode_dry_run.sql
+
       - name: PostgreSQL runtime role fail-closed regressions
         shell: bash
         run: |

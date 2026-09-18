@@ -1,4 +1,5 @@
 export * from "./adapters/disabled.js";
+export * from "./adapters/dry-run.js";
 export * from "./adapters/gmail.js";
 export * from "./adapters/resend.js";
 export { MailProviderRequestError } from "./domain/gateway.js";

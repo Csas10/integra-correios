@@ -48,6 +48,13 @@ export interface AuditEventInput {
   readonly eventHash: string;
 }
 
+/**
+ * Modo conceitual do lote (F7): DRY_RUN usa gateway sintético; LIVE_PILOT é o
+ * mesmo motor trocando apenas o adapter final. Persistido para que DRY_RUN
+ * nunca possa virar LIVE silenciosamente e a auditoria seja inequívoca.
+ */
+export type BatchMode = "DRY_RUN" | "LIVE_PILOT";
+
 export interface CommunicationBatchItem {
   readonly professionalId: string;
   readonly confirmationId: string;
@@ -66,6 +73,8 @@ export interface EnqueueCommunicationBatchCommand {
   readonly code: string;
   readonly origin: "PF";
   readonly templateVersion: string;
+  /** Modo de execução do lote — persistido em lote_comunicacao.modo (F7). */
+  readonly mode: BatchMode;
   readonly createdBy: string;
   readonly createdAt: string;
   readonly auditEvent: AuditEventInput;
@@ -101,6 +110,8 @@ export interface ClaimedOutboxItem {
   readonly idempotencyKey: string;
   readonly encryptedPayload: EncryptedValue;
   readonly attempts: number;
+  /** Modo do lote de origem (F7): inequívoco também na memória do worker. */
+  readonly modo: BatchMode;
 }
 
 export interface StoredOauthConnection {
@@ -121,7 +132,7 @@ export interface SaveOauthConnectionCommand {
 export interface AcceptOutboxCommand {
   readonly outboxId: string;
   readonly communicationId: string;
-  readonly provider: "GMAIL" | "RESEND";
+  readonly provider: "GMAIL" | "RESEND" | "DRY_RUN";
   readonly providerMessageId: string;
   readonly providerThreadId?: string;
   readonly acceptedAt: string;
@@ -138,4 +149,64 @@ export interface FailOutboxCommand {
 
 export interface GmailOauthCredentialSource {
   loadGmailConnection(accountFingerprint: string): Promise<StoredOauthConnection | undefined>;
+}
+
+/**
+ * Atualização segura do access token renovado (F3): persiste o novo envelope
+ * cifrado preservando refresh token, scopes e identidade da conexão.
+ */
+export interface RefreshedOauthTokenCommand {
+  readonly connectionId: string;
+  readonly accountFingerprint: string;
+  readonly accessToken: EncryptedValue;
+  readonly expiresAt: string;
+}
+
+// ===========================================================================
+// F5 — Backend público por capability token: consumo atômico do token
+// (compare-and-set já existente) + fechamento operacional do workflow PF.
+// Nenhum comando aqui aceita decisão/estado vindos do browser além do
+// contrato explícito; replay/expiração falham fechados (consumePending).
+// ===========================================================================
+
+/** Contexto mínimo da página de confirmação — NUNCA documento/código/id interno. */
+export interface ConfirmationContext {
+  readonly nome: string;
+  readonly enderecoApresentado: string;
+  readonly telefoneMascarado: string;
+  readonly expiraEm: string;
+}
+
+/** Dados propostos pelo profissional em ATUALIZAR (formulário público). */
+export interface ProposedPfData {
+  readonly logradouro: string;
+  readonly numero: string;
+  readonly complemento?: string;
+  readonly bairro: string;
+  readonly cidade: string;
+  readonly uf: string;
+  readonly cep: string;
+  readonly telefone: string;
+  readonly whatsapp?: string;
+}
+
+export interface RegisterConfirmationOutcomeCommand {
+  /** ID da confirmação consumida por compare-and-set (consumePending). */
+  readonly confirmationId: string;
+  readonly professionalId: string;
+  /** Snapshot decidido (proposto em ATUALIZAR / confirmado em CONFIRMAR), já CIFRADO pelo chamador. */
+  readonly snapshotCifrado: EncryptedValue;
+  /** Conteúdo em claro do snapshot decidido — apenas para regras server-side de elegibilidade. */
+  readonly snapshotDecidido: Record<string, unknown>;
+  readonly decisao: "CONFIRMAR" | "ATUALIZAR";
+  readonly fonte: "CONFIRMACAO_WEB";
+  readonly occurredAt: string;
+}
+
+export interface ConfirmationOutcomeResult {
+  readonly confirmationId: string;
+  readonly professionalId: string;
+  /** Estado final do profissional após o fechamento server-side do workflow. */
+  readonly status: "APTO_PREPOSTAGEM" | "PENDENCIA_CADASTRAL";
+  readonly snapshotId: string;
 }

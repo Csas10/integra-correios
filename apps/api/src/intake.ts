@@ -114,7 +114,9 @@ export function mascararCpf(documento: string): string {
   const digitos = documento.replace(/\D/g, "");
   if (digitos.length !== 11) return "***";
   return `***.***.${digitos.slice(6, 9)}-${digitos.slice(9)}`;
-}export interface PreflightInput {
+}
+
+export interface PreflightInput {
   readonly nomeArquivo: string;
   readonly bytes: Uint8Array;
   readonly folha?: string;
@@ -145,7 +147,9 @@ export function executarPreflight(input: PreflightInput): ResumoPreflight {
   const aplicado = aplicarMapeamento(folha, mapeamentoConfirmado);
 
   const registros: RegistroPreflight[] = [];
-  const fingerprints = new Set<string>();
+  // F11: deduplicação apenas EM MEMÓRIA, pelo documento normalizado — sem
+  // chave fixa de desenvolvimento, sem fingerprint persistido.
+  const documentosVistos = new Set<string>();
   let duplicados = 0;
 
   for (const linha of aplicado.linhas) {
@@ -174,17 +178,16 @@ export function executarPreflight(input: PreflightInput): ResumoPreflight {
       issues.push("Endereço inválido/não parseável.");
     }
 
-    // Deduplicação por fingerprint HMAC do documento — nunca criamos dois
+    // Deduplicação em memória pelo documento normalizado — nunca criamos dois
     // profissionais para o mesmo CPF. Linhas duplicadas permanecem listadas.
-    const fingerprint = documento ? hmac.fingerprint("cpf-preflight", documento) : "";
     let duplicada = false;
-    if (fingerprint) {
-      if (fingerprints.has(fingerprint)) {
+    if (documento) {
+      if (documentosVistos.has(documento)) {
         duplicada = true;
         duplicados += 1;
         issues.push("Duplicada: mesmo CPF já presente no arquivo.");
       } else {
-        fingerprints.add(fingerprint);
+        documentosVistos.add(documento);
       }
     }
 
@@ -200,7 +203,7 @@ export function executarPreflight(input: PreflightInput): ResumoPreflight {
         enderecoOrigem,
         issues: parsing.issues,
       },
-      issues: duplicada ? [...issues] : issues,
+      issues: duplicada ? [...issues, "Duplicada."] : issues,
       aptoContato,
     });
   }
@@ -223,13 +226,6 @@ export function executarPreflight(input: PreflightInput): ResumoPreflight {
   };
 }
 
-import { createHmac } from "node:crypto";
-const hmac = {
-  fingerprint(namespace: string, valor: string): string {
-    return createHmac("sha256", "preflight-synthetic-key").update(namespace).update("\0").update(valor).digest("hex");
-  },
-};
-
 // ---------------------------------------------------------------------------
 // Confirmação da importação (persistência — só com ação explícita)
 // ---------------------------------------------------------------------------
@@ -247,14 +243,22 @@ export interface ResultadoConfirmarImportacao {
   readonly arquivoImportacaoId: string;
   readonly importacaoId: string;
   readonly profissionaisCriados: number;
+  /** F9: linhas elegíveis — independe de profissionais já existentes. */
+  readonly linhasValidas: number;
   readonly linhasPendentes: number;
   readonly linhasInvalidas: number;
 }
 
 /**
- * Persiste a importação confirmada:
- *   arquivo_importacao → importacao → linha_importada → profissional
- *   → snapshot ORIGINAL (cifrado) → evento_auditoria.
+ * Persiste a importação confirmada — F8: UMA única transação operacional no
+ * persistence package (registrarImportacaoPf): arquivo_importacao →
+ * importacao → linha_importada → profissional → snapshot ORIGINAL (cifrado)
+ * → evento_auditoria. Falha intermediária = ROLLBACK integral (provado por
+ * teste de falha no meio da escrita).
+ *
+ * F9: contagens semânticas (linhas_validas = linhas elegíveis para criação,
+ * independe de quantos profissionais já existiam) são calculadas e
+ * persistidas pelo persistence package.
  *
  * Idempotência: reimportar o MESMO arquivo (mesmo SHA-256) é determinístico —
  * o arquivo é registrado uma única vez e os profissionais existentes
@@ -264,9 +268,6 @@ export interface ResultadoConfirmarImportacao {
 export async function confirmarImportacao(
   command: ConfirmarImportacaoCommand,
   repository: PostgresOperationalRepository,
-  pool: {
-    query: (text: string, values?: readonly unknown[]) => Promise<{ rows: readonly any[]; rowCount: number | null }>;
-  },
 ): Promise<ResultadoConfirmarImportacao> {
   const leitura = lerXlsx(
     { nome: command.nomeArquivo, bytes: command.bytes },
@@ -292,40 +293,11 @@ export async function confirmarImportacao(
   const caixa = new Aes256GcmSecretBox(Buffer.from(encryptionKeyB64, "base64"), keyVersion);
   const fingerprinter = new HmacSha256Fingerprinter(Buffer.from(fingerprintKeyB64, "base64"));
 
-  const sha256 = leitura.sha256;
-
-  // 1) arquivo_importacao — idempotente por SHA-256 (arquivo já registrado
-  //    não gera segunda linha).
-  const existente = await pool.query(
-    `SELECT id FROM arquivo_importacao WHERE sha256 = $1 AND origem = 'PF' LIMIT 1`,
-    [sha256],
-  );
-  let arquivoId: string;
-  if (existente.rows[0]) {
-    arquivoId = existente.rows[0]!.id;
-  } else {
-    arquivoId = randomUUID();
-    await pool.query(
-      `INSERT INTO arquivo_importacao (id, origem, nome_original, mime_type, tamanho_bytes, sha256, storage_key)
-       VALUES ($1, 'PF', $2, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', $3, $4, $5)`,
-      [arquivoId, command.nomeArquivo, command.bytes.length, sha256, `mem://pf/${sha256}`],
-    );
-  }
-
-  // 2) importacao
-  const importacaoId = randomUUID();
-  await pool.query(
-    `INSERT INTO importacao (id, arquivo_importacao_id, origem, status, total_linhas, linhas_validas, linhas_pendentes)
-     VALUES ($1, $2, 'PF', 'VALIDADA', $3, 0, 0)`,
-    [importacaoId, arquivoId, aplicado.linhas.length],
-  );
-
   const agora = new Date().toISOString();
-  let criados = 0;
-  let pendentes = 0;
-  let invalidas = 0;
 
-  for (const linha of aplicado.linhas) {
+  // Pré-processamento puro (sem side effects): classificação das linhas +
+  // payload de profissional elegível.
+  const linhas = aplicado.linhas.map((linha) => {
     const codigo = (linha.valores.CODIGO ?? "").trim();
     const nome = (linha.valores.NOME ?? "").trim();
     const email = (linha.valores.EMAIL ?? "").trim();
@@ -358,105 +330,66 @@ export async function confirmarImportacao(
       issues.push("Célula numérica em campo sensível a zeros.");
     }
 
-    // linha_importada com dados brutos cifrados (preservação integral).
-    const fingerprint = documento
-      ? fingerprinter.fingerprint("cpf-importacao", documento)
-      : null;
-    await pool.query(
-      `INSERT INTO linha_importada (importacao_id, folha, numero_linha, dados_brutos_ciphertext, dados_brutos_nonce, dados_brutos_auth_tag, chave_versao, documento_fingerprint, status, inconsistencias)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)`,
-      [
-        importacaoId,
-        folha.nome,
-        linha.numero,
-        ...parametrosCifrados(caixa.seal(JSON.stringify(linha.valores), "linha:bruta"), keyVersion),
-        fingerprint,
-        statusLinha,
-        JSON.stringify(issues),
-      ],
-    );
+    const fingerprint = documento ? fingerprinter.fingerprint("cpf-importacao", documento) : null;
+    const profissionalElegivel =
+      statusLinha !== "INVALIDA" && codigo && fingerprint
+        ? {
+            id: randomUUID(),
+            codigoOperacional: codigo,
+            status: "CARTEIRA_IDENTIFICADA",
+            documento: caixa.seal(documento, "documento:cpf"),
+            originalSnapshot: caixa.seal(
+              JSON.stringify({
+                documento,
+                nome,
+                email,
+                telefone,
+                whatsapp: celular || undefined,
+                endereco: {
+                  logradouro: parsing.sugerido.logradouro,
+                  numero: parsing.sugerido.numero,
+                  complemento: parsing.sugerido.complemento,
+                  bairro: parsing.sugerido.bairro,
+                  cidade: parsing.sugerido.cidade,
+                  uf: parsing.sugerido.uf,
+                  cep: parsing.sugerido.cep,
+                },
+                enderecoOrigem,
+              }),
+              "snapshot:original",
+            ),
+          }
+        : undefined;
 
-    if (statusLinha === "INVALIDA") {
-      invalidas += 1;
-      continue;
-    }
-    if (statusLinha === "PENDENTE") {
-      pendentes += 1;
-    }
+    return {
+      numeroLinha: linha.numero,
+      dadosBrutos: caixa.seal(JSON.stringify(linha.valores), "linha:bruta"),
+      documentoFingerprint: fingerprint,
+      statusLinha,
+      inconsistencias: issues,
+      ...(profissionalElegivel ? { profissional: profissionalElegivel } : {}),
+    };
+  });
 
-    // profissional — idempotente por (origem, codigo_operacional).
-    const profissional = await pool.query(
-      `SELECT id FROM profissional WHERE origem = 'PF' AND codigo_operacional = $1`,
-      [codigo],
-    );
-    if (!profissional.rows[0]) {
-      const profissionalId = randomUUID();
-      await repository.createProfessional({
-        id: profissionalId,
-        origin: "PF",
-        operationalCode: codigo,
-        status: "CARTEIRA_IDENTIFICADA",
-        document: {
-          documentType: "CPF",
-          fingerprint: fingerprint!,
-          encrypted: caixa.seal(documento, "documento:cpf"),
-        },
-        originalSnapshot: caixa.seal(
-          JSON.stringify({
-            documento,
-            nome,
-            email,
-            telefone,
-            whatsapp: celular || undefined,
-            endereco: {
-              logradouro: parsing.sugerido.logradouro,
-              numero: parsing.sugerido.numero,
-              complemento: parsing.sugerido.complemento,
-              bairro: parsing.sugerido.bairro,
-              cidade: parsing.sugerido.cidade,
-              uf: parsing.sugerido.uf,
-              cep: parsing.sugerido.cep,
-            },
-            enderecoOrigem,
-          }),
-          "snapshot:original",
-        ),
-        auditEvent: {
-          id: randomUUID(),
-          aggregateType: "PROFISSIONAL",
-          aggregateId: profissionalId,
-          type: "PF_IMPORTADO",
-          actorId: command.operador,
-          occurredAt: agora,
-          metadata: { importacaoId, classificacaoEndereco: parsing.classificacao },
-          eventHash: hashEvento(profissionalId, agora),
-        },
-      });
-      criados += 1;
-    }
-  }
-
-  // importacao concluída com contagens reais.
-  await pool.query(
-    `UPDATE importacao
-     SET status = 'CONCLUIDA', linhas_validas = $2, linhas_pendentes = $3, concluida_em = now()
-     WHERE id = $1`,
-    [importacaoId, criados + (pendentes ? 0 : 0), pendentes],
-  );
+  // F8: UMA transação no persistence package para toda a escrita operacional.
+  const resultado = await repository.registrarImportacaoPf({
+    nomeArquivo: command.nomeArquivo,
+    mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    bytesLength: command.bytes.length,
+    sha256: leitura.sha256,
+    storageKey: `mem://pf/${leitura.sha256}`,
+    folha: folha.nome,
+    operador: command.operador,
+    agora,
+    linhas,
+  });
 
   return {
-    arquivoImportacaoId: arquivoId,
-    importacaoId,
-    profissionaisCriados: criados,
-    linhasPendentes: pendentes,
-    linhasInvalidas: invalidas,
+    arquivoImportacaoId: resultado.arquivoImportacaoId,
+    importacaoId: resultado.importacaoId,
+    profissionaisCriados: resultado.profissionaisCriados,
+    linhasValidas: resultado.linhasValidas,
+    linhasPendentes: resultado.linhasPendentes,
+    linhasInvalidas: resultado.linhasInvalidas,
   };
-}
-
-function parametrosCifrados(valor: { ciphertext: Uint8Array; nonce: Uint8Array; authTag: Uint8Array }, keyVersion: string) {
-  return [Buffer.from(valor.ciphertext), Buffer.from(valor.nonce), Buffer.from(valor.authTag), keyVersion];
-}
-
-function hashEvento(id: string, ocorreuEm: string): string {
-  return createHmac("sha256", "audit-chain").update(id).update(ocorreuEm).digest("hex");
 }

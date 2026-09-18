@@ -3,17 +3,23 @@ import type {
   ConfirmationRecord,
   ConsumePendingConfirmation,
 } from "@integra-correios/pf-workflow";
+import { validarCadastroPf } from "@integra-correios/pf-workflow";
 import type {
   AuditEventInput,
   AcceptOutboxCommand,
   ActivateCommunicationBatchCommand,
   BatchActivationState,
+  BatchMode,
   ClaimedOutboxItem,
+  ConfirmationContext,
+  ConfirmationOutcomeResult,
   CreateProfessionalCommand,
   EnqueueCommunicationBatchCommand,
   FailOutboxCommand,
   GmailOauthCredentialSource,
   QueryResult,
+  RefreshedOauthTokenCommand,
+  RegisterConfirmationOutcomeCommand,
   SaveOauthConnectionCommand,
   SqlExecutor,
   SqlPool,
@@ -21,6 +27,7 @@ import type {
   StoredOauthConnection,
 } from "./contracts.js";
 import type { EncryptedValue } from "./crypto.js";
+import { createHash, randomUUID } from "node:crypto";
 
 async function inTransaction<T>(pool: SqlPool, operation: (sql: SqlTransaction) => Promise<T>) {
   const transaction = await pool.connect();
@@ -86,8 +93,46 @@ function assertUuid(value: string, label: string): void {
   }
 }
 
+export interface RegistrarImportacaoPfCommand {
+  readonly nomeArquivo: string;
+  readonly mimeType: string;
+  readonly bytesLength: number;
+  readonly sha256: string;
+  readonly storageKey: string;
+  readonly folha: string;
+  readonly operador: string;
+  readonly agora: string;
+  readonly linhas: readonly {
+    readonly numeroLinha: number;
+    /** Valores brutos mapeados — persistidos cifrados, preservados integralmente. */
+    readonly dadosBrutos: EncryptedValue;
+    readonly documentoFingerprint: string | null;
+    readonly statusLinha: "VALIDA" | "PENDENTE" | "INVALIDA";
+    readonly inconsistencias: readonly string[];
+    /** Profissional a criar quando a linha está elegível (VALIDA/PENDENTE). */
+    readonly profissional?: {
+      readonly id: string;
+      readonly codigoOperacional: string;
+      readonly status: string;
+      readonly documento: EncryptedValue;
+      readonly originalSnapshot: EncryptedValue;
+    };
+  }[];
+}
+
+export interface ResultadoRegistrarImportacao {
+  readonly arquivoImportacaoId: string;
+  readonly importacaoId: string;
+  /** Linhas com núcleo válido (código/nome/CPF/e-mail) — F9. */
+  readonly linhasValidas: number;
+  readonly linhasPendentes: number;
+  readonly linhasInvalidas: number;
+  readonly profissionaisCriados: number;
+}
+
 export class PostgresOperationalRepository implements GmailOauthCredentialSource {
-  constructor(private readonly pool: SqlPool) {}
+  /** Acesso de leitura ao pool para casos de consulta do chamador (confirmação). */
+  constructor(readonly pool: SqlPool) {}
 
   async createProfessional(command: CreateProfessionalCommand): Promise<void> {
     assertUuid(command.id, "professional.id");
@@ -141,13 +186,16 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
       // elegíveis ao worker.
       await sql.query(
         `INSERT INTO lote_comunicacao (
-          id, origem, codigo, template_versao, status, criado_por, criado_em, ativado_em
-        ) VALUES ($1, $2, $3, $4, 'PREPARACAO', $5, $6, NULL)`,
+          id, origem, codigo, template_versao, modo, status, criado_por, criado_em, ativado_em
+        ) VALUES ($1, $2, $3, $4, $5, 'PREPARACAO', $6, $7, NULL)`,
         [
           command.id,
           command.origin,
           command.code,
           command.templateVersion,
+          // F7: o modo nasce no INSERT — lote DRY_RUN nunca vira LIVE
+          // silenciosamente (sem UPDATE de modo em nenhum fluxo).
+          command.mode,
           command.createdBy,
           command.createdAt,
         ],
@@ -210,6 +258,141 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         await insertAudit(sql, item.auditEvent);
       }
       await insertAudit(sql, command.auditEvent);
+    });
+  }
+
+  /**
+   * F8 — Importação confirmada como UMA transação operacional:
+   * arquivo_importacao → importacao → linha_importada → profissional
+   * → snapshot_cadastral → evento_auditoria, tudo em um único BEGIN/COMMIT.
+   * Falha intermediária = ROLLBACK integral (provado por teste de falha no meio).
+   *
+   * F9 — Contagens semanticamente corretas persistidas em importacao:
+   * linhas_validas conta linhas elegíveis (independe de profissionais novos);
+   * reimportação do mesmo SHA-256 é idempotente e determinística.
+   */
+  async registrarImportacaoPf(command: RegistrarImportacaoPfCommand): Promise<ResultadoRegistrarImportacao> {
+    assertSha256(command.sha256, "import.sha256");
+    if (command.linhas.length === 0) throw new Error("Importação sem linhas");
+    return inTransaction(this.pool, async (sql) => {
+      // arquivo_importacao — idempotente por SHA-256 (mesma origem).
+      const existente = await sql.query<{ id: string }>(
+        `SELECT id FROM arquivo_importacao WHERE sha256 = $1 AND origem = 'PF' LIMIT 1`,
+        [command.sha256],
+      );
+      let arquivoId = existente.rows[0]?.id;
+      if (!arquivoId) {
+        arquivoId = randomUUID();
+        await sql.query(
+          `INSERT INTO arquivo_importacao (id, origem, nome_original, mime_type, tamanho_bytes, sha256, storage_key)
+          VALUES ($1, 'PF', $2, $3, $4, $5, $6)`,
+          [arquivoId, command.nomeArquivo, command.mimeType, command.bytesLength, command.sha256, command.storageKey],
+        );
+      }
+
+      // Um mesmo arquivo reimportado produz nova importação determinística
+      // (evidência de execução), com contagens recalculadas.
+      const importacaoId = randomUUID();
+      await sql.query(
+        `INSERT INTO importacao (id, arquivo_importacao_id, origem, status, total_linhas, linhas_validas, linhas_pendentes)
+        VALUES ($1, $2, 'PF', 'VALIDADA', $3, 0, 0)`,
+        [importacaoId, arquivoId, command.linhas.length],
+      );
+
+      let validas = 0;
+      let pendentes = 0;
+      let invalidas = 0;
+      let criados = 0;
+
+      for (const linha of command.linhas) {
+        const fingerprint = linha.documentoFingerprint;
+        const cifrada = linha.dadosBrutos;
+        await sql.query(
+          `INSERT INTO linha_importada (importacao_id, folha, numero_linha, dados_brutos_ciphertext, dados_brutos_nonce, dados_brutos_auth_tag, chave_versao, documento_fingerprint, status, inconsistencias)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)`,
+          [
+            importacaoId,
+            command.folha,
+            linha.numeroLinha,
+            Buffer.from(cifrada.ciphertext),
+            Buffer.from(cifrada.nonce),
+            Buffer.from(cifrada.authTag),
+            cifrada.keyVersion,
+            fingerprint,
+            linha.statusLinha,
+            JSON.stringify(linha.inconsistencias),
+          ],
+        );
+
+        if (linha.statusLinha === "INVALIDA") {
+          invalidas += 1;
+          continue;
+        }
+        // F9: válida = linha elegível (VALIDA ou PENDENTE); pendente é subconjunto.
+        validas += 1;
+        if (linha.statusLinha === "PENDENTE") pendentes += 1;
+
+        const profissional = linha.profissional;
+        if (!profissional) continue;
+
+        const jaExiste = await sql.query<{ id: string }>(
+          `SELECT id FROM profissional WHERE origem = 'PF' AND codigo_operacional = $1`,
+          [profissional.codigoOperacional],
+        );
+        if (jaExiste.rows[0]) continue;
+
+        await sql.query(
+          `INSERT INTO profissional (
+            id, origem, codigo_operacional, tipo_documento,
+            documento_ciphertext, documento_nonce, documento_auth_tag,
+            documento_chave_versao, documento_fingerprint, status
+          ) VALUES ($1, 'PF', $2, 'CPF', $3, $4, $5, $6, $7, $8)`,
+          [
+            profissional.id,
+            profissional.codigoOperacional,
+            ...encryptedParameters(profissional.documento),
+            linha.documentoFingerprint!,
+            profissional.status,
+          ],
+        );
+        await sql.query(
+          `INSERT INTO snapshot_cadastral (
+            profissional_id, tipo, conteudo_ciphertext, conteudo_nonce,
+            conteudo_auth_tag, chave_versao, fonte
+          ) VALUES ($1, 'ORIGINAL', $2, $3, $4, $5, 'IMPORTACAO')`,
+          [profissional.id, ...encryptedParameters(profissional.originalSnapshot)],
+        );
+        await insertAudit(sql, {
+          id: randomUUID(),
+          aggregateType: "PROFISSIONAL",
+          aggregateId: profissional.id,
+          type: "PF_IMPORTADO",
+          actorId: command.operador,
+          occurredAt: command.agora,
+          metadata: { importacaoId },
+          eventHash: createHash("sha256")
+            .update(profissional.id)
+            .update(command.agora)
+            .digest("hex"),
+        });
+        criados += 1;
+      }
+
+      await sql.query(
+        `UPDATE importacao
+        SET status = 'CONCLUIDA', linhas_validas = $2, linhas_pendentes = $3, concluida_em = now()
+        WHERE id = $1`,
+        [importacaoId, validas, pendentes],
+      );
+
+      return {
+        arquivoImportacaoId: arquivoId,
+        importacaoId,
+        linhasValidas: validas,
+        linhasPendentes: pendentes,
+        linhasInvalidas: invalidas,
+        profissionaisCriados: criados,
+      };
     });
   }
 
@@ -305,6 +488,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         payload_auth_tag: Uint8Array;
         chave_versao: string;
         tentativas: number;
+        modo: string;
       }>(
         `WITH candidatas AS (
           SELECT outbox.id
@@ -327,7 +511,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         WHERE outbox.id = candidatas.id
         RETURNING outbox.id, outbox.comunicacao_id, outbox.idempotency_key,
           outbox.payload_ciphertext, outbox.payload_nonce, outbox.payload_auth_tag,
-          outbox.chave_versao, outbox.tentativas`,
+          outbox.chave_versao, outbox.tentativas, lote.modo`,
         [now, limit, workerId],
       );
       if (result.rows.length > 0) {
@@ -349,6 +533,9 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
           keyVersion: row.chave_versao,
         },
         attempts: row.tentativas,
+        // F7: o modo do lote atravessa o claim — o worker valida o gate
+        // server-side (lote DRY_RUN nunca processa com gateway LIVE).
+        modo: row.modo as BatchMode,
       }));
     });
   }
@@ -498,6 +685,189 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         throw new Error("Conflito entre identidade OAuth e fingerprint da conta");
       }
       await insertAudit(sql, command.auditEvent);
+    });
+  }
+
+  /**
+   * F3 — Atualização segura do access token renovado: persiste o novo envelope
+   * cifrado preservando refresh token, scopes e identidade (id + fingerprint).
+   * CAS por id: conexão revogada/recriada não recebe token órfão.
+   */
+  async refreshOauthAccessToken(command: RefreshedOauthTokenCommand): Promise<void> {
+    if (command.accountFingerprint !== command.accountFingerprint.trim()) {
+      throw new Error("accountFingerprint inválido");
+    }
+    assertSha256(command.accountFingerprint, "oauth.accountFingerprint");
+    await inTransaction(this.pool, async (sql) => {
+      const updated = await sql.query(
+        `UPDATE oauth_connection
+        SET access_token_ciphertext = $3, access_token_nonce = $4, access_token_auth_tag = $5,
+          chave_versao = $6, expira_em = $7, revogada_em = NULL, atualizada_em = now()
+        WHERE id = $1 AND conta_fingerprint = $2 AND revogada_em IS NULL`,
+        [
+          command.connectionId,
+          command.accountFingerprint,
+          Buffer.from(command.accessToken.ciphertext),
+          Buffer.from(command.accessToken.nonce),
+          Buffer.from(command.accessToken.authTag),
+          command.accessToken.keyVersion,
+          command.expiresAt,
+        ],
+      );
+      if (updated.rowCount !== 1) {
+        throw new Error("Conexão OAuth não encontrada para renovar token");
+      }
+    });
+  }
+
+  // ==========================================================================
+  // F5 — Confirmação do profissional server-side (capability token).
+  // Contexto mínimo (sem PII além de nome/endereço apresentado), consumo
+  // atômico via compare-and-set e fechamento transacional do workflow PF.
+  // ==========================================================================
+
+  /**
+   * Contexto mínimo da confirmação para a página pública: decifra o snapshot
+   * ORIGINAL e expõe apenas nome, endereço apresentado e telefone mascarado.
+   * Falha fechada: token inexistente/expirado/consumido → undefined.
+   */
+  async obterContextoConfirmacao(
+    tokenHash: string,
+    caixa: { open(value: EncryptedValue, context: string): Uint8Array },
+    agora: string,
+  ): Promise<ConfirmationContext | undefined> {
+    if (!/^[a-f0-9]{64}$/.test(tokenHash)) return undefined;
+    const result = await this.pool.query<{
+      conteudo_ciphertext: Uint8Array;
+      conteudo_nonce: Uint8Array;
+      conteudo_auth_tag: Uint8Array;
+      chave_versao: string;
+      expira_em: Date;
+    }>(
+      `SELECT s.conteudo_ciphertext, s.conteudo_nonce, s.conteudo_auth_tag, s.chave_versao,
+        c.expira_em
+      FROM confirmacao c
+      JOIN snapshot_cadastral s ON s.profissional_id = c.profissional_id AND s.tipo = 'ORIGINAL' AND s.vigente
+      WHERE c.token_hash = $1 AND c.status = 'PENDING' AND c.expira_em > $2
+      LIMIT 1`,
+      [tokenHash, agora],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    let snapshot: any = {};
+    try {
+      snapshot = JSON.parse(
+        new TextDecoder().decode(
+          caixa.open(
+            {
+              ciphertext: row.conteudo_ciphertext,
+              nonce: row.conteudo_nonce,
+              authTag: row.conteudo_auth_tag,
+              keyVersion: row.chave_versao,
+            },
+            "snapshot:original",
+          ),
+        ),
+      );
+    } catch {
+      return undefined; // fail-closed: snapshot ilegível não é exposto
+    }
+    const endereco = (snapshot.endereco ?? {}) as Record<string, string | undefined>;
+    const telefone = String(snapshot.telefone ?? "");
+    const digitos = telefone.replace(/\D/g, "");
+    return {
+      nome: String(snapshot.nome ?? ""),
+      enderecoApresentado: String(snapshot.enderecoOrigem ?? endereco.logradouro ?? ""),
+      telefoneMascarado: digitos.length >= 4 ? `***${digitos.slice(-4)}` : "—",
+      expiraEm: row.expira_em.toISOString(),
+    };
+  }
+
+  /** Indica se existe conexão Gmail ativa persistida (readiness F2). */
+  async existeConexaoGmailAtiva(): Promise<boolean> {
+    const result = await this.pool.query<{ existe: boolean }>(
+      `SELECT EXISTS(
+        SELECT 1 FROM oauth_connection WHERE provider = 'GMAIL' AND revogada_em IS NULL
+      ) AS existe`,
+    );
+    return result.rows[0]?.existe === true;
+  }
+
+  /**
+   * Fechamento transacional da confirmação: snapshot ORIGINAL preservado,
+   * snapshot decidido criado (CONFIRMADO), workflow avançado e auditoria —
+   * tudo em uma única transação. Falha = ROLLBACK integral.
+   */
+  async registrarResultadoConfirmacao(command: RegisterConfirmationOutcomeCommand): Promise<ConfirmationOutcomeResult> {
+    const agora = command.occurredAt;
+    return inTransaction(this.pool, async (sql) => {
+      // 1) Snapshot decidido (proposto em ATUALIZAR, confirmado em CONFIRMAR).
+      const snapshotId = randomUUID();
+      const snapshotCifrado = command.snapshotCifrado;
+      await sql.query(
+        `INSERT INTO snapshot_cadastral (
+          id, profissional_id, tipo, conteudo_ciphertext, conteudo_nonce,
+          conteudo_auth_tag, chave_versao, fonte
+        ) VALUES ($1, $2, 'CONFIRMADO', $3, $4, $5, $6, $7)`,
+        [
+          snapshotId,
+          command.professionalId,
+          ...encryptedParameters(snapshotCifrado),
+          command.fonte,
+        ],
+      );
+      // 2) Confirmação aponta para o snapshot decidido.
+      await sql.query(
+        `UPDATE confirmacao SET snapshot_confirmado_id = $2 WHERE id = $1`,
+        [command.confirmationId, snapshotId],
+      );
+      // 3) Workflow: estado final server-side — regras do pf-workflow decidem
+      // APTO_PREPOSTAGEM vs PENDENCIA_CADASTRAL conforme os dados decididos.
+      const cadastro = command.snapshotDecidido as {
+        documento?: string;
+        nome?: string;
+        email?: string;
+        telefone?: string;
+        endereco?: Record<string, string>;
+      };
+      const validacao = validarCadastroPf({
+        documento: String(cadastro.documento ?? ""),
+        nome: String(cadastro.nome ?? ""),
+        email: String(cadastro.email ?? ""),
+        telefone: String(cadastro.telefone ?? ""),
+        endereco: {
+          logradouro: String(cadastro.endereco?.logradouro ?? ""),
+          numero: String(cadastro.endereco?.numero ?? ""),
+          bairro: String(cadastro.endereco?.bairro ?? ""),
+          cidade: String(cadastro.endereco?.cidade ?? ""),
+          uf: String(cadastro.endereco?.uf ?? ""),
+          cep: String(cadastro.endereco?.cep ?? ""),
+        },
+      });
+      const novoStatus: ConfirmationOutcomeResult["status"] = validacao.valid
+        ? "APTO_PREPOSTAGEM"
+        : "PENDENCIA_CADASTRAL";
+      await sql.query(
+        `UPDATE profissional SET status = $2, atualizado_em = $3
+        WHERE id = $1 AND origem = 'PF'`,
+        [command.professionalId, novoStatus, agora],
+      );
+      // 4) Auditoria — sem PII nos metadados.
+      await insertAudit(sql, {
+        id: randomUUID(),
+        aggregateType: "PROFISSIONAL",
+        aggregateId: command.professionalId,
+        type: "PF_CONFIRMACAO_SUBMETIDA",
+        occurredAt: agora,
+        metadata: { confirmationId: command.confirmationId, decisao: command.decisao, statusFinal: novoStatus },
+        eventHash: createHash("sha256").update(command.confirmationId).update(agora).digest("hex"),
+      });
+      return {
+        confirmationId: command.confirmationId,
+        professionalId: command.professionalId,
+        status: novoStatus,
+        snapshotId,
+      };
     });
   }
 

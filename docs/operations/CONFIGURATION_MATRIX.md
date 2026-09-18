@@ -12,6 +12,8 @@ código (nomes reais, nada hipotético). Nenhum valor real no Git.
 | `CONFIRMATION_BASE_URL` | Titular/ambiente | Base das URLs de confirmação no e-mail | Lote/preview | ENVIRONMENT | NÃO | SIM (`https://preview.exemplo.test` em preview) | Default seguro de preview |
 | `PORT` | Plataforma | Porta de escuta da API (0.0.0.0) | API | ENVIRONMENT | NÃO | SIM (`8787`) | OK |
 | `PILOT_MODE` | Operação (env do processo) | Liga a execução controlada do worker run-once | Worker run-once | ENVIRONMENT | NÃO | SIM (`false`) | DISABLED por padrão (fail-closed) |
+| `OPERATOR_TOKEN` | Operação (env do processo) | Bearer token das rotas OPERATOR_ROUTE (F10) | Todas as rotas operacionais no Preview | ENVIRONMENT | SIM | NÃO | Fail-closed: sem valor, NENHUMA rota operacional responde (401) |
+| `VITE_API_BASE` | Plataforma/build do web | Base da API para o browser (opcional) | Preview/somente se API em outra origem | APPLICATION (build-time) | NÃO | SIM (mesma origem) | Default = mesma origem via adapter serverless `/api/*` — localhost NUNCA é usado no Preview |
 | `PILOT_MAX_RECIPIENTS` | Operação (env do processo) | Hard cap server-side do piloto (1–100) | Preview, prepare, activate | ENVIRONMENT | NÃO | SIM (`5`) | OK, aplicado em 4 camadas |
 | `REAL_SEND_ENABLED` | Operação (env do processo) | GATE 1 do envio externo (Gmail real) | Worker LIVE_PILOT | ENVIRONMENT | NÃO | SIM (`false`) | DISABLED — envio real proibido nesta fase |
 | `MAIL_PROVIDER` | Operação (env do processo) | Seleção do gateway real (`gmail`) | LIVE_PILOT | ENVIRONMENT | NÃO | SIM (ausente = Disabled) | OK |
@@ -42,7 +44,9 @@ Para executar o DRY_RUN no Preview, o titular deve configurar **exatamente**:
 2. `DATA_ENCRYPTION_KEY_BASE64` — chave AES-256-GCM (32 bytes, base64);
 3. `DOCUMENT_FINGERPRINT_KEY_BASE64` — chave HMAC-SHA-256 (32 bytes, base64);
 4. `DATA_ENCRYPTION_KEY_VERSION` — rótulo da versão (ex.: `v1`);
-5. `PILOT_MODE=true` — habilita o worker run-once no ambiente.
+5. `PILOT_MODE=true` — habilita o worker run-once no ambiente;
+6. `OPERATOR_TOKEN` — habilita as rotas operacionais (F10; a rota pública de
+   confirmação `/api/confirmation` não depende dele).
 
 Não é necessário nenhum segredo do Google para o DRY_RUN (o gateway é
 sintético). Para o LIVE_PILOT, adicionam-se as credenciais OAuth do titular

@@ -312,6 +312,7 @@ export class GmailHttpTransport {
     return {
       provider: "GMAIL" as const,
       messageId: data.id,
+      ...(data.threadId ? { threadId: data.threadId } : {}),
       acceptedAt: new Date().toISOString(),
     };
   }

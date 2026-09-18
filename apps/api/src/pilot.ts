@@ -344,6 +344,7 @@ export async function prepararLotePiloto(
     code: codigo,
     origin: "PF",
     templateVersion: PF_PILOT_TEMPLATE_VERSION,
+    mode: "DRY_RUN",
     createdBy: command.operador,
     createdAt: agora,
     auditEvent: {

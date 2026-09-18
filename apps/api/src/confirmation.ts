@@ -174,5 +174,3 @@ async function decifrarSnapshotOriginal(
     return undefined;
   }
 }
-
-

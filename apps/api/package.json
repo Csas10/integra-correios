@@ -9,6 +9,10 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@integra-correios/domain": "*"
+    "@integra-correios/domain": "*",
+    "@integra-correios/importers": "*",
+    "@integra-correios/mail": "*",
+    "@integra-correios/persistence": "*",
+    "@integra-correios/pf-workflow": "*"
   }
 }

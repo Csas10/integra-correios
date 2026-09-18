@@ -1151,3 +1151,233 @@ button:focus-visible {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ==========================================================================
+   Fluxo operacional (Fase B — PF Gmail Pilot)
+   ========================================================================== */
+
+.operational-flow {
+  display: grid;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.flow-progress {
+  padding: 16px 19px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+  box-shadow: 0 7px 26px rgba(9, 29, 56, 0.045);
+}
+
+.flow-progress ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.flow-progress li {
+  color: var(--ink-500);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.flow-progress li.is-complete {
+  color: var(--success);
+}
+
+.flow-progress li::before {
+  content: "· ";
+  color: var(--ink-500);
+}
+
+.flow-progress li.is-complete::before {
+  content: "✓ ";
+  color: var(--success);
+}
+
+.flow-panel {
+  display: grid;
+  gap: 14px;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--surface);
+  box-shadow: 0 7px 26px rgba(9, 29, 56, 0.045);
+}
+
+.flow-panel h2 {
+  margin: 0;
+  color: var(--ink-900);
+  font-size: 19px;
+  font-weight: 750;
+  letter-spacing: -0.03em;
+}
+
+.flow-panel > p {
+  margin: 0;
+  color: var(--ink-700);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.flow-panel code {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--surface-muted);
+  font-size: 10px;
+}
+
+.flow-panel button {
+  min-height: 38px;
+  justify-self: start;
+  padding: 0 16px;
+  color: #fff;
+  border: 0;
+  border-radius: 8px;
+  background: var(--blue-600);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.flow-panel button:hover:not(:disabled) {
+  background: var(--navy-700);
+}
+
+.flow-panel button:disabled {
+  color: #8a96a5;
+  background: #f1f4f7;
+  cursor: not-allowed;
+}
+
+.flow-panel button.flow-primary {
+  background: var(--success);
+}
+
+.flow-panel button.flow-primary:hover:not(:disabled) {
+  background: #0f6a51;
+}
+
+.flow-error {
+  margin: 0;
+  padding: 12px 16px;
+  color: #8f2d2d;
+  border: 1px solid #eccccc;
+  border-radius: 10px;
+  background: #fbeeee;
+  font-size: 12px;
+}
+
+.flow-warn {
+  margin: 0;
+  padding: 10px 14px;
+  color: #7a5a12;
+  border: 1px solid #e8d9a8;
+  border-radius: 9px;
+  background: #fdf7e3;
+  font-size: 11px;
+}
+
+.flow-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.flow-stats li {
+  color: var(--ink-700);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.flow-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.flow-table th,
+.flow-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #edf0f3;
+  color: var(--ink-700);
+  text-align: left;
+}
+
+.flow-table th {
+  color: var(--ink-500);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.flow-scroll {
+  max-height: 380px;
+  overflow: auto;
+  border: 1px solid #edf0f3;
+  border-radius: 10px;
+}
+
+.flow-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.flow-filters button {
+  min-height: 30px;
+  padding: 0 12px;
+  color: #65758a;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #e6ebf0;
+  font-size: 10px;
+}
+
+.flow-filters button.is-selected {
+  color: var(--navy-800);
+  border-color: #c4d4e2;
+  background: #fff;
+}
+
+.flow-panel select {
+  min-height: 30px;
+  padding: 0 8px;
+  color: var(--ink-900);
+  border: 1px solid #ccd7e2;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 11px;
+}
+
+.flow-panel details {
+  padding: 10px 14px;
+  border: 1px solid #e4e9ef;
+  border-radius: 9px;
+  background: var(--surface-muted);
+}
+
+.flow-panel details summary {
+  color: var(--ink-700);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.flow-panel details pre {
+  margin: 10px 0 0;
+  color: var(--ink-700);
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}

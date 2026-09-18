@@ -23,6 +23,8 @@ export const CAMPOS_TODOS = [
   "CIDADE",
   "UF",
   "TELEFONE",
+  "CELULAR",
+  "ENDERECO_COMPOSTO",
   "EMAIL",
 ] as const;
 
@@ -37,7 +39,7 @@ export type Campo = (typeof CAMPOS_TODOS)[number];
 export const CAMPOS_OBRIGATORIOS: Readonly<
   Record<OrigemMapeamento, readonly Campo[]>
 > = {
-  PF: ["ORIGEM", "CODIGO", "NOME", "CPF_CNPJ", "CEP", "LOGRADOURO", "CIDADE", "UF", "TELEFONE"],
+  PF: ["ORIGEM", "CODIGO", "NOME", "CPF_CNPJ", "ENDERECO_COMPOSTO", "TELEFONE"],
   PJ: ["ORIGEM", "CODIGO", "NOME", "NOME_FANTASIA", "CPF_CNPJ", "CEP", "LOGRADOURO", "CIDADE", "UF"],
 };
 
@@ -47,15 +49,17 @@ const ALIASES: Readonly<Record<Campo, readonly string[]>> = {
   CODIGO: ["CODIGO", "ID", "COD", "CODIGO INTERNO"],
   NOME: ["NOME", "NOME COMPLETO", "RAZAO SOCIAL", "NOME RAZAO SOCIAL"],
   NOME_FANTASIA: ["NOME FANTASIA", "FANTASIA"],
-  CPF_CNPJ: ["CPF CNPJ", "CPFCNPJ", "DOCUMENTO", "CPF/CNPJ"],
+  CPF_CNPJ: ["CPF", "CPF CNPJ", "CPFCNPJ", "DOCUMENTO", "CPF/CNPJ", "REGISTRO NACIONAL"],
   CEP: ["CEP", "CEP RESIDENCIAL", "CEP DO ENDERECO"],
-  LOGRADOURO: ["LOGRADOURO", "ENDERECO", "RUA"],
+  LOGRADOURO: ["LOGRADOURO", "RUA"],
   NUMERO: ["NUMERO", "NUM", "N"],
   COMPLEMENTO: ["COMPLEMENTO", "COMPL"],
   BAIRRO: ["BAIRRO"],
   CIDADE: ["CIDADE", "MUNICIPIO"],
   UF: ["UF", "ESTADO", "UNIDADE FEDERATIVA"],
-  TELEFONE: ["TELEFONE", "TEL", "CELULAR", "FONE"],
+  TELEFONE: ["TELEFONE", "TEL", "FONE"],
+  CELULAR: ["CELULAR", "WHATSAPP", "CEL"],
+  ENDERECO_COMPOSTO: ["ENDERECO", "ENDERECO COMPLETO", "LOGRADOURO COMPLETO"],
   EMAIL: ["EMAIL", "E-MAIL", "CORREIO ELETRONICO"],
 };
 
@@ -161,6 +165,12 @@ export function validarMapeamento(
 /**
  * Fronteira explícita da confirmação do operador. Valida e congela uma cópia
  * do mapeamento; aplicarMapeamento não aceita o contrato estrutural comum.
+ *
+ * Fluxo institucional PF (base real CRT): a base possui ENDERECO composto
+ * (sem CEP/UF/logradouro decompostos), então os obrigatórios PF são
+ * CODIGO/NOME/CPF/ENDERECO_COMPOSTO/TELEFONE. O parsing assistido do
+ * endereço (address-parser) sugere a decomposição depois, sempre com
+ * endereco_origem preservado e revisão do operador quando ambíguo.
  */
 export function confirmarMapeamento(
   mapeamento: Mapeamento,

@@ -9,6 +9,7 @@
     { "path": "../../packages/domain" },
     { "path": "../../packages/correios" },
     { "path": "../../packages/mail" },
+    { "path": "../../packages/persistence" },
     { "path": "../../packages/pf-workflow" }
   ],
   "include": ["src/**/*.ts"]

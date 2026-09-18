@@ -12,6 +12,7 @@
     "@integra-correios/correios": "*",
     "@integra-correios/domain": "*",
     "@integra-correios/mail": "*",
+    "@integra-correios/persistence": "*",
     "@integra-correios/pf-workflow": "*"
   }
 }

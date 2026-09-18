@@ -1065,39 +1065,47 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
     const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
     try {
       const repository = new PostgresOperationalRepository(pool);
-      const profissionalId = randomUUID();
-      const codigo = `GL-${randomUUID().slice(0, 8).toUpperCase()}`;
       const agora = new Date().toISOString();
 
-      await repository.createProfessional({
-        id: profissionalId,
-        origin: "PF",
-        operationalCode: codigo,
-        status: "CARTEIRA_IDENTIFICADA",
-        document: {
-          documentType: "CPF",
-          fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${CPF_VALIDO}`),
-          encrypted: caixa.seal(CPF_VALIDO_FORMATADO, "documento:cpf"),
-        },
-        originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
-        auditEvent: {
-          id: randomUUID(),
-          aggregateType: "PROFISSIONAL",
-          aggregateId: profissionalId,
-          type: "PF_IMPORTADO_V0",
-          occurredAt: agora,
-          metadata: {},
-          eventHash: hash64(profissionalId),
-        },
-      });
+      // Um profissional distinto por lote: o índice parcial único
+      // item_lote_profissional_ativo_idx impede o mesmo profissional em dois
+      // lotes "vivos" simultâneos (invariante de domínio). Este cenário varia
+      // o STATUS do lote, não o profissional, então cada lote recebe o seu.
+      async function criarProfissional(): Promise<string> {
+        const profissionalId = randomUUID();
+        const codigo = `GL-${randomUUID().slice(0, 8).toUpperCase()}`;
+        await repository.createProfessional({
+          id: profissionalId,
+          origin: "PF",
+          operationalCode: codigo,
+          status: "CARTEIRA_IDENTIFICADA",
+          document: {
+            documentType: "CPF",
+            fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${CPF_VALIDO}`),
+            encrypted: caixa.seal(CPF_VALIDO_FORMATADO, "documento:cpf"),
+          },
+          originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
+          auditEvent: {
+            id: randomUUID(),
+            aggregateType: "PROFISSIONAL",
+            aggregateId: profissionalId,
+            type: "PF_IMPORTADO_V0",
+            occurredAt: agora,
+            metadata: {},
+            eventHash: hash64(profissionalId),
+          },
+        });
+        return profissionalId;
+      }
 
       // Três lotes com outbox PENDING: PREPARACAO (padrão), ATIVO e CANCELADO.
       async function criarLoteComOutbox(suffix: string): Promise<{ loteId: string; outboxId: string }> {
+        const profissionalId = await criarProfissional();
         const loteId = randomUUID();
         const outboxId = randomUUID();
         await repository.enqueueCommunicationBatch({
           id: loteId,
-          code: `PF-MAIL-V0-${codigo}-${suffix}`,
+          code: `PF-MAIL-V0-${randomUUID().slice(0, 8).toUpperCase()}-${suffix}`,
           origin: "PF",
           templateVersion: "pf-confirmation-v1",
           createdBy: "validacao-v0",

@@ -496,7 +496,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         modo: string;
       }>(
         `WITH candidatas AS (
-          SELECT outbox.id, lote.modo
+          SELECT outbox.id
           FROM outbox_email outbox
           JOIN comunicacao comunicacao ON comunicacao.id = outbox.comunicacao_id
           JOIN lote_comunicacao lote ON lote.id = comunicacao.lote_comunicacao_id
@@ -516,7 +516,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         WHERE outbox.id = candidatas.id
         RETURNING outbox.id, outbox.comunicacao_id, outbox.idempotency_key,
           outbox.payload_ciphertext, outbox.payload_nonce, outbox.payload_auth_tag,
-          outbox.chave_versao, outbox.tentativas, candidatas.modo`,
+          outbox.chave_versao, outbox.tentativas`,
         [now, limit, workerId],
       );
       if (result.rows.length > 0) {
@@ -527,6 +527,19 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
           [result.rows.map((row) => row.comunicacao_id), now],
         );
       }
+      // F7: modo do lote resolvido por JOIN determinístico (mesma transação,
+      // mesmo snapshot do claim) — o worker valida o gate server-side.
+      const modos =
+        result.rows.length > 0
+          ? await sql.query<{ comunicacao_id: string; modo: string }>(
+              `SELECT c.id AS comunicacao_id, l.modo
+              FROM comunicacao c
+              JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+              WHERE c.id = ANY($1::uuid[])`,
+              [result.rows.map((row) => row.comunicacao_id)],
+            )
+          : { rows: [] as { comunicacao_id: string; modo: string }[] };
+      const modoPorComunicacao = new Map(modos.rows.map((m) => [m.comunicacao_id, m.modo]));
       return result.rows.map((row) => ({
         id: row.id,
         communicationId: row.comunicacao_id,
@@ -538,9 +551,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
           keyVersion: row.chave_versao,
         },
         attempts: row.tentativas,
-        // F7: o modo do lote atravessa o claim — o worker valida o gate
-        // server-side (lote DRY_RUN nunca processa com gateway LIVE).
-        modo: row.modo as BatchMode,
+        modo: (modoPorComunicacao.get(row.comunicacao_id) ?? "DRY_RUN") as BatchMode,
       }));
     });
   }

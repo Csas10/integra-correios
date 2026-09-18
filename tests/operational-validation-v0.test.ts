@@ -1391,8 +1391,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       expect(segunda.profissionaisCriados).toBe(0);
       expect(segunda.linhasValidas).toBe(2);
 
-      const contagens = await pool.query<{ total: string; validas: string; pendentes: string }>(
-        `SELECT total_linhas, linhas_validas, linhas_pendentes
+      const contagens = await pool.query<{ validas: string; pendentes: string }>(
+        `SELECT linhas_validas AS validas, linhas_pendentes AS pendentes
         FROM importacao WHERE arquivo_importacao_id = (SELECT id FROM arquivo_importacao WHERE sha256 = $1)
         ORDER BY iniciada_em`,
         [sha256],

@@ -105,10 +105,36 @@ export async function processarOutboxUmaVez(
   let falhas = 0;
 
   for (const item of items as readonly ClaimedOutboxItem[]) {
+    // Fase 1 — render: decrypt + parse + validação do payload da outbox.
+    // Falha aqui é do ARTEFATO (payload corrompido/inválido), não do provider:
+    // código próprio e final (payload não se corrige com retry).
+    let message: OutboundMail;
     try {
       const plaintext = caixa.open(item.encryptedPayload, "outbox:email");
       const payload = JSON.parse(new TextDecoder().decode(plaintext));
-      const message = mailFromPayload(payload);
+      message = mailFromPayload(payload);
+    } catch {
+      codigosErro.push("RENDER_PAYLOAD_ERROR");
+      await repository.markOutboxFailed({
+        outboxId: item.id,
+        communicationId: item.communicationId,
+        errorCode: "RENDER_PAYLOAD_ERROR",
+        retryAt: new Date(now.getTime() + 30 * 24 * 3_600_000).toISOString(),
+        auditEvent: {
+          id: crypto.randomUUID(),
+          aggregateType: "COMUNICACAO",
+          aggregateId: item.communicationId,
+          type: "PF_COMMUNICATION_FAILED",
+          occurredAt: now.toISOString(),
+          metadata: { codigo: "RENDER_PAYLOAD_ERROR", final: true },
+          eventHash: await hashEvento(item.id, "RENDER_PAYLOAD_ERROR"),
+        },
+      });
+      falhas += 1;
+      continue;
+    }
+    // Fase 2 — envio: erros do gateway/provider com códigos sanitizados.
+    try {
       const receipt = await gateway.send(message);
       await repository.markOutboxAccepted({
         outboxId: item.id,

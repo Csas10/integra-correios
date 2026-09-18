@@ -19,7 +19,8 @@ import { avaliarReadiness, workerPodeExecutar } from "../src/readiness.js";
 
 const envPronto = {
   DATABASE_URL: process.env.DATABASE_URL ?? "postgresql://placeholder",
-  DATA_ENCRYPTION_KEY_BASE64: Buffer.from(new Uint8Array(32).fill(1)).toString("base64"),
+  // Mesma key de `caixa` abaixo — o motor abre payloads com esta chave.
+  DATA_ENCRYPTION_KEY_BASE64: Buffer.from(new Uint8Array(32).fill(11)).toString("base64"),
   DOCUMENT_FINGERPRINT_KEY_BASE64: Buffer.from(new Uint8Array(32).fill(2)).toString("base64"),
   DATA_ENCRYPTION_KEY_VERSION: "v1",
   PILOT_MODE: "true",
@@ -297,7 +298,8 @@ d("executarWorkerUmaVez (motor completo, PostgreSQL real)", () => {
             expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
             recipientFingerprint: hash64("email-wf"),
             idempotencyKey: `pf-pilot:wf:${outboxId}`,
-            // Payload inválido (não-JSON) → falha no render, erro sanitizado.
+            // Payload inválido (não-JSON) → falha de RENDER (artefato), nunca
+            // do provider: código RENDER_PAYLOAD_ERROR, sem retry inútil.
             encryptedPayload: caixaLocal.seal("payload-nao-json", "outbox:email"),
             auditEvent: {
               id: randomUUID(),
@@ -343,8 +345,10 @@ d("executarWorkerUmaVez (motor completo, PostgreSQL real)", () => {
         repository,
         new Date(),
       );
+      // Payload inválido → falha de RENDER (artefato), nunca do provider:
+      // código RENDER_PAYLOAD_ERROR, sem retry inútil.
       expect(resultado.falhas).toBeGreaterThanOrEqual(1);
-      expect(resultado.codigosErro).toContain("SEND_DISABLED");
+      expect(resultado.codigosErro).toContain("RENDER_PAYLOAD_ERROR");
     } finally {
       await pool.close();
     }

@@ -6,6 +6,8 @@ import type {
 import type {
   AuditEventInput,
   AcceptOutboxCommand,
+  ActivateCommunicationBatchCommand,
+  BatchActivationState,
   ClaimedOutboxItem,
   CreateProfessionalCommand,
   EnqueueCommunicationBatchCommand,
@@ -133,10 +135,14 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
     }
 
     await inTransaction(this.pool, async (sql) => {
+      // PREPARAÇÃO ≠ LIBERAÇÃO: o lote nasce PREPARACAO — outbox persistida,
+      // porém NÃO elegível a claim. Só a ativação explícita e auditável
+      // (ativarLoteComunicacao, CAS PREPARACAO → ATIVO) torna os itens
+      // elegíveis ao worker.
       await sql.query(
         `INSERT INTO lote_comunicacao (
           id, origem, codigo, template_versao, status, criado_por, criado_em, ativado_em
-        ) VALUES ($1, $2, $3, $4, 'ATIVO', $5, $6, $6)`,
+        ) VALUES ($1, $2, $3, $4, 'PREPARACAO', $5, $6, NULL)`,
         [
           command.id,
           command.origin,
@@ -207,6 +213,83 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
     });
   }
 
+  /**
+   * Ativação deliberada do lote: CAS PREPARACAO → ATIVO com auditoria.
+   * Preparações não elegíveis são rejeitadas deterministicamente:
+   *  - inexistente / outra origem → INVALID_STATE;
+   *  - vazio → EMPTY;
+   *  - alguma comunicação já enviada → ALREADY_SENT;
+   *  - CANCELADO/CONCLUIDO → INVALID_STATE;
+   *  - ATIVO (segunda ativação) → ALREADY_ACTIVE (idempotente-determinístico).
+   */
+  async ativarLoteComunicacao(
+    command: ActivateCommunicationBatchCommand,
+  ): Promise<BatchActivationState> {
+    return inTransaction(this.pool, async (sql) => {
+      const lote = await sql.query<{
+        status: string;
+        ativado_em: Date | null;
+        criado_em: Date;
+        template_versao: string;
+        total: string;
+      }>(
+        `SELECT l.status, l.ativado_em, l.criado_em, l.template_versao,
+          (SELECT count(*) FROM item_lote_comunicacao i WHERE i.lote_comunicacao_id = l.id) AS total
+        FROM lote_comunicacao l
+        WHERE l.id = $1 AND l.origem = $2
+        FOR UPDATE`,
+        [command.batchId, command.origin],
+      );
+      const row = lote.rows[0];
+      if (!row) {
+        throw new Error("INVALID_STATE: lote inexistente ou origem incompatível");
+      }
+      const totalItems = Number(row.total);
+      if (row.status === "ATIVO") {
+        return {
+          status: "ATIVO",
+          totalItems,
+          sentItems: 0,
+          templateVersion: row.template_versao,
+          createdAt: row.criado_em.toISOString(),
+          activatedAt: row.ativado_em?.toISOString() ?? null,
+          resultCode: "ALREADY_ACTIVE",
+        };
+      }
+      if (totalItems < 1) throw new Error("EMPTY: lote sem itens");
+      if (row.status !== "PREPARACAO") {
+        throw new Error(`INVALID_STATE: lote em status ${row.status} não pode ser ativado`);
+      }
+      const enviadas = await sql.query<{ total: string }>(
+        `SELECT count(*) AS total
+        FROM comunicacao c
+        WHERE c.lote_comunicacao_id = $1 AND c.status IN ('ACCEPTED', 'SENT')`,
+        [command.batchId],
+      );
+      if (Number(enviadas.rows[0]?.total ?? 0) > 0) {
+        throw new Error("ALREADY_SENT: lote possui comunicação já aceita");
+      }
+      // CAS: só atualiza se ainda PREPARACAO (protegido pelo FOR UPDATE acima).
+      const ativado = await sql.query(
+        `UPDATE lote_comunicacao
+        SET status = 'ATIVO', ativado_em = $2
+        WHERE id = $1 AND origem = $3 AND status = 'PREPARACAO'`,
+        [command.batchId, command.activatedAt, command.origin],
+      );
+      if (ativado.rowCount !== 1) throw new Error("INVALID_STATE: CAS de ativação falhou");
+      await insertAudit(sql, command.auditEvent);
+      return {
+        status: "ATIVO",
+        totalItems,
+        sentItems: 0,
+        templateVersion: row.template_versao,
+        createdAt: row.criado_em.toISOString(),
+        activatedAt: command.activatedAt,
+        resultCode: "ACTIVATED",
+      };
+    });
+  }
+
   async claimOutbox(workerId: string, limit: number, now: string): Promise<readonly ClaimedOutboxItem[]> {
     if (!workerId.trim()) throw new Error("workerId obrigatório");
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
@@ -224,11 +307,16 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         tentativas: number;
       }>(
         `WITH candidatas AS (
-          SELECT id
-          FROM outbox_email
-          WHERE (status IN ('PENDING', 'FAILED') AND disponivel_em <= $1)
-             OR (status = 'PROCESSING' AND bloqueada_em <= $1::timestamptz - interval '15 minutes')
-          ORDER BY disponivel_em, criada_em
+          SELECT outbox.id
+          FROM outbox_email outbox
+          JOIN comunicacao comunicacao ON comunicacao.id = outbox.comunicacao_id
+          JOIN lote_comunicacao lote ON lote.id = comunicacao.lote_comunicacao_id
+          WHERE lote.status = 'ATIVO'
+            AND (
+              (outbox.status IN ('PENDING', 'FAILED') AND outbox.disponivel_em <= $1)
+              OR (outbox.status = 'PROCESSING' AND outbox.bloqueada_em <= $1::timestamptz - interval '15 minutes')
+            )
+          ORDER BY outbox.disponivel_em, outbox.criada_em
           FOR UPDATE SKIP LOCKED
           LIMIT $2
         )

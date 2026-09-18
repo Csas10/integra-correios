@@ -72,6 +72,29 @@ export interface EnqueueCommunicationBatchCommand {
   readonly items: readonly CommunicationBatchItem[];
 }
 
+export interface ActivateCommunicationBatchCommand {
+  readonly batchId: string;
+  readonly origin: "PF";
+  readonly actorId: string;
+  readonly activatedAt: string;
+  readonly auditEvent: AuditEventInput;
+}
+
+export interface BatchActivationState {
+  readonly status: "PREPARACAO" | "ATIVO" | "CONCLUIDO" | "CANCELADO";
+  readonly totalItems: number;
+  readonly sentItems: number;
+  readonly templateVersion: string;
+  readonly createdAt: string;
+  readonly activatedAt: string | null;
+  readonly resultCode:
+    | "ACTIVATED"
+    | "ALREADY_ACTIVE"
+    | "INVALID_STATE"
+    | "EMPTY"
+    | "ALREADY_SENT";
+}
+
 export interface ClaimedOutboxItem {
   readonly id: string;
   readonly communicationId: string;

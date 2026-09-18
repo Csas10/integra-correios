@@ -12,5 +12,6 @@
     { "path": "../../packages/persistence" },
     { "path": "../../packages/pf-workflow" }
   ],
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/cli.ts"]
 }

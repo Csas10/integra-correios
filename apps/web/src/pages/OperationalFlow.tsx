@@ -88,6 +88,41 @@ interface OutboxItem {
   erroCodigo: string | null;
 }
 
+interface ReadinessItem {
+  name: string;
+  status: string;
+  detail: string;
+  requiredAction?: string;
+}
+
+interface ReadinessReport {
+  database: ReadinessItem;
+  cryptography: ReadinessItem;
+  intake: ReadinessItem;
+  persistence: ReadinessItem;
+  outbox: ReadinessItem;
+  worker: ReadinessItem;
+  gmailTransport: ReadinessItem;
+  gmailOauth: ReadinessItem;
+  realSend: ReadinessItem;
+  ppn: ReadinessItem;
+  executionMode: string;
+}
+
+interface WorkerRun {
+  modo?: string;
+  resultado?: {
+    processados: number;
+    enviados: number;
+    falhas: number;
+    codigosErro: string[];
+    modo: string;
+  };
+  motivo?: string;
+  aviso?: string;
+  erro?: string;
+}
+
 type Etapa =
   | "UPLOAD"
   | "MAPPING"
@@ -134,6 +169,9 @@ export function OperationalFlow() {
   } | null>(null);
   const [lote, setLote] = useState<{ loteId: string; codigo: string; totalItens: number } | null>(null);
   const [outbox, setOutbox] = useState<OutboxItem[]>([]);
+  const [readiness, setReadiness] = useState<ReadinessReport | null>(null);
+  const [workerRun, setWorkerRun] = useState<WorkerRun | null>(null);
+  const [ativacao, setAtivacao] = useState<string | null>(null);
   const arquivoRef = useRef<FormData | null>(null);
 
   const guardarArquivo = useCallback((form: FormData) => {
@@ -317,6 +355,53 @@ export function OperationalFlow() {
       setOutbox(resposta.itens);
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha ao consultar outbox.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  const carregarReadiness = useCallback(async () => {
+    try {
+      setReadiness((await chamar("/api/readiness")) as ReadinessReport);
+    } catch {
+      setReadiness(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void carregarReadiness();
+  }, [carregarReadiness]);
+
+  async function liberarLote() {
+    if (!lote) return;
+    setOcupado(true);
+    setErro(undefined);
+    try {
+      const resposta = (await chamar("/api/pilot/activate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ loteId: lote.loteId }),
+      })) as { resultado?: { resultCode: string }; modoEnvio?: string; aviso?: string };
+      setAtivacao(resposta.resultado?.resultCode ?? "ACTIVATED");
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha na liberação do lote.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  async function executarWorkerUmaVez() {
+    setOcupado(true);
+    setErro(undefined);
+    try {
+      const resposta = (await chamar("/api/pilot/worker/run-once", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ dryRun: true }),
+      })) as WorkerRun;
+      setWorkerRun(resposta);
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha na execução do worker.");
     } finally {
       setOcupado(false);
     }
@@ -571,17 +656,90 @@ export function OperationalFlow() {
         </section>
       )}
 
+      {readiness && (
+        <section className="flow-panel" aria-labelledby="readiness-title">
+          <h2 id="readiness-title">Prontidão operacional</h2>
+          <p>
+            Modo atual: <strong>{readiness.executionMode}</strong> — a ausência de configuração
+            deixa de ser ambígua. Nenhum valor sensível é exibido.
+          </p>
+          <table className="flow-table">
+            <thead>
+              <tr>
+                <th>Subsistema</th>
+                <th>Estado</th>
+                <th>Detalhe / ação necessária</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(
+                [
+                  readiness.database,
+                  readiness.cryptography,
+                  readiness.intake,
+                  readiness.persistence,
+                  readiness.outbox,
+                  readiness.worker,
+                  readiness.gmailTransport,
+                  readiness.gmailOauth,
+                  readiness.realSend,
+                  readiness.ppn,
+                ] as ReadinessItem[]
+              ).map((item) => (
+                <tr key={item.name}>
+                  <td>{item.name}</td>
+                  <td>
+                    <code>{item.status}</code>
+                  </td>
+                  <td>
+                    {item.detail}
+                    {item.requiredAction ? <small> · {item.requiredAction}</small> : null}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
       {etapa === "OUTBOX" && lote && (
         <section className="flow-panel" aria-labelledby="outbox-title">
           <h2 id="outbox-title">Status da outbox</h2>
           <p>
-            Lote <strong>{lote.codigo}</strong> com {lote.totalItens} item(ns). Envio real
-            bloqueado (REAL_SEND_ENABLED=false) — os itens permanecem PENDING até o worker ser
-            autorizado.
+            Lote <strong>{lote.codigo}</strong> com {lote.totalItens} item(ns), em PREPARACAO —
+            não elegível a envio até liberação humana explícita (PREPARACAO → ATIVO).
           </p>
-          <button type="button" onClick={atualizarOutbox} disabled={ocupado}>
-            Atualizar status
-          </button>
+          <div className="flow-filters">
+            <button type="button" onClick={atualizarOutbox} disabled={ocupado}>
+              Atualizar status
+            </button>
+            <button type="button" onClick={liberarLote} disabled={ocupado}>
+              LIBERAR LOTE (PREPARACAO → ATIVO) — decisão humana
+            </button>
+            <button type="button" onClick={executarWorkerUmaVez} disabled={ocupado}>
+              Executar worker uma iteração (DRY_RUN)
+            </button>
+          </div>
+          {ativacao && (
+            <p className="flow-stats">
+              Liberação: <code>{ativacao}</code> — lote ATIVO para o motor. Envio real permanece
+              bloqueado (REAL_SEND_ENABLED=false).
+            </p>
+          )}
+          {workerRun && (
+            <div className="flow-stats">
+              <p>Worker one-shot ({workerRun.modo ?? "DRY_RUN"}):</p>
+              {workerRun.motivo && <p>Motivo do bloqueio: <code>{workerRun.motivo}</code></p>}
+              {workerRun.resultado && (
+                <ul>
+                  <li>Processados: {workerRun.resultado.processados}</li>
+                  <li>Enviados (sintético): {workerRun.resultado.enviados}</li>
+                  <li>Falhas: {workerRun.resultado.falhas}</li>
+                </ul>
+              )}
+              {workerRun.aviso && <small>{workerRun.aviso}</small>}
+            </div>
+          )}
           <table className="flow-table">
             <thead>
               <tr>

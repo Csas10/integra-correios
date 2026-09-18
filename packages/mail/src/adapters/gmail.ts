@@ -1,8 +1,10 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   MailProviderNaoConfiguradoError,
+  MailProviderRequestError,
   type MailGateway,
 } from "../domain/gateway.js";
+import { PILOT_SENDER } from "../templates/pf-pilot.js";
 import type {
   MailDelivery,
   MailProvider,
@@ -213,3 +215,135 @@ export class GmailMailGateway implements MailGateway {
 }
 
 export type MailProvider_ = MailProvider;
+
+// ============================================================================
+// Transporte real do Gmail — MIME RFC 2822 + messages.send.
+// Implementado nesta fase; executado SOMENTE quando REAL_SEND_ENABLED=true
+// (GATE 1) e o lote estiver ATIVO (GATE 2), com credenciais do titular.
+// ============================================================================
+
+export const GMAIL_SEND_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
+
+export interface GmailSendResponse {
+  readonly id: string;
+  readonly threadId?: string;
+}
+
+export interface GmailTokenRefreshResponse {
+  readonly access_token: string;
+  readonly expires_in: number;
+}
+
+/**
+ * Composição MIME multipart/alternative (text + html) RFC 2045/2822.
+ * Headers sanitizados: CRLF proibido em from/replyTo/to/subject (header
+ * injection); subject em RFC 2047 quando contém não-ASCII.
+ */
+export function composeMimeMessage(message: OutboundMail): string {
+  const headerSanitize = (valor: string): string => {
+    if (/[\r\n]/.test(valor)) throw new Error("Cabeçalho MIME inválido (CRLF detectado)");
+    return valor;
+  };
+  const from = headerSanitize(`${PILOT_SENDER.name} <${PILOT_SENDER.address}>`);
+  const replyTo = headerSanitize(message.replyTo);
+  const to = headerSanitize(message.to);
+  const subject = headerSanitize(message.subject);
+  const subjectEncoded = /^[-\w .,:;()!\u00C0-\u024F]*$/.test(subject)
+    ? subject
+    : `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
+  const boundary = `ic-${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}-${randomBytes(8).toString("hex")}`;
+
+  return [
+    `From: ${from}`,
+    `Reply-To: ${replyTo}`,
+    `To: ${to}`,
+    `Subject: ${subjectEncoded}`,
+    `MIME-Version: 1.0`,
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    `X-Integra-Confirmation-Id: ${headerSanitize(message.confirmationId)}`,
+    `X-Integra-Template-Version: ${headerSanitize(message.templateVersion)}`,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/plain; charset=UTF-8",
+    "Content-Transfer-Encoding: 8bit",
+    "",
+    message.textBody,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/html; charset=UTF-8",
+    "Content-Transfer-Encoding: 8bit",
+    "",
+    message.htmlBody,
+    "",
+    `--${boundary}--`,
+  ].join("\r\n");
+}
+
+/**
+ * Transporte HTTP real para o Gmail API. Nenhuma credencial entra em logs,
+ * erros ou receipts — apenas códigos curtos determinísticos.
+ */
+export class GmailHttpTransport {
+  async send(message: OutboundMail, accessToken: string): Promise<MailReceipt> {
+    const mime = composeMimeMessage(message);
+    const body = JSON.stringify({ raw: Buffer.from(mime, "utf8").toString("base64url") });
+    let response: Response;
+    try {
+      response = await fetch(GMAIL_SEND_ENDPOINT, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "content-type": "application/json",
+        },
+        body,
+      });
+    } catch {
+      throw new MailProviderRequestError("GMAIL", "messages.send (rede)");
+    }
+    if (!response.ok) {
+      // Erro sanitizado: status + código curto; corpo da resposta NUNCA é
+      // propagado (pode conter PII do payload ou detalhes internos).
+      throw new MailProviderRequestError("GMAIL", `messages.send (HTTP ${response.status})`);
+    }
+    const data = (await response.json()) as GmailSendResponse;
+    if (!data?.id) {
+      throw new MailProviderRequestError("GMAIL", "messages.send (resposta sem id)");
+    }
+    return {
+      provider: "GMAIL" as const,
+      messageId: data.id,
+      acceptedAt: new Date().toISOString(),
+    };
+  }
+
+  /** Refresh do access token via refresh_token (server-side, sem logs). */
+  async refreshAccessToken(
+    config: GmailOauthConfig,
+    refreshToken: string,
+  ): Promise<GmailTokenRefreshResponse> {
+    const body = new URLSearchParams({
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    });
+    let response: Response;
+    try {
+      response = await fetch(GMAIL_OAUTH_TOKEN_ENDPOINT, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body,
+      });
+    } catch {
+      throw new MailProviderRequestError("GMAIL", "token.refresh (rede)");
+    }
+    if (!response.ok) {
+      throw new MailProviderRequestError("GMAIL", `token.refresh (HTTP ${response.status})`);
+    }
+    const data = (await response.json()) as GmailTokenRefreshResponse;
+    if (!data?.access_token) {
+      throw new MailProviderRequestError("GMAIL", "token.refresh (resposta sem access_token)");
+    }
+    return data;
+  }
+}

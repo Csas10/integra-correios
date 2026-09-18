@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   GMAIL_SEND_SCOPE,
+  GmailHttpTransport,
   GmailMailGateway,
   MailProviderNaoConfiguradoError,
+  MailProviderRequestError,
   OauthStateSigner,
   buildAuthorizationUrl,
+  composeMimeMessage,
   exchangeAuthorizationCode,
   loadGmailOauthConfig,
   oauthStatusFromEnvironment,
@@ -177,5 +180,135 @@ describe("Template institucional do piloto", () => {
     });
     expect(mensagem.htmlBody).not.toContain("WhatsApp:");
     expect(mensagem.textBody).not.toContain("WhatsApp:");
+  });
+});
+
+describe("Transporte Gmail real — MIME e messages.send (sem rede)", () => {
+  const mensagem: OutboundMail = {
+    idempotencyKey: "k",
+    confirmationId: "conf-mime-1",
+    to: "profissional@exemplo.test",
+    replyTo: PILOT_SENDER.address,
+    subject: PILOT_SUBJECT,
+    textBody: "corpo texto",
+    htmlBody: "<p>corpo html</p>",
+    templateVersion: PF_PILOT_TEMPLATE_VERSION,
+  };
+
+  it("composição MIME: multipart/alternative com From/Reply-To/To/Subject e ambas as partes", () => {
+    const mime = composeMimeMessage(mensagem);
+    expect(mime).toContain(`From: ${PILOT_SENDER.name} <${PILOT_SENDER.address}>`);
+    expect(mime).toContain(`Reply-To: ${PILOT_SENDER.address}`);
+    expect(mime).toContain(`To: profissional@exemplo.test`);
+    expect(mime).toContain(`Subject: ${PILOT_SUBJECT}`);
+    expect(mime).toContain("MIME-Version: 1.0");
+    expect(mime).toContain("multipart/alternative");
+    expect(mime).toContain("text/plain");
+    expect(mime).toContain("text/html");
+    expect(mime).toContain("corpo texto");
+    expect(mime).toContain("<p>corpo html</p>");
+    expect(mime).toContain(`X-Integra-Template-Version: ${PF_PILOT_TEMPLATE_VERSION}`);
+  });
+
+  it("header injection (CRLF) em destinatário/assunto é rejeitada", () => {
+    expect(() =>
+      composeMimeMessage({ ...mensagem, to: "a@exemplo.test\r\nBcc: vítima@exemplo.test" }),
+    ).toThrow(/CRLF/);
+    expect(() =>
+      composeMimeMessage({ ...mensagem, subject: `Assunto\nBcc: x@exemplo.test` }),
+    ).toThrow(/CRLF/);
+  });
+
+  it("assunto com caracteres fora do range é codificado em RFC 2047", () => {
+    const mime = composeMimeMessage({ ...mensagem, subject: "Confirmação de dados ✓" });
+    expect(mime).toMatch(/^Subject: =\?UTF-8\?B\?/m);
+  });
+
+  async function comFetchFake(
+    implementacao: (url: string, init: RequestInit) => Promise<Response>,
+    acao: (transporte: GmailHttpTransport) => Promise<unknown>,
+  ): Promise<void> {
+    const original = globalThis.fetch;
+    globalThis.fetch = implementacao as typeof fetch;
+    try {
+      await acao(new GmailHttpTransport());
+    } finally {
+      globalThis.fetch = original;
+    }
+  }
+
+  it("messages.send: corpo base64url, Bearer token e receipt com id do Gmail", async () => {
+    let capturado: { url: string; init: RequestInit } | undefined;
+    await comFetchFake(
+      async (url, init) => {
+        capturado = { url, init };
+        return new Response(JSON.stringify({ id: "gmail-msg-123", threadId: "thr-9" }), {
+          status: 200,
+        });
+      },
+      async (transporte) => {
+        const receipt = await transporte.send(mensagem, "token-teste");
+        expect(receipt.provider).toBe("GMAIL");
+        expect(receipt.messageId).toBe("gmail-msg-123");
+      },
+    );
+    expect(capturado?.url).toContain("gmail.googleapis.com");
+    expect((capturado?.init.headers as Record<string, string>).authorization).toBe("Bearer token-teste");
+    const corpo = JSON.parse(capturado!.init.body as string) as { raw: string };
+    const mime = Buffer.from(corpo.raw, "base64url").toString("utf8");
+    expect(mime).toContain(`To: profissional@exemplo.test`);
+  });
+
+  it("HTTP 4xx/5xx e rede caída viram erro sanitizado (sem corpo da resposta)", async () => {
+    await comFetchFake(
+      async () => new Response("{\"erro\":\"detalhe interno\"}", { status: 403 }),
+      async (transporte) => {
+        await expect(transporte.send(mensagem, "t")).rejects.toThrow(MailProviderRequestError);
+        await expect(transporte.send(mensagem, "t")).rejects.toThrow(/403/);
+      },
+    );
+    await comFetchFake(
+      async () => {
+        throw new Error("ECONNREFUSED");
+      },
+      async (transporte) => {
+        await expect(transporte.send(mensagem, "t")).rejects.toThrow(/rede/);
+      },
+    );
+  });
+
+  it("refresh de token usa grant_type=refresh_token e devolve access_token", async () => {
+    let corpoCapturado: URLSearchParams | undefined;
+    await comFetchFake(
+      async (_url, init) => {
+        corpoCapturado = new URLSearchParams(init.body as string);
+        return new Response(
+          JSON.stringify({ access_token: "novo-token", expires_in: 3600 }),
+          { status: 200 },
+        );
+      },
+      async (transporte) => {
+        const tokens = await transporte.refreshAccessToken(
+          { clientId: "cid", clientSecret: "csecret", redirectUri: "https://app/cb" },
+          "refresh-sintetico",
+        );
+        expect(tokens.access_token).toBe("novo-token");
+        expect(tokens.expires_in).toBe(3600);
+      },
+    );
+    expect(corpoCapturado?.get("grant_type")).toBe("refresh_token");
+    expect(corpoCapturado?.get("client_secret")).toBe("csecret");
+    expect(corpoCapturado?.get("refresh_token")).toBe("refresh-sintetico");
+  });
+
+  it("gateway completo com transporte real: REAL_SEND_ENABLED=false segue bloqueando", async () => {
+    const transporte = new GmailHttpTransport();
+    const gateway = new GmailMailGateway(
+      (msg, token) => transporte.send(msg, token),
+      async () => "token",
+      () => new Date(),
+      { REAL_SEND_ENABLED: "false" },
+    );
+    await expect(gateway.send(mensagem)).rejects.toThrow(MailProviderNaoConfiguradoError);
   });
 });

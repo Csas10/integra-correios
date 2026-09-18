@@ -10,7 +10,8 @@
     { "path": "../../packages/importers" },
     { "path": "../../packages/mail" },
     { "path": "../../packages/persistence" },
-    { "path": "../../packages/pf-workflow" }
+    { "path": "../../packages/pf-workflow" },
+    { "path": "../worker" }
   ],
   "include": ["src/**/*.ts"]
 }

@@ -13,6 +13,7 @@
     "@integra-correios/importers": "*",
     "@integra-correios/mail": "*",
     "@integra-correios/persistence": "*",
-    "@integra-correios/pf-workflow": "*"
+    "@integra-correios/pf-workflow": "*",
+    "@integra-correios/worker": "*"
   }
 }

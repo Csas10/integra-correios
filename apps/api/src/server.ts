@@ -19,7 +19,8 @@ import {
   loadGmailOauthConfig,
   oauthStatusFromEnvironment,
 } from "@integra-correios/mail";
-import { createHmac, randomBytes } from "node:crypto";
+import { avaliarReadiness, workerPodeExecutar, sondarDatabase, executarWorkerUmaVez } from "@integra-correios/worker";
+import { randomUUID, createHmac } from "node:crypto";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
@@ -206,6 +207,100 @@ const ROTAS: readonly { metodo: string; prefixo: string; handler: RotaHandler; b
     json(res, 200, { itens: await statusOutbox(pool, loteId) });
   }},
 
+  // ------------------------------------------------------------------
+  // Readiness operacional — estados por subsistema, SEM secrets.
+  // ------------------------------------------------------------------
+  { metodo: "GET", prefixo: "/api/readiness", handler: async (_req, res) => {
+    const report = await avaliarReadiness(process.env, () => sondarDatabase(process.env));
+    json(res, 200, report);
+  }},
+
+  // ------------------------------------------------------------------
+  // LIBERAÇÃO DE LOTE (GATE 2) — ação humana deliberada e auditável:
+  // CAS PREPARACAO → ATIVO + hard cap revalidado server-side.
+  // O browser não define nada além do loteId e do ator declarado.
+  // ------------------------------------------------------------------
+  { metodo: "POST", prefixo: "/api/pilot/activate", handler: async (_req, res, _url, corpo) => {
+    const { pool, repository } = requireDb();
+    const body = JSON.parse(corpo.toString("utf8")) as { loteId?: string; operador?: string };
+    if (!body.loteId) {
+      json(res, 422, { erro: "loteId obrigatório.", codigo: "BLOCKED_INVALID_BATCH" });
+      return;
+    }
+    const policy = carregarPilotPolicy();
+    const estado = await pool.query<{ total: string; status: string }>(
+      `SELECT (SELECT count(*) FROM item_lote_comunicacao WHERE lote_comunicacao_id = $1) AS total,
+        (SELECT status FROM lote_comunicacao WHERE id = $1) AS status`,
+      [body.loteId],
+    );
+    const total = Number(estado.rows[0]?.total ?? 0);
+    if (total < 1) {
+      json(res, 422, { erro: "Lote sem itens.", codigo: "BLOCKED_EMPTY_BATCH" });
+      return;
+    }
+    if (total > policy.maxRecipients) {
+      json(res, 422, {
+        erro: `Lote com ${total} itens excede o limite do piloto (${policy.maxRecipients}).`,
+        codigo: "BLOCKED_PILOT_LIMIT",
+      });
+      return;
+    }
+    const agora = new Date().toISOString();
+    try {
+      const resultado = await repository.ativarLoteComunicacao({
+        batchId: body.loteId,
+        origin: "PF",
+        actorId: body.operador ?? "operador-preview",
+        activatedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: body.loteId,
+          type: "PF_LOTE_COMUNICACAO_ATIVADO",
+          actorId: body.operador ?? "operador-preview",
+          occurredAt: agora,
+          metadata: { totalItens: total },
+          eventHash: hashEvento(body.loteId, agora),
+        },
+      });
+      json(res, 200, { resultado, modoEnvio: "DISABLED", aviso: "Lote ATIVO para DRY_RUN. Envio real permanece bloqueado (REAL_SEND_ENABLED=false)." });
+    } catch (error) {
+      const mensagem = error instanceof Error ? error.message : "Falha na ativação.";
+      const codigo = mensagem.includes("ALREADY_ACTIVE")
+        ? "ALREADY_ACTIVE"
+        : mensagem.includes("INVALID_STATE")
+          ? "BLOCKED_INVALID_STATE"
+          : mensagem.includes("ALREADY_SENT")
+            ? "BLOCKED_ALREADY_SENT"
+            : "BLOCKED_ACTIVATION";
+      json(res, 409, { erro: mensagem, codigo });
+    }
+  }},
+
+  // ------------------------------------------------------------------
+  // WORKER RUN-ONCE — execução controlada de UMA iteração server-side
+  // (mesmo serviço interno do CLI). DRY_RUN por padrão; envio externo
+  // permanece duplamente bloqueado (GATE 1 + GATE 2 + flag do chamador).
+  // ------------------------------------------------------------------
+  { metodo: "POST", prefixo: "/api/pilot/worker/run-once", handler: async (_req, res, _url, corpo) => {
+    const body = JSON.parse(corpo.toString("utf8") || "{}") as { dryRun?: boolean };
+    const readiness = await avaliarReadiness(process.env, () => sondarDatabase(process.env));
+    const veredito = workerPodeExecutar(readiness);
+    if (!veredito.ok) {
+      json(res, 409, { erro: `Worker bloqueado: ${veredito.motivo}`, codigo: veredito.motivo });
+      return;
+    }
+    // LIVE (dryRun=false) é recusado nesta fase: envio real só via gate humano
+    // explícito fora da UI (REAL_SEND_ENABLED + liberação formal).
+    const resultado = await executarWorkerUmaVez({ dryRun: body.dryRun !== false, env: process.env });
+    json(res, 200, {
+      modo: resultado.resultado?.modo ?? "DRY_RUN",
+      resultado: resultado.resultado,
+      motivo: resultado.motivo,
+      aviso: "Execução one-shot server-side. DRY_RUN usa gateway sintético — nenhuma mensagem externa.",
+    });
+  }},
+
   { metodo: "GET", prefixo: "/api/oauth/gmail/status", handler: async (_req, res) => {
     const config = loadGmailOauthConfig(process.env);
     const status = oauthStatusFromEnvironment(process.env, false);
@@ -219,6 +314,10 @@ const ROTAS: readonly { metodo: string; prefixo: string; handler: RotaHandler; b
     });
   }},
 ]
+
+function hashEvento(id: string, ocorreuEm: string): string {
+  return createHmac("sha256", "audit-chain").update(id).update(ocorreuEm).digest("hex");
+}
 
 export function criarServidor() {
   return createServer(async (req, res) => {

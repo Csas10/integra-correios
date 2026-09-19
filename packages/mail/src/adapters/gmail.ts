@@ -30,6 +30,17 @@ export type GmailOauthStatus =
 /** Escopo mínimo da fase: somente envio. Sem leitura de inbox. */
 export const GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send";
 
+/**
+ * F14 — Escopos completos do consentimento: envio + identidade OIDC mínima
+ * (openid + email) para provar a CONTA Google autorizada (email_verified).
+ * Nenhum escopo de leitura de Gmail em nenhuma fase.
+ */
+export const GMAIL_OAUTH_SCOPES: readonly string[] = [
+  GMAIL_SEND_SCOPE,
+  "openid",
+  "email",
+];
+
 export const GMAIL_OAUTH_AUTH_ENDPOINT =
   "https://accounts.google.com/o/oauth2/v2/auth";
 export const GMAIL_OAUTH_TOKEN_ENDPOINT =
@@ -92,13 +103,19 @@ export class OauthStateSigner {
     private readonly ttlMs: number = 10 * 60 * 1000,
   ) {}
 
-  issue(now: Date = new Date()): OauthState {
+  /**
+   * Emite o state assinado. Um `nonce` externo (F13 — binding one-time
+   * start↔callback) pode ser embutido no payload: o MESMO nonce é então
+   * exigido no callback via cookie HttpOnly + registro one-time, tornando o
+   * state inútil fora do fluxo autenticado que o originou.
+   */
+  issue(now: Date = new Date(), nonce?: string): OauthState {
     const expiresAt = new Date(now.getTime() + this.ttlMs).toISOString();
-    const nonce = randomBytes(16).toString("base64url");
+    const nonceEmitido = nonce ?? randomBytes(16).toString("base64url");
     // O payload assinado usa epoch ms (sem pontos): o estado é delimitado por
     // "." e um ISO com milissegundos (12:10:00.000Z) quebraria o split da
     // verificação, invalidando todo state emitido.
-    const payload = `${nonce}.${now.getTime() + this.ttlMs}`;
+    const payload = `${nonceEmitido}.${now.getTime() + this.ttlMs}`;
     const signature = this.sign(payload);
     return { state: `${payload}.${signature}`, expiresAt };
   }
@@ -122,20 +139,148 @@ export class OauthStateSigner {
   }
 }
 
+/** Nome do cookie HttpOnly de binding do fluxo OAuth (start ↔ callback). */
+export const OAUTH_BINDING_COOKIE = "ic_oauth_binding";
+
+export type OauthBindingStatus = "BOUND" | "MISSING" | "REPLAY" | "EXPIRED";
+
+/**
+ * F13 — Registro one-time do binding start↔callback (anti login-CSRF e
+ * account injection). O START autenticado emite um nonce criptograficamente
+ * aleatório; o callback só é aceito quando o state assinado carrega um nonce
+ * previamente emitido, dentro do TTL e NÃO consumido — e o cookie do fluxo
+ * contém o MESMO nonce (comparação em tempo constante feita pelo chamador).
+ * Instância por processo: em serverless multi-instância o registro deve
+ * migrar a um store compartilhado (limitação documentada na PR).
+ */
+export class OauthBindingStore {
+  readonly #emitidos = new Map<string, number>();
+  readonly #consumidos = new Set<string>();
+
+  constructor(
+    private readonly ttlMs: number = 10 * 60 * 1000,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  /** Emite e registra um nonce de binding (apenas pelo START autenticado). */
+  issue(): string {
+    this.varrer();
+    const nonce = randomBytes(32).toString("base64url");
+    this.#emitidos.set(nonce, this.now() + this.ttlMs);
+    return nonce;
+  }
+
+  /**
+   * Consome o binding UMA única vez. BOUND → prossiga comparando o cookie;
+   * MISSING → nonce nunca emitido; REPLAY → já consumido; EXPIRADO → fora do
+   * TTL. Qualquer estado ≠ BOUND rejeita o callback (fail-closed).
+   */
+  consume(nonce: string, agora: Date = new Date()): OauthBindingStatus {
+    this.varrer();
+    if (!this.#emitidos.has(nonce)) {
+      return this.#consumidos.has(nonce) ? "REPLAY" : "MISSING";
+    }
+    if ((this.#emitidos.get(nonce) ?? 0) <= agora.getTime()) {
+      this.#emitidos.delete(nonce);
+      return "EXPIRED";
+    }
+    this.#emitidos.delete(nonce);
+    this.#consumidos.add(nonce);
+    return "BOUND";
+  }
+
+  private varrer(): void {
+    const agora = this.now();
+    for (const [nonce, expira] of this.#emitidos) {
+      if (expira <= agora) this.#emitidos.delete(nonce);
+    }
+    if (this.#consumidos.size > 10_000) this.#consumidos.clear();
+  }
+}
+
 /** URLs do fluxo OAuth (start/callback) construídas com escopo mínimo. */
 export function buildAuthorizationUrl(
   config: GmailOauthConfig,
   state: string,
+  scopes: readonly string[] = GMAIL_OAUTH_SCOPES,
 ): string {
   const url = new URL(GMAIL_OAUTH_AUTH_ENDPOINT);
   url.searchParams.set("client_id", config.clientId);
   url.searchParams.set("redirect_uri", config.redirectUri);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", GMAIL_SEND_SCOPE);
+  url.searchParams.set("scope", scopes.join(" "));
   url.searchParams.set("access_type", "offline");
   url.searchParams.set("prompt", "consent");
   url.searchParams.set("state", state);
   return url.toString();
+}
+
+export const GOOGLE_OIDC_USERINFO_ENDPOINT =
+  "https://openidconnect.googleapis.com/v1/userinfo";
+
+export interface GoogleAccountIdentity {
+  readonly sub: string;
+  readonly email: string;
+  readonly emailVerified: boolean;
+}
+
+/**
+ * F14 — Identidade Google verificada do titular do access token (OIDC
+ * userinfo, privilégio mínimo: usa o access token já obtido). Erro sanitizado:
+ * status HTTP apenas, nunca o corpo.
+ */
+export async function fetchGoogleAccountIdentity(
+  accessToken: string,
+  transport: (url: string, token: string) => Promise<{ status: number; json: () => Promise<unknown> }> =
+    async (url, token) => {
+      const response = await fetch(url, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      return { status: response.status, json: () => response.json() };
+    },
+): Promise<GoogleAccountIdentity> {
+  let payload: { sub?: string; email?: string; email_verified?: boolean | string };
+  try {
+    const resposta = await transport(GOOGLE_OIDC_USERINFO_ENDPOINT, accessToken);
+    if (resposta.status !== 200) {
+      throw new OauthIdentityError(
+        "IDENTITY_CHECK_FAILED",
+        `Verificação de identidade Google falhou (HTTP ${resposta.status}).`,
+      );
+    }
+    payload = (await resposta.json()) as typeof payload;
+  } catch (error) {
+    if (error instanceof OauthIdentityError) throw error;
+    throw new OauthIdentityError("IDENTITY_CHECK_FAILED", "Verificação de identidade Google falhou (rede).");
+  }
+  if (!payload?.sub || !payload?.email) {
+    throw new OauthIdentityError("IDENTITY_INCOMPLETE", "Identidade Google sem sub/email.");
+  }
+  if (payload.email_verified !== true && payload.email_verified !== "true") {
+    throw new OauthIdentityError("EMAIL_NOT_VERIFIED", "E-mail Google não verificado.");
+  }
+  return { sub: payload.sub, email: payload.email, emailVerified: true };
+}
+
+export class OauthIdentityError extends Error {
+  constructor(readonly codigo: string, message: string) {
+    super(message);
+    this.name = "OauthIdentityError";
+  }
+}
+
+/**
+ * F14 — Derivação compartilhada do fingerprint da CONTA: a partir da
+ * identidade Google VERIFICADA (e-mail com email_verified=true, exigido
+ * igual a GMAIL_EXPECTED_ACCOUNT), NUNCA do clientId do OAuth client.
+ * Usada pelo callback OAuth (persistência) e pelo worker (lookup da conexão)
+ * — mesma função, mesma derivação dos dois lados.
+ */
+export function derivarFingerprintContaGmail(
+  fingerprinter: { fingerprint(namespace: string, canonicalValue: string): string },
+  emailVerificado: string,
+): string {
+  return fingerprinter.fingerprint("gmail-account", `gmail:${emailVerificado.trim().toLowerCase()}`);
 }
 
 export interface GmailTokenResponse {

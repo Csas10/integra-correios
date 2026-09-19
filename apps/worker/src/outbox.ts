@@ -3,6 +3,7 @@ import {
   DryRunMailGateway,
   GmailHttpTransport,
   GmailMailGateway,
+  derivarFingerprintContaGmail,
   loadGmailOauthConfig,
   type MailGateway,
   type OutboundMail,
@@ -232,8 +233,12 @@ export function criarAccessTokenProvider(
     Buffer.from(env.DOCUMENT_FINGERPRINT_KEY_BASE64 ?? "", "base64"),
   );
   const transporte = new GmailHttpTransport();
-  const accountFingerprint = config
-    ? fingerprinter.fingerprint("gmail-account", config.clientId)
+  // F14: lookup deriva o fingerprint da CONTA ESPERADA (GMAIL_EXPECTED_ACCOUNT)
+  // pela MESMA função usada no callback OAuth (que persiste com a identidade
+  // verificada == conta esperada). Ambos os lados convergem no mesmo valor.
+  const esperada = env.GMAIL_EXPECTED_ACCOUNT?.trim().toLowerCase() ?? "";
+  const accountFingerprint = esperada
+    ? derivarFingerprintContaGmail(fingerprinter, esperada)
     : "";
   let cache: { token: string; expiraEmMs: number } | undefined;
   return async () => {

@@ -20,6 +20,26 @@ const API_BASE =
     : "http://localhost:8787");
 const PILOT_MAX = 5;
 
+/**
+ * F12 — Sessão operacional do browser: o OPERATOR_TOKEN é informado UMA vez,
+ * validado por POST /api/operator/session e trocado por um cookie HttpOnly
+ * de sessão de curta duração. O token nunca é persistido (nem storage, nem
+ * URL, nem bundle): vive apenas no estado do formulário de login.
+ */
+interface EstadoSessao {
+  status: "DESCONHECIDO" | "AUTENTICADO" | "NAO_AUTENTICADO";
+  expiraEm?: string;
+}
+
+async function consultarSessao(): Promise<EstadoSessao> {
+  const resposta = await fetch(`${API_BASE}/api/operator/session`, { credentials: "same-origin" });
+  if (resposta.status === 200) {
+    const corpo = (await resposta.json().catch(() => ({}))) as { expiraEm?: string };
+    return { status: "AUTENTICADO", ...(corpo.expiraEm ? { expiraEm: corpo.expiraEm } : {}) };
+  }
+  return { status: "NAO_AUTENTICADO" };
+}
+
 interface Sugestao {
   campo: string;
   cabecalho: string | null;
@@ -178,7 +198,55 @@ export function OperationalFlow() {
   const [readiness, setReadiness] = useState<ReadinessReport | null>(null);
   const [workerRun, setWorkerRun] = useState<WorkerRun | null>(null);
   const [ativacao, setAtivacao] = useState<string | null>(null);
+  const [sessao, setSessao] = useState<EstadoSessao>({ status: "DESCONHECIDO" });
+  const [tokenOperador, setTokenOperador] = useState("");
+  const [entrando, setEntrando] = useState(false);
   const arquivoRef = useRef<FormData | null>(null);
+
+  // F12: estado de sessão claro antes de liberar qualquer operação.
+  useEffect(() => {
+    void consultarSessao().then(setSessao);
+  }, []);
+
+  const autenticar = useCallback(async () => {
+    if (!tokenOperador) return;
+    setEntrando(true);
+    setErro(undefined);
+    try {
+      const resposta = await fetch(`${API_BASE}/api/operator/session`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: tokenOperador }),
+      });
+      const corpo = (await resposta.json().catch(() => ({}))) as { erro?: string; expiraEm?: string };
+      if (resposta.status === 503) {
+        setSessao({ status: "NAO_AUTENTICADO" });
+        setErro("Autenticação operacional indisponível (OPERATOR_TOKEN ausente no servidor). Fail-closed.");
+        return;
+      }
+      if (!resposta.ok) {
+        setSessao({ status: "NAO_AUTENTICADO" });
+        setErro(corpo.erro ?? "Token operacional inválido.");
+        return;
+      }
+      setSessao({ status: "AUTENTICADO", ...(corpo.expiraEm ? { expiraEm: corpo.expiraEm } : {}) });
+      setTokenOperador("");
+    } catch {
+      setSessao({ status: "NAO_AUTENTICADO" });
+      setErro("Não foi possível autenticar a sessão operacional.");
+    } finally {
+      setEntrando(false);
+    }
+  }, [tokenOperador]);
+
+  const sair = useCallback(async () => {
+    try {
+      await fetch(`${API_BASE}/api/operator/session`, { method: "DELETE", credentials: "same-origin" });
+    } finally {
+      setSessao({ status: "NAO_AUTENTICADO" });
+    }
+  }, []);
 
   const guardarArquivo = useCallback((form: FormData) => {
     arquivoRef.current = form;
@@ -374,9 +442,11 @@ export function OperationalFlow() {
     }
   }, []);
 
+  // F12: recarrega a prontidão quando a sessão operacional muda.
   useEffect(() => {
-    void carregarReadiness();
-  }, [carregarReadiness]);
+    if (sessao.status === "AUTENTICADO") void carregarReadiness();
+    else setReadiness(null);
+  }, [sessao.status, carregarReadiness]);
 
   async function liberarLote() {
     if (!lote) return;
@@ -438,6 +508,61 @@ export function OperationalFlow() {
         </p>
       )}
 
+      {/* F12 — Sessão operacional: estado claro antes de liberar o fluxo. */}
+      {sessao.status !== "AUTENTICADO" ? (
+        <section className="flow-panel" aria-labelledby="session-title">
+          <h2 id="session-title">Sessão operacional</h2>
+          <p className="flow-warn">
+            {sessao.status === "DESCONHECIDO"
+              ? "Verificando sessão operacional…"
+              : "Autenticação operacional necessária — nenhuma operação disponível até autenticar."}
+          </p>
+          <div className="flow-filters">
+            <input
+              type="password"
+              value={tokenOperador}
+              onChange={(e) => setTokenOperador(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void autenticar();
+              }}
+              placeholder="Token operacional"
+              autoComplete="off"
+              aria-label="Token operacional"
+            />
+            <button type="button" disabled={!tokenOperador || entrando} onClick={autenticar}>
+              {entrando ? "Autenticando…" : "Autenticar sessão"}
+            </button>
+          </div>
+          <small>
+            O token é enviado uma única vez e trocado por um cookie HttpOnly de sessão; ele não
+            é persistido no navegador.
+          </small>
+        </section>
+      ) : (
+        <section className="flow-panel" aria-labelledby="session-title">
+          <h2 id="session-title">Sessão operacional</h2>
+          <p>
+            Sessão ativa{sessao.expiraEm ? ` (expira ${new Date(sessao.expiraEm).toLocaleString()})` : ""}.
+          </p>
+          <button type="button" onClick={sair}>
+            Encerrar sessão operacional
+          </button>
+        </section>
+      )}
+
+      {/* F12 — Nenhuma operação disponível sem sessão autenticada. */}
+      {sessao.status !== "AUTENTICADO" && (
+        <section className="flow-panel" aria-label="Fluxo bloqueado">
+          <p className="flow-warn">
+            Fluxo operacional bloqueado até a sessão ser autenticada. Informe o token operacional
+            para liberar as etapas abaixo.
+          </p>
+        </section>
+      )}
+
+      {/* F12 — Fluxo operacional inteiro atrás da sessão autenticada. */}
+      {sessao.status === "AUTENTICADO" && (
+        <>
       {etapa === "UPLOAD" && (
         <section className="flow-panel" aria-labelledby="upload-title">
           <h2 id="upload-title">Importar base de profissionais</h2>
@@ -771,6 +896,8 @@ export function OperationalFlow() {
             </tbody>
           </table>
         </section>
+      )}
+        </>
       )}
     </div>
   );

@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createHmac, timingSafeEqual, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   NodePostgresPool,
   PostgresOperationalRepository,
@@ -37,6 +37,7 @@ import { createWebTokenService } from "@integra-correios/pf-workflow";
 import {
   loadGmailOauthConfig,
   oauthStatusFromEnvironment,
+  OAUTH_BINDING_COOKIE,
 } from "@integra-correios/mail";
 import {
   avaliarReadiness,
@@ -51,25 +52,55 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 /**
  * F10 — CONTROLE DE ACESSO.
  *
- * OPERATOR_ROUTE: rotas operacionais (importar, cockpit, lote, worker,
- *   readiness detalhado). Exigem cabeçalho Authorization: Bearer
- *   OPERATOR_TOKEN — segredo do ambiente (fail-closed: sem o segredo no
- *   ambiente, NENHUMA rota operacional responde; nenhum XLSX real entra).
- * PUBLIC_CONFIRMATION_ROUTE: consulta/submissão da confirmação do
- *   profissional — protegida pelo capability token na URL (256 bits,
- *   hash-only no banco, consumo atômico). Nunca expõe PII além do
- *   contexto mínimo.
- * /api/health é público sem PII (readiness simples de uptime).
+ * ROTAS PUBLICAS (este servidor não faz matching por prefixo — ver F15):
+ *   - /api/health: uptime simples, sem PII;
+ *   - GET/POST /api/confirmation: capability token na URL (256 bits,
+ *     hash-only no banco, consumo atômico);
+ *   - GET /api/oauth/gmail/callback: retorno do Google, protegido pelo
+ *     binding one-time start↔callback (state assinado + nonce + cookie).
+ *
+ * OPERATOR_ROUTE — F12: a autenticação operacional aceita (a) a SESSÃO de
+ * curta duração criada por POST /api/operator/session (cookie HttpOnly;
+ * token bruto NUNCA vai ao browser) e (b) Authorization: Bearer
+ * OPERATOR_TOKEN para CLI/admin técnico. Fail-closed: sem o segredo no
+ * ambiente, NENHUMA rota operacional responde.
  */
 
 const ROTAS_PUBLICAS = new Set([
   "GET /api/health",
   "GET /api/confirmation", // consulta por token (capability)
   "POST /api/confirmation", // submissão por token (capability)
-  "GET /api/oauth/gmail/start", // redireciona ao consentimento Google (gate humano do titular)
-  "GET /api/oauth/gmail/callback", // callback autorizado pelo titular
-  "GET /api/oauth/gmail/status", // estado sem secrets
+  "GET /api/oauth/gmail/callback", // retorno do Google (binding one-time)
+  "POST /api/operator/session", // F12: valida token UMA vez e emite sessão (fail-closed sem env)
+  "DELETE /api/operator/session", // logout operacional
 ]);
+
+const OPERATOR_SESSION_COOKIE = "ic_operator_session";
+
+/** F12 — TTL da sessão operacional (cookie HttpOnly; token NUNCA vai ao browser). */
+const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+/** F13 — TTL curto do binding one-time do fluxo OAuth. */
+const OAUTH_BINDING_TTL_SECONDS = 600;
+
+/**
+ * Sessões operacionais em memória do processo (F12): o cookie carrega um
+ * identificador opaco aleatório — NUNCA o OPERATOR_TOKEN. Instância por
+ * processo; em serverless multi-instância a sessão deve migrar a um store
+ * compartilhado (limitação documentada na PR).
+ */
+const sessoesOperador = new Map<string, { expiraEm: number }>();
+
+function limparSessoesExpiradas(): void {
+  const agora = Date.now();
+  for (const [id, sessao] of sessoesOperador) {
+    if (sessao.expiraEm <= agora) sessoesOperador.delete(id);
+  }
+}
+
+/** Comparação em tempo constante (buffers de igual comprimento). */
+function timingSafeIgual(a: Buffer, b: Buffer): boolean {
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 function caixa(): Aes256GcmSecretBox {
   return new Aes256GcmSecretBox(
@@ -84,14 +115,98 @@ function fingerprinter(): HmacSha256Fingerprinter {
   );
 }
 
-function json(res: ServerResponse, status: number, body: unknown): void {
+function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(payload),
     "cache-control": "no-store",
+    ...headers,
   });
   res.end(payload);
+}
+
+/** Limite de tamanho do header x-mapping (JSON do mapeamento UI→API). */
+const MAX_MAPPING_BYTES = 64 * 1024;
+/** Limite de tamanho do header x-file-name decodificado. */
+const MAX_FILE_NAME_BYTES = 512;
+
+export class ContratoInvalidoError extends Error {
+  constructor(readonly codigo: string, message: string) {
+    super(message);
+    this.name = "ContratoInvalidoError";
+  }
+}
+
+/**
+ * Contrato browser→API do mapeamento (F13 do browser/API):
+ *   UI envia  encodeURIComponent(JSON.stringify(mapping))
+ *   API decodifica  decodeURIComponent → JSON.parse → validação de schema.
+ * Payload malformado/grande demais → erro 400 sanitizado (nunca 500).
+ */
+export function parseMappingHeader(bruto: string | undefined): { campo: string; coluna: number }[] {
+  if (!bruto?.trim()) {
+    throw new ContratoInvalidoError("MAPPING_MISSING", "Header x-mapping ausente.");
+  }
+  if (bruto.length > MAX_MAPPING_BYTES) {
+    throw new ContratoInvalidoError("MAPPING_TOO_LARGE", "Header x-mapping excede o limite de tamanho.");
+  }
+  let decodificado: string;
+  try {
+    decodificado = decodeURIComponent(bruto);
+  } catch {
+    throw new ContratoInvalidoError("MAPPING_MALFORMED", "Header x-mapping não é uma codificação de componente válida.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decodificado);
+  } catch {
+    throw new ContratoInvalidoError("MAPPING_MALFORMED", "Header x-mapping não contém JSON válido.");
+  }
+  if (!Array.isArray(parsed)) {
+    throw new ContratoInvalidoError("MAPPING_INVALID_SCHEMA", "Header x-mapping deve ser um array de { campo, coluna }.");
+  }
+  const itens: { campo: string; coluna: number }[] = [];
+  for (const entrada of parsed) {
+    if (typeof entrada !== "object" || entrada === null) {
+      throw new ContratoInvalidoError("MAPPING_INVALID_SCHEMA", "Item do mapeamento deve ser objeto.");
+    }
+    const { campo, coluna } = entrada as { campo?: unknown; coluna?: unknown };
+    if (typeof campo !== "string" || !campo.trim() || campo.length > 64) {
+      throw new ContratoInvalidoError("MAPPING_INVALID_SCHEMA", "Campo do mapeamento inválido.");
+    }
+    if (typeof coluna !== "number" || !Number.isInteger(coluna) || coluna < 0 || coluna > 1023) {
+      throw new ContratoInvalidoError("MAPPING_INVALID_SCHEMA", "Coluna do mapeamento inválida.");
+    }
+    itens.push({ campo: campo.trim(), coluna });
+  }
+  return itens;
+}
+
+/**
+ * Contrato simétrico do x-file-name: encode no browser → decode seguro aqui.
+ * Nome ausente demais/inválido → erro 400 sanitizado (nunca 500).
+ */
+export function parseFileNameHeader(bruto: string | undefined): string {
+  const cru = bruto?.trim() ?? "";
+  if (!cru) return "entrada.xlsx";
+  if (cru.length > MAX_FILE_NAME_BYTES * 4) {
+    throw new ContratoInvalidoError("FILE_NAME_TOO_LARGE", "Nome de arquivo excede o limite.");
+  }
+  let decodificado: string;
+  try {
+    decodificado = decodeURIComponent(cru);
+  } catch {
+    throw new ContratoInvalidoError("FILE_NAME_MALFORMED", "Nome de arquivo com codificação inválida.");
+  }
+  if (!decodificado || decodificado.length > MAX_FILE_NAME_BYTES) {
+    throw new ContratoInvalidoError("FILE_NAME_INVALID", "Nome de arquivo vazio ou excessivo.");
+  }
+  // Nome nunca é usado em paths/commands — apenas exibição/metadado.
+  if (/[\r\n\u0000]/.test(decodificado)) {
+    throw new ContratoInvalidoError("FILE_NAME_INVALID", "Nome de arquivo contém caracteres proibidos.");
+  }
+  return decodificado;
 }
 
 async function lerCorpo(req: IncomingMessage, limite = MAX_UPLOAD_BYTES): Promise<Buffer> {
@@ -120,7 +235,77 @@ function requireDb(): { pool: NodePostgresPool; repository: PostgresOperationalR
   return { pool: recursos.pool, repository: recursos.repository! };
 }
 
-/** Comparação em tempo constante do token do operador (F10). */
+type RotaHandler = (req: IncomingMessage, res: ServerResponse, url: URL, corpo: Buffer) => Promise<void>;
+
+/**
+ * F15 — Rota com matching EXATO (estáticas) ou matcher explícito (dinâmicas).
+ * Nenhuma rota futura herda autoridade/público por compartilhar prefixo:
+ * `startsWith` foi eliminado do roteamento e da autorização.
+ */
+interface Rota {
+  metodo: string;
+  caminhoExato?: string;
+  /** Matcher restrito para rotas dinâmicas — prefixo nunca é suficiente. */
+  matcher?: (pathname: string) => boolean;
+  handler: RotaHandler;
+}
+
+/**
+ * F12 — Cria sessão operacional de curta duração: id opaco aleatório gravado
+ * no cookie HttpOnly; o mapeamento id→expiração vive apenas na memória do
+ * processo. O token bruto NUNCA vai ao browser/storage/URL/log.
+ */
+function criarSessaoOperador(): { cookie: string; expiraEm: number } {
+  const id = randomBytes(32).toString("base64url");
+  const expiraEm = Date.now() + OPERATOR_SESSION_TTL_MS;
+  sessoesOperador.set(id, { expiraEm });
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  return {
+    cookie: `${OPERATOR_SESSION_COOKIE}=${id}; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=${Math.floor(OPERATOR_SESSION_TTL_MS / 1000)}`,
+    expiraEm,
+  };
+}
+
+function sessaoCookieRemovido(): string {
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  return `${OPERATOR_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=0`;
+}
+
+/** Cookie HttpOnly do binding OAuth (F13) com expiração explícita. */
+function bindingCookie(valor: string): string {
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  return `${OAUTH_BINDING_COOKIE}=${valor}; Path=/; HttpOnly; SameSite=Lax${secure}; Max-Age=${OAUTH_BINDING_TTL_SECONDS}`;
+}
+
+/** Exclui o cookie de binding após o consumo/conclusão do fluxo. */
+function bindingCookieRemovido(): string {
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  return `${OAUTH_BINDING_COOKIE}=; Path=/; HttpOnly; SameSite=Lax${secure}; Max-Age=0`;
+}
+
+function cookiesDo(req: IncomingMessage): Record<string, string> {
+  const bruto = req.headers.cookie ?? "";
+  const cookies: Record<string, string> = {};
+  for (const parte of bruto.split(";")) {
+    const idx = parte.indexOf("=");
+    if (idx > 0) cookies[parte.slice(0, idx).trim()] = parte.slice(idx + 1).trim();
+  }
+  return cookies;
+}
+
+function autenticacaoDeSessao(req: IncomingMessage): boolean {
+  const cookie = cookiesDo(req)[OPERATOR_SESSION_COOKIE];
+  if (!cookie) return false;
+  limparSessoesExpiradas();
+  const sessao = sessoesOperador.get(cookie);
+  if (!sessao || sessao.expiraEm <= Date.now()) {
+    sessoesOperador.delete(cookie);
+    return false;
+  }
+  return true;
+}
+
+/** Comparação em tempo constante do token do operador (F10/F12). */
 function verificarOperador(req: IncomingMessage): boolean {
   const esperado = process.env.OPERATOR_TOKEN?.trim();
   if (!esperado) return false; // fail-closed: sem segredo no ambiente, sem acesso
@@ -132,17 +317,16 @@ function verificarOperador(req: IncomingMessage): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-type RotaHandler = (req: IncomingMessage, res: ServerResponse, url: URL, corpo: Buffer) => Promise<void>;
-
-interface Rota {
-  metodo: string;
-  prefixo: string;
-  handler: RotaHandler;
-}
-
+/**
+ * F12 — Autenticação operacional aceita por SESSÃO (cookie HttpOnly) OU
+ * Bearer direto (CLI/admin técnico). Sessão inexistente/expirada → 401.
+ */
 function exigirOperador(req: IncomingMessage, res: ServerResponse): boolean {
-  if (verificarOperador(req)) return true;
-  json(res, 401, { erro: "Acesso do operador exigido (Authorization: Bearer OPERATOR_TOKEN)." });
+  if (autenticacaoDeSessao(req) || verificarOperador(req)) return true;
+  json(res, 401, {
+    erro: "Autenticação operacional exigida.",
+    codigo: "OPERATOR_AUTH_REQUIRED",
+  });
   return false;
 }
 
@@ -156,7 +340,7 @@ const ROTAS: readonly Rota[] = [
   // ------------------------------------------------------------------
   {
     metodo: "GET",
-    prefixo: "/api/health",
+    caminhoExato: "/api/health",
     handler: async (_req, res) => {
       const policy = carregarPilotPolicy();
       const oauth = loadGmailOauthConfig(process.env)
@@ -176,7 +360,7 @@ const ROTAS: readonly Rota[] = [
   // ------------------------------------------------------------------
   {
     metodo: "GET",
-    prefixo: "/api/readiness",
+    caminhoExato: "/api/readiness",
     handler: async (req, res) => {
       if (!exigirOperador(req, res)) return;
       const report = await avaliarReadiness(
@@ -201,62 +385,91 @@ const ROTAS: readonly Rota[] = [
   // ------------------------------------------------------------------
   {
     metodo: "POST",
-    prefixo: "/api/intake/analyze",
+    caminhoExato: "/api/intake/analyze",
     handler: async (req, res, _url, corpo) => {
       if (!exigirOperador(req, res)) return;
-      const nome = req.headers["x-file-name"]?.toString() ?? "entrada.xlsx";
-      const folha = req.headers["x-sheet-name"]?.toString();
-      const linhaCabecalho = req.headers["x-header-row"]?.toString();
-      const analise = analisarXlsx(
-        nome,
-        new Uint8Array(corpo),
-        folha,
-        linhaCabecalho ? Number.parseInt(linhaCabecalho, 10) : undefined,
-      );
-      json(res, 200, analise);
+      try {
+        const nome = parseFileNameHeader(req.headers["x-file-name"]?.toString());
+        const folha = req.headers["x-sheet-name"]?.toString();
+        const linhaCabecalho = req.headers["x-header-row"]?.toString();
+        const analise = analisarXlsx(
+          nome,
+          new Uint8Array(corpo),
+          folha,
+          linhaCabecalho ? Number.parseInt(linhaCabecalho, 10) : undefined,
+        );
+        json(res, 200, analise);
+      } catch (error) {
+        if (error instanceof ContratoInvalidoError) {
+          json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 422, { erro: "Arquivo não pôde ser analisado (formato/estrutura inválida)." });
+      }
     },
   },
   {
     metodo: "POST",
-    prefixo: "/api/intake/preflight",
+    caminhoExato: "/api/intake/preflight",
     handler: async (req, res, _url, corpo) => {
       if (!exigirOperador(req, res)) return;
-      const nome = req.headers["x-file-name"]?.toString() ?? "entrada.xlsx";
-      const folha = req.headers["x-sheet-name"]?.toString();
-      const linhaCabecalho = req.headers["x-header-row"]?.toString();
-      const mapeamento = JSON.parse(req.headers["x-mapping"]?.toString() ?? "[]");
-      const input: PreflightInput = {
-        nomeArquivo: nome,
-        bytes: new Uint8Array(corpo),
-        ...(folha ? { folha } : {}),
-        ...(linhaCabecalho ? { linhaCabecalho: Number.parseInt(linhaCabecalho, 10) } : {}),
-        mapeamento,
-      };
-      json(res, 200, executarPreflight(input));
-    },
-  },
-  {
-    metodo: "POST",
-    prefixo: "/api/intake/confirm",
-    handler: async (req, res, _url, corpo) => {
-      if (!exigirOperador(req, res)) return;
-      const { pool, repository } = requireDb();
-      const nome = req.headers["x-file-name"]?.toString() ?? "entrada.xlsx";
-      const folha = req.headers["x-sheet-name"]?.toString();
-      const linhaCabecalho = req.headers["x-header-row"]?.toString();
-      const mapeamento = JSON.parse(req.headers["x-mapping"]?.toString() ?? "[]");
-      const resultado = await confirmarImportacao(
-        {
+      try {
+        const nome = parseFileNameHeader(req.headers["x-file-name"]?.toString());
+        const folha = req.headers["x-sheet-name"]?.toString();
+        const linhaCabecalho = req.headers["x-header-row"]?.toString();
+        const mapeamento = parseMappingHeader(req.headers["x-mapping"]?.toString());
+        const input: PreflightInput = {
           nomeArquivo: nome,
           bytes: new Uint8Array(corpo),
           ...(folha ? { folha } : {}),
           ...(linhaCabecalho ? { linhaCabecalho: Number.parseInt(linhaCabecalho, 10) } : {}),
-          mapeamento,
-          operador: "operador-autenticado",
-        },
-        repository,
-      );
-      json(res, 200, resultado);
+          mapeamento: mapeamento as PreflightInput["mapeamento"],
+        };
+        json(res, 200, executarPreflight(input));
+      } catch (error) {
+        if (error instanceof ContratoInvalidoError) {
+          json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 422, { erro: "Preflight não pôde ser executado (arquivo/mapping inválidos)." });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/intake/confirm",
+    handler: async (req, res, _url, corpo) => {
+      if (!exigirOperador(req, res)) return;
+      try {
+        const { pool, repository } = requireDb();
+        const nome = parseFileNameHeader(req.headers["x-file-name"]?.toString());
+        const folha = req.headers["x-sheet-name"]?.toString();
+        const linhaCabecalho = req.headers["x-header-row"]?.toString();
+        const mapeamento = parseMappingHeader(req.headers["x-mapping"]?.toString());
+        const resultado = await confirmarImportacao(
+          {
+            nomeArquivo: nome,
+            bytes: new Uint8Array(corpo),
+            ...(folha ? { folha } : {}),
+            ...(linhaCabecalho ? { linhaCabecalho: Number.parseInt(linhaCabecalho, 10) } : {}),
+            mapeamento: mapeamento as PreflightInput["mapeamento"],
+            operador: "operador-autenticado",
+          },
+          repository,
+        );
+        json(res, 200, resultado);
+      } catch (error) {
+        if (error instanceof ContratoInvalidoError) {
+          json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        const mensagem = error instanceof Error ? error.message : "Falha na importação.";
+        if (mensagem.includes("Configuração de criptografia")) {
+          json(res, 503, { erro: "Persistência não configurada (chaves ausentes)." });
+          return;
+        }
+        json(res, 422, { erro: "Importação não pôde ser confirmada (arquivo/mapping inválidos)." });
+      }
     },
   },
 
@@ -265,7 +478,7 @@ const ROTAS: readonly Rota[] = [
   // ------------------------------------------------------------------
   {
     metodo: "GET",
-    prefixo: "/api/professionals",
+    caminhoExato: "/api/professionals",
     handler: async (req, res, url) => {
       if (!exigirOperador(req, res)) return;
       const { pool } = requireDb();
@@ -276,7 +489,7 @@ const ROTAS: readonly Rota[] = [
   },
   {
     metodo: "POST",
-    prefixo: "/api/pilot/preview",
+    caminhoExato: "/api/pilot/preview",
     handler: async (req, res, _url, corpo) => {
       if (!exigirOperador(req, res)) return;
       const { pool } = requireDb();
@@ -313,7 +526,7 @@ const ROTAS: readonly Rota[] = [
   },
   {
     metodo: "POST",
-    prefixo: "/api/pilot/prepare",
+    caminhoExato: "/api/pilot/prepare",
     handler: async (req, res, _url, corpo) => {
       if (!exigirOperador(req, res)) return;
       const { pool, repository } = requireDb();
@@ -342,7 +555,7 @@ const ROTAS: readonly Rota[] = [
   },
   {
     metodo: "GET",
-    prefixo: "/api/pilot/outbox",
+    caminhoExato: "/api/pilot/outbox",
     handler: async (req, res, url) => {
       if (!exigirOperador(req, res)) return;
       const { pool } = requireDb();
@@ -357,7 +570,7 @@ const ROTAS: readonly Rota[] = [
   // ------------------------------------------------------------------
   {
     metodo: "POST",
-    prefixo: "/api/pilot/activate",
+    caminhoExato: "/api/pilot/activate",
     handler: async (req, res, _url, corpo) => {
       if (!exigirOperador(req, res)) return;
       const { pool, repository } = requireDb();
@@ -428,7 +641,7 @@ const ROTAS: readonly Rota[] = [
   // ------------------------------------------------------------------
   {
     metodo: "POST",
-    prefixo: "/api/pilot/worker/run-once",
+    caminhoExato: "/api/pilot/worker/run-once",
     handler: async (req, res) => {
       if (!exigirOperador(req, res)) return;
       const readiness = await avaliarReadiness(process.env, () => sondarDatabase(process.env));
@@ -451,13 +664,66 @@ const ROTAS: readonly Rota[] = [
   },
 
   // ------------------------------------------------------------------
-  // F2 — OAuth Gmail: start (URL de consentimento) e callback (troca,
-  // cifragem e persistência). Rotas de gate humano do titular.
+  // F12 — SESSÃO OPERACIONAL: troca única do OPERATOR_TOKEN por sessão de
+  // curta duração (cookie HttpOnly). Comparação em tempo constante; fail-closed
+  // sem env; token bruto nunca vai ao browser, storage, URL ou log. Depois da
+  // sessão, as OPERATOR_ROUTE aceitam o cookie (Bearer preservado p/ CLI).
+  // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/session",
+    handler: async (_req, res, _url, corpo) => {
+      const esperado = process.env.OPERATOR_TOKEN?.trim();
+      if (!esperado) {
+        json(res, 503, {
+          erro: "OPERATOR_TOKEN não configurado no ambiente — autenticação operacional indisponível (fail-closed).",
+          codigo: "OPERATOR_TOKEN_MISSING",
+        });
+        return;
+      }
+      let token = "";
+      try {
+        const body = JSON.parse(corpo.toString("utf8") || "{}") as { token?: unknown };
+        if (typeof body.token === "string") token = body.token;
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      const a = Buffer.from(token);
+      const b = Buffer.from(esperado);
+      if (!a.length || a.length !== b.length || !timingSafeEqual(a, b)) {
+        json(res, 401, { erro: "Token operacional inválido.", codigo: "OPERATOR_AUTH_INVALID" });
+        return;
+      }
+      const { cookie, expiraEm } = criarSessaoOperador();
+      json(
+        res,
+        200,
+        { status: "OPERATOR_SESSION_ACTIVE", expiraEm: new Date(expiraEm).toISOString() },
+        { "set-cookie": cookie },
+      );
+    },
+  },
+  {
+    metodo: "DELETE",
+    caminhoExato: "/api/operator/session",
+    handler: async (req, res) => {
+      const cookie = cookiesDo(req)[OPERATOR_SESSION_COOKIE];
+      if (cookie) sessoesOperador.delete(cookie);
+      json(res, 200, { status: "OPERATOR_SESSION_CLOSED" }, { "set-cookie": sessaoCookieRemovido() });
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // F2/F12/F13 — OAuth Gmail. start e status são OPERATOR_ROUTE; o callback
+  // é público porém protegido pelo binding one-time start↔callback (state
+  // assinado + nonce + cookie HttpOnly). Nenhum secret devolvido ao browser.
   // ------------------------------------------------------------------
   {
     metodo: "GET",
-    prefixo: "/api/oauth/gmail/status",
-    handler: async (_req, res) => {
+    caminhoExato: "/api/oauth/gmail/status",
+    handler: async (req, res) => {
+      if (!exigirOperador(req, res)) return;
       const config = loadGmailOauthConfig(process.env);
       let connected = false;
       if (config && process.env.DATABASE_URL?.trim() && process.env.DATA_ENCRYPTION_KEY_BASE64?.trim()) {
@@ -481,12 +747,20 @@ const ROTAS: readonly Rota[] = [
   },
   {
     metodo: "GET",
-    prefixo: "/api/oauth/gmail/start",
-    handler: async (_req, res, url) => {
+    caminhoExato: "/api/oauth/gmail/start",
+    handler: async (req, res, url) => {
+      if (!exigirOperador(req, res)) return;
       try {
         const origin = process.env.CONFIRMATION_BASE_URL?.trim() || `${url.protocol}//${url.host}`;
-        const { url: consentUrl, expiresAt } = iniciarFluxoOauth(origin);
-        json(res, 200, { authorizationUrl: consentUrl, expiresAt });
+        const { url: consentUrl, expiresAt, bindingNonce } = iniciarFluxoOauth(origin);
+        // F13: nonce de binding no cookie HttpOnly do fluxo — consumido
+        // one-time pelo callback; nenhum secret na URL além do state OAuth.
+        json(
+          res,
+          200,
+          { authorizationUrl: consentUrl, expiresAt },
+          { "set-cookie": bindingCookie(bindingNonce) },
+        );
       } catch (error) {
         if (error instanceof OauthFlowError) {
           json(res, 409, { erro: error.message, codigo: error.codigo });
@@ -498,8 +772,8 @@ const ROTAS: readonly Rota[] = [
   },
   {
     metodo: "GET",
-    prefixo: "/api/oauth/gmail/callback",
-    handler: async (_req, res, url) => {
+    caminhoExato: "/api/oauth/gmail/callback",
+    handler: async (req, res, url) => {
       const code = url.searchParams.get("code") ?? "";
       const state = url.searchParams.get("state") ?? "";
       if (!code || !state) {
@@ -508,9 +782,15 @@ const ROTAS: readonly Rota[] = [
       }
       try {
         const { pool, repository } = requireDb();
-        const resultado = await concluirFluxoOauth(code, state, repository, caixa(), fingerprinter());
+        const binding = cookiesDo(req)[OAUTH_BINDING_COOKIE];
+        const resultado = await concluirFluxoOauth(code, state, binding, repository, caixa(), fingerprinter());
         // Auditoria já registrada no repositório. NUNCA devolvemos tokens.
-        json(res, 200, { status: resultado.status, escopo: resultado.scopes[0] });
+        json(
+          res,
+          200,
+          { status: resultado.status, escopo: resultado.scopes[0] },
+          { "set-cookie": bindingCookieRemovido() },
+        );
       } catch (error) {
         if (error instanceof OauthFlowError) {
           json(res, 401, { erro: error.message, codigo: error.codigo });
@@ -526,7 +806,7 @@ const ROTAS: readonly Rota[] = [
   // ------------------------------------------------------------------
   {
     metodo: "GET",
-    prefixo: "/api/confirmation",
+    caminhoExato: "/api/confirmation",
     handler: async (_req, res, url) => {
       const token = url.searchParams.get("token") ?? "";
       if (!token) {
@@ -554,7 +834,7 @@ const ROTAS: readonly Rota[] = [
   },
   {
     metodo: "POST",
-    prefixo: "/api/confirmation",
+    caminhoExato: "/api/confirmation",
     handler: async (_req, res, url, corpo) => {
       const token = url.searchParams.get("token") ?? "";
       if (!token) {
@@ -593,19 +873,29 @@ const ROTAS: readonly Rota[] = [
   },
 ];
 
+/**
+ * F15 — Matching EXATO de caminhos: estáticas por igualdade completa;
+ * dinâmicas (ex.: /confirma/:token) apenas por matcher explícito e restrito.
+ * Nenhum match por prefixo — /api/health-foo NUNCA resolve para /api/health.
+ */
+function correspondeCaminho(rota: Rota, pathname: string): boolean {
+  if (rota.caminhoExato !== undefined) return pathname === rota.caminhoExato;
+  return rota.matcher ? rota.matcher(pathname) : false;
+}
+
 export function criarServidor() {
   return createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
     try {
       const rota = ROTAS.find(
-        (r) => r.metodo === req.method && url.pathname.startsWith(r.prefixo),
+        (r) => r.metodo === req.method && correspondeCaminho(r, url.pathname),
       );
       if (!rota) {
         json(res, 404, { erro: "Rota não encontrada." });
         return;
       }
       // F10: público explícito; todo o resto exige operador autenticado.
-      const publica = ROTAS_PUBLICAS.has(`${req.method} ${rota.prefixo}`);
+      const publica = ROTAS_PUBLICAS.has(`${req.method} ${rota.caminhoExato ?? ""}`);
       if (!publica && !exigirOperador(req, res)) return;
       const corpo = req.method === "POST" ? await lerCorpo(req) : Buffer.alloc(0);
       await rota.handler(req, res, url, corpo);
@@ -636,7 +926,13 @@ function respostaColetada() {
   const res = {
     writeHead(codigo: number, cabecalhos: Record<string, string>) {
       status = codigo;
-      headers = { ...cabecalhos };
+      // set-cookie pode ocorrer múltiplas vezes (RFC 6265): acumula em lista
+      // separada por "\n" para não perder cookies (ex.: binding + sessão).
+      for (const [nome, valor] of Object.entries(cabecalhos)) {
+        headers[nome] = nome === "set-cookie" && headers[nome]
+          ? `${headers[nome]}\n${valor}`
+          : valor;
+      }
     },
     end(payload?: string) {
       corpo = payload ?? "";
@@ -667,13 +963,13 @@ export async function despachar(
   } as unknown as IncomingMessage;
   try {
     const rota = ROTAS.find(
-      (r) => r.metodo === metodo && url.pathname.startsWith(r.prefixo),
+      (r) => r.metodo === metodo && correspondeCaminho(r, url.pathname),
     );
     if (!rota) {
       json(coletor.res as unknown as ServerResponse, 404, { erro: "Rota não encontrada." });
       return coletor.obter();
     }
-    const publica = ROTAS_PUBLICAS.has(`${metodo} ${rota.prefixo}`);
+    const publica = ROTAS_PUBLICAS.has(`${metodo} ${rota.caminhoExato ?? ""}`);
     if (!publica && !exigirOperador(req, coletor.res as unknown as ServerResponse)) {
       return coletor.obter();
     }

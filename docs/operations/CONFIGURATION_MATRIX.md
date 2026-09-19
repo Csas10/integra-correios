@@ -20,8 +20,11 @@ código (nomes reais, nada hipotético). Nenhum valor real no Git.
 | `GMAIL_OAUTH_CLIENT_ID` | Titular (Google Cloud) | OAuth client do envio institucional | LIVE_PILOT | EXTERNAL_SECRET | SIM | NÃO | CONFIGURATION_REQUIRED |
 | `GMAIL_OAUTH_CLIENT_SECRET` | Titular (Google Cloud) | OAuth client secret (somente server-side) | LIVE_PILOT | EXTERNAL_SECRET | SIM | NÃO | CONFIGURATION_REQUIRED |
 | `GMAIL_OAUTH_REDIRECT_URI` | Titular (Google Cloud) | Redirect URI do OAuth (gmail.send) | LIVE_PILOT | EXTERNAL_SECRET | NÃO (URL) | NÃO | CONFIGURATION_REQUIRED |
-| `GMAIL_OAUTH_STATE_KEY` | Titular/ambiente | Chave HMAC do state OAuth (CSRF assinado) | OAuth start/callback | ENVIRONMENT | SIM | NÃO | CONFIGURATION_REQUIRED |
-| `GMAIL_ACCOUNT_FINGERPRINT` | Derivado | HMAC da conta institucional para `oauth_connection` | Conexão OAuth | DERIVED (da chave HMAC) | NÃO (fingerprint) | NÃO | DERIVED |
+| `GMAIL_OAUTH_STATE_KEY` | Titular/ambiente | Chave HMAC do state OAuth (CSRF assinado, ≥32 bytes) | OAuth start/callback | ENVIRONMENT | SIM | NÃO | CONFIGURATION_REQUIRED |
+| `GMAIL_EXPECTED_ACCOUNT` | Operação (env do processo) | Conta Google institucional autorizada (F14; comparada exatamente à identidade OIDC com `email_verified`) | OAuth start e callback (fail-closed sem ela) | ENVIRONMENT | NÃO | NÃO | CONFIGURATION_REQUIRED — sem ela NENHUMA conexão é aceita |
+| `GMAIL_ACCOUNT_FINGERPRINT` | Derivado | HMAC da CONTA Google VERIFICADA para `oauth_connection` (não do clientId) | Conexão OAuth, worker, refresh | DERIVED (identidade OIDC + chave HMAC) | NÃO (fingerprint) | NÃO | DERIVED |
+| Binding OAuth (cookie `ic_oauth_binding`) | Aplicação | Binding one-time start↔callback (nonce HttpOnly; F13) | Sempre (emitido pelo START autenticado) | APPLICATION | NÃO (nonce opaco) | NÃO | IMPLEMENTADO (consumo one-time; replay/expiração FAIL) |
+| Sessão operacional (cookie `ic_operator_session`) | Aplicação | Sessão de curta duração troca pelo `OPERATOR_TOKEN` UMA vez (F12; HttpOnly, SameSite=Strict, Secure em produção) | Rotas operacionais no Preview | APPLICATION | NÃO (id opaco; token NUNCA vai ao browser) | NÃO | IMPLEMENTADO (8h; invalidação via DELETE) |
 | Mapping (colunas → campos) | Operador (UI) | Confirmar mapping assistido do XLSX | Importação | APPLICATION (contrato versionado) | NÃO | NÃO | IMPLEMENTADO |
 | `PPN_ENABLED` | — | Motor PPN/Correios | (fora do escopo desta fase) | HUMAN_DECISION | NÃO | SIM (`false`) | DISABLED deliberadamente |
 | Liberação do lote (PREPARACAO → ATIVO) | Operador humano | GATE 2: elegibilidade da outbox | Envio (DRY_RUN também exige ATIVO) | HUMAN_DECISION + auditoria | NÃO | NÃO | IMPLEMENTADO (`/api/pilot/activate`) |
@@ -46,7 +49,15 @@ Para executar o DRY_RUN no Preview, o titular deve configurar **exatamente**:
 4. `DATA_ENCRYPTION_KEY_VERSION` — rótulo da versão (ex.: `v1`);
 5. `PILOT_MODE=true` — habilita o worker run-once no ambiente;
 6. `OPERATOR_TOKEN` — habilita as rotas operacionais (F10; a rota pública de
-   confirmação `/api/confirmation` não depende dele).
+   confirmação `/api/confirmation` não depende dele). A UI autentica via
+   `POST /api/operator/session` e passa a usar o cookie de sessão (o token
+   bruto nunca fica no navegador); Bearer direto permanece para CLI/admin.
+
+Para o LIVE_PILOT acrescentam-se: `GMAIL_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI`,
+`GMAIL_OAUTH_STATE_KEY` (≥32 bytes) e `GMAIL_EXPECTED_ACCOUNT`
+(= carteiras@crtba.org.br) — sem a conta esperada, nenhuma conexão OAuth é
+aceita (F14, fail-closed). `.env.example` com placeholders vazios deve ser
+atualizado pelo titular (edição bloqueada por política no ambiente atual).
 
 Não é necessário nenhum segredo do Google para o DRY_RUN (o gateway é
 sintético). Para o LIVE_PILOT, adicionam-se as credenciais OAuth do titular

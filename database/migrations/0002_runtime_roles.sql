@@ -83,6 +83,21 @@ TO integra_runtime;
 GRANT SELECT, INSERT ON evento_auditoria TO integra_runtime;
 GRANT USAGE, SELECT ON SEQUENCE evento_auditoria_sequencia_seq TO integra_runtime;
 
+-- F18 — Binding one-time do fluxo OAuth. A tabela nasce na migration 0004,
+-- que pode ser aplicada antes OU depois desta re-execução (o REVOKE ALL
+-- acima zera TODAS as tabelas): o grant é condicional à existência para que
+-- qualquer ordem de aplicação/restauração reconverja para o estado válido.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'oauth_flow'
+  ) THEN
+    GRANT SELECT, INSERT, UPDATE ON oauth_flow TO integra_runtime;
+  END IF;
+END
+$$;
+
 -- Provisionamento fora do Git (exemplo sem credencial):
 --   CREATE ROLE integra_app_login LOGIN ...;
 --   GRANT integra_runtime TO integra_app_login;

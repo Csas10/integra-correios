@@ -1,5 +1,12 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import {
+  createHmac,
+  createHash,
+  hkdfSync,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
 import {
   NodePostgresPool,
   PostgresOperationalRepository,
@@ -72,6 +79,7 @@ const ROTAS_PUBLICAS = new Set([
   "POST /api/confirmation", // submissão por token (capability)
   "GET /api/oauth/gmail/callback", // retorno do Google (binding one-time)
   "POST /api/operator/session", // F12: valida token UMA vez e emite sessão (fail-closed sem env)
+  "GET /api/operator/session", // F17: restore da sessão pela UI (200/401 sanitizado)
   "DELETE /api/operator/session", // logout operacional
 ]);
 
@@ -79,22 +87,93 @@ const OPERATOR_SESSION_COOKIE = "ic_operator_session";
 
 /** F12 — TTL da sessão operacional (cookie HttpOnly; token NUNCA vai ao browser). */
 const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
-/** F13 — TTL curto do binding one-time do fluxo OAuth. */
+/** F13/F18 — TTL curto do binding one-time do fluxo OAuth. */
 const OAUTH_BINDING_TTL_SECONDS = 600;
+/** F16 — versão do formato do cookie de sessão stateless (rotação de formato). */
+const OPERATOR_SESSION_VERSION = "v1";
 
 /**
- * Sessões operacionais em memória do processo (F12): o cookie carrega um
- * identificador opaco aleatório — NUNCA o OPERATOR_TOKEN. Instância por
- * processo; em serverless multi-instância a sessão deve migrar a um store
- * compartilhado (limitação documentada na PR).
+ * F16 — Sessão operacional STATELESS assinada (serverless-safe).
+ *
+ * O cookie carrega `version.issuedAt.expiresAt.nonce.signature` (HMAC-SHA256);
+ * a chave de assinatura é DERIVADA do OPERATOR_TOKEN via HKDF com domain
+ * separation — nenhum secret externo novo, e o OPERATOR_TOKEN JAMAIS vai ao
+ * cookie. Rotação do token invalida todas as sessões anteriores (a chave
+ * derivada muda). Validação server-side: formato, assinatura (timing-safe),
+ * expiração. Nenhuma memória de processo, nenhuma afinidade de instância.
  */
-const sessoesOperador = new Map<string, { expiraEm: number }>();
-
-function limparSessoesExpiradas(): void {
-  const agora = Date.now();
-  for (const [id, sessao] of sessoesOperador) {
-    if (sessao.expiraEm <= agora) sessoesOperador.delete(id);
+function chaveSessaoOperador(): Buffer {
+  const token = process.env.OPERATOR_TOKEN?.trim();
+  if (!token) {
+    throw new Error("OPERATOR_TOKEN ausente — chave de sessão não derivável.");
   }
+  // HKDF-SHA256, domain separation explícita (info), salt fixo da aplicação.
+  return Buffer.from(
+    hkdfSync(
+      "sha256",
+      Buffer.from(token, "utf8"),
+      Buffer.from("integra-correios:operator-session:v1", "utf8"),
+      Buffer.from("ic_operator_session_cookie_signature", "utf8"),
+      32,
+    ),
+  );
+}
+
+function assinarSessao(payload: string): string {
+  return createHmac("sha256", chaveSessaoOperador()).update(payload).digest("base64url");
+}
+
+function comparacaoTimingSafeString(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+}
+
+/** Emite o cookie de sessão stateless assinado (apenas POST bem-sucedido). */
+function criarSessaoOperador(): { cookie: string; expiraEm: number } {
+  const agora = Date.now();
+  const expiraEm = agora + OPERATOR_SESSION_TTL_MS;
+  const nonce = randomBytes(16).toString("base64url");
+  const payload = `${OPERATOR_SESSION_VERSION}.${agora}.${expiraEm}.${nonce}`;
+  const assinatura = assinarSessao(payload);
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  return {
+    cookie: `${OPERATOR_SESSION_COOKIE}=${payload}.${assinatura}; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=${Math.floor(OPERATOR_SESSION_TTL_MS / 1000)}`,
+    expiraEm,
+  };
+}
+
+/**
+ * F16 — Valida o cookie de sessão stateless: formato versionado, assinatura
+ * HMAC (timing-safe) e expiração server-side. Qualquer divergência → inválida.
+ */
+function sessaoOperadorValida(valorCookie: string | undefined, agora: number = Date.now()): boolean {
+  if (!valorCookie?.trim()) return false;
+  const partes = valorCookie.trim().split(".");
+  if (partes.length !== 5) return false;
+  const [versao, issuedAt, expiresAt, nonce, assinatura] = partes as [
+    string,
+    string,
+    string,
+    string,
+    string,
+  ];
+  if (versao !== OPERATOR_SESSION_VERSION) return false;
+  const payload = `${versao}.${issuedAt}.${expiresAt}.${nonce}`;
+  // Assinatura verificada ANTES de qualquer parse numérico (timing-safe).
+  if (!comparacaoTimingSafeString(assinatura, assinarSessao(payload))) return false;
+  const expira = Number(expiresAt);
+  if (!Number.isSafeInteger(expira) || expira <= agora) return false;
+  return true;
+}
+
+/** Expiração (ISO) embutida no cookie de sessão válido — nunca o token. */
+function expiracaoDaSessao(valorCookie: string | undefined): string | undefined {
+  if (!valorCookie?.trim()) return undefined;
+  const partes = valorCookie.trim().split(".");
+  if (partes.length !== 5) return undefined;
+  const expira = Number(partes[2]);
+  return Number.isSafeInteger(expira) ? new Date(expira).toISOString() : undefined;
 }
 
 /** Comparação em tempo constante (buffers de igual comprimento). */
@@ -250,22 +329,6 @@ interface Rota {
   handler: RotaHandler;
 }
 
-/**
- * F12 — Cria sessão operacional de curta duração: id opaco aleatório gravado
- * no cookie HttpOnly; o mapeamento id→expiração vive apenas na memória do
- * processo. O token bruto NUNCA vai ao browser/storage/URL/log.
- */
-function criarSessaoOperador(): { cookie: string; expiraEm: number } {
-  const id = randomBytes(32).toString("base64url");
-  const expiraEm = Date.now() + OPERATOR_SESSION_TTL_MS;
-  sessoesOperador.set(id, { expiraEm });
-  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
-  return {
-    cookie: `${OPERATOR_SESSION_COOKIE}=${id}; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=${Math.floor(OPERATOR_SESSION_TTL_MS / 1000)}`,
-    expiraEm,
-  };
-}
-
 function sessaoCookieRemovido(): string {
   const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
   return `${OPERATOR_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=0`;
@@ -294,15 +357,9 @@ function cookiesDo(req: IncomingMessage): Record<string, string> {
 }
 
 function autenticacaoDeSessao(req: IncomingMessage): boolean {
-  const cookie = cookiesDo(req)[OPERATOR_SESSION_COOKIE];
-  if (!cookie) return false;
-  limparSessoesExpiradas();
-  const sessao = sessoesOperador.get(cookie);
-  if (!sessao || sessao.expiraEm <= Date.now()) {
-    sessoesOperador.delete(cookie);
-    return false;
-  }
-  return true;
+  // F16: sessão stateless — nenhuma memória de processo; qualquer instância
+  // valida o mesmo cookie assinado.
+  return sessaoOperadorValida(cookiesDo(req)[OPERATOR_SESSION_COOKIE]);
 }
 
 /** Comparação em tempo constante do token do operador (F10/F12). */
@@ -708,9 +765,32 @@ const ROTAS: readonly Rota[] = [
     metodo: "DELETE",
     caminhoExato: "/api/operator/session",
     handler: async (req, res) => {
-      const cookie = cookiesDo(req)[OPERATOR_SESSION_COOKIE];
-      if (cookie) sessoesOperador.delete(cookie);
+      // F16: sessão stateless — logout apenas limpa o cookie no browser
+      // (a validação continua fail-closed server-side em qualquer instância).
       json(res, 200, { status: "OPERATOR_SESSION_CLOSED" }, { "set-cookie": sessaoCookieRemovido() });
+    },
+  },
+  // ------------------------------------------------------------------
+  // F17 — Restore da sessão operacional pela UI (consultaSessao na
+  // inicialização). Resposta sanitizada: NUNCA token, assinatura, nonce ou
+  // valor do cookie — apenas status + expiração.
+  // ------------------------------------------------------------------
+  {
+    metodo: "GET",
+    caminhoExato: "/api/operator/session",
+    handler: async (req, res) => {
+      const cookie = cookiesDo(req)[OPERATOR_SESSION_COOKIE];
+      if (!sessaoOperadorValida(cookie)) {
+        json(res, 401, {
+          erro: "Sessão operacional ausente, inválida ou expirada.",
+          codigo: "OPERATOR_AUTH_REQUIRED",
+        });
+        return;
+      }
+      json(res, 200, {
+        status: "OPERATOR_SESSION_ACTIVE",
+        expiraEm: expiracaoDaSessao(cookie),
+      });
     },
   },
 
@@ -752,7 +832,13 @@ const ROTAS: readonly Rota[] = [
       if (!exigirOperador(req, res)) return;
       try {
         const origin = process.env.CONFIRMATION_BASE_URL?.trim() || `${url.protocol}//${url.host}`;
-        const { url: consentUrl, expiresAt, bindingNonce } = iniciarFluxoOauth(origin);
+        // F18: binding one-time registrado em PostgreSQL — START em qualquer
+        // instância é consumível pelo CALLBACK em qualquer outra.
+        const { repository } = requireDb();
+        const { url: consentUrl, expiresAt, bindingNonce } = await iniciarFluxoOauth(
+          origin,
+          repository,
+        );
         // F13: nonce de binding no cookie HttpOnly do fluxo — consumido
         // one-time pelo callback; nenhum secret na URL além do state OAuth.
         json(
@@ -781,9 +867,18 @@ const ROTAS: readonly Rota[] = [
         return;
       }
       try {
-        const { pool, repository } = requireDb();
+        const { repository } = requireDb();
         const binding = cookiesDo(req)[OAUTH_BINDING_COOKIE];
-        const resultado = await concluirFluxoOauth(code, state, binding, repository, caixa(), fingerprinter());
+        // F18: o binding vive em PostgreSQL (serverless-safe); hash do nonce
+        // é calculado server-side — o valor bruto nunca é persistido.
+        const resultado = await concluirFluxoOauth(
+          code,
+          state,
+          binding,
+          repository,
+          caixa(),
+          fingerprinter(),
+        );
         // Auditoria já registrada no repositório. NUNCA devolvemos tokens.
         json(
           res,

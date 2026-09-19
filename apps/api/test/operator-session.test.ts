@@ -91,7 +91,7 @@ describe("F12 — sessão operacional (token trocado UMA vez por cookie HttpOnly
     expect(falsificado.status).toBe(401);
   });
 
-  it("logout (DELETE) invalida a sessão", async () => {
+  it("logout (DELETE) emite Max-Age=0; browser sem o cookie → 401", async () => {
     process.env.OPERATOR_TOKEN = "token-operacional-sintetico-f12";
     const login = await despachar("POST", "/api/operator/session", {
       headers: { "content-type": "application/json" },
@@ -101,7 +101,12 @@ describe("F12 — sessão operacional (token trocado UMA vez por cookie HttpOnly
     expect((await despachar("GET", "/api/readiness", { headers: { cookie } })).status).toBe(200);
     const saida = await despachar("DELETE", "/api/operator/session", { headers: { cookie } });
     expect(saida.status).toBe(200);
-    const aposSaida = await despachar("GET", "/api/readiness", { headers: { cookie } });
+    const cookieRemovido = parseSetCookie(saida.headers["set-cookie"]);
+    expect(cookieRemovido).toContain("Max-Age=0");
+    // Sessão stateless (F16): o logout limpa o cookie no browser — a
+    // requisição seguinte sem ele falha fechada. Revogação server-side do
+    // valor capturado exigiria estado (Map/banco), vetado pelo F16.
+    const aposSaida = await despachar("GET", "/api/readiness");
     expect(aposSaida.status).toBe(401);
   });
 });
@@ -159,5 +164,100 @@ describe("F13-contrato — headers x-mapping / x-file-name simétricos browser�
     // XLSX inválido por construção → 422 sanitizado; NUNCA 500 (contrato
     // parsing correto até o executor, autenticado pela sessão).
     expect(resposta.status).toBe(422);
+  });
+});
+
+describe("F16/F17 — sessão STATELESS assinada (serverless-safe) + restore via GET", () => {
+  const TOKEN = "token-operacional-sintetico-f16";
+
+  function valorCookie(header: string | undefined): string {
+    const cookie = parseSetCookie(header);
+    const idx = cookie.indexOf("=");
+    return idx > 0 ? cookie.slice(idx + 1, cookie.indexOf(";") > 0 ? cookie.indexOf(";") : undefined) : "";
+  }
+
+  async function login(token = TOKEN): Promise<string> {
+    const resposta = await despachar("POST", "/api/operator/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token })),
+    });
+    expect(resposta.status).toBe(200);
+    return valorCookie(resposta.headers["set-cookie"]);
+  }
+
+  it("sessão emitida é válida em uma 'nova instância' (mesma chave derivada, sem memória de processo)", async () => {
+    process.env.OPERATOR_TOKEN = TOKEN;
+    const valor = await login();
+    // O cookie carrega payload.versionado.assinatura — NENHUM estado server-side.
+    expect(valor.split(".")).toHaveLength(5);
+    // Qualquer requisição posterior valida apenas o cookie assinado:
+    // funciona em qualquer instância do processo/pod serverless.
+    const readiness = await despachar("GET", "/api/readiness", {
+      headers: { cookie: `ic_operator_session=${valor}` },
+    });
+    expect(readiness.status).toBe(200);
+  });
+
+  it("cookie adulterado (assinatura inválida) → 401", async () => {
+    process.env.OPERATOR_TOKEN = TOKEN;
+    const valor = await login();
+    const partes = valor.split(".");
+    const adulterado = `${partes[0]}.${partes[1]}.${partes[2]}.${partes[3]}.assinatura-falsa`;
+    const resposta = await despachar("GET", "/api/readiness", {
+      headers: { cookie: `ic_operator_session=${adulterado}` },
+    });
+    expect(resposta.status).toBe(401);
+  });
+
+  it("cookie com expiração no passado → 401 (validação server-side)", async () => {
+    process.env.OPERATOR_TOKEN = TOKEN;
+    const valor = await login();
+    const partes = valor.split(".");
+    const expirado = `${partes[0]}.${Number(partes[1]) - 10_000}.${Number(partes[2]) - 5_000}.${partes[3]}.${partes[4]}`;
+    const resposta = await despachar("GET", "/api/readiness", {
+      headers: { cookie: `ic_operator_session=${expirado}` },
+    });
+    expect(resposta.status).toBe(401);
+  });
+
+  it("rotação de OPERATOR_TOKEN invalida sessões emitidas pelo token anterior", async () => {
+    process.env.OPERATOR_TOKEN = TOKEN;
+    const valor = await login();
+    process.env.OPERATOR_TOKEN = "token-rotacionado-f16";
+    const resposta = await despachar("GET", "/api/readiness", {
+      headers: { cookie: `ic_operator_session=${valor}` },
+    });
+    expect(resposta.status).toBe(401);
+    process.env.OPERATOR_TOKEN = TOKEN;
+  });
+
+  it("GET /api/operator/session sem sessão → 401; com sessão → 200 sanitizado", async () => {
+    process.env.OPERATOR_TOKEN = TOKEN;
+    const semSessao = await despachar("GET", "/api/operator/session");
+    expect(semSessao.status).toBe(401);
+
+    const valor = await login();
+    const comSessao = await despachar("GET", "/api/operator/session", {
+      headers: { cookie: `ic_operator_session=${valor}` },
+    });
+    expect(comSessao.status).toBe(200);
+    const corpo = JSON.parse(comSessao.corpo) as { status?: string; expiraEm?: string };
+    expect(corpo.status).toBe("OPERATOR_SESSION_ACTIVE");
+    expect(typeof corpo.expiraEm).toBe("string");
+    // Sanitizado: NENHUM token, assinatura, nonce ou valor do cookie na resposta.
+    expect(comSessao.corpo).not.toContain(TOKEN);
+    expect(comSessao.corpo).not.toContain(valor);
+  });
+
+  it("refresh lógico da UI: login → GET session 200 → rota operacional 200 → logout limpa cookie → GET session 401", async () => {
+    process.env.OPERATOR_TOKEN = TOKEN;
+    const valor = await login();
+    const headers = { cookie: `ic_operator_session=${valor}` };
+    expect((await despachar("GET", "/api/operator/session", { headers })).status).toBe(200);
+    expect((await despachar("GET", "/api/readiness", { headers })).status).toBe(200);
+    await despachar("DELETE", "/api/operator/session", { headers });
+    // Após o logout o browser não envia mais o cookie (Max-Age=0):
+    const semCookie = await despachar("GET", "/api/operator/session");
+    expect(semCookie.status).toBe(401);
   });
 });

@@ -23,8 +23,8 @@ código (nomes reais, nada hipotético). Nenhum valor real no Git.
 | `GMAIL_OAUTH_STATE_KEY` | Titular/ambiente | Chave HMAC do state OAuth (CSRF assinado, ≥32 bytes) | OAuth start/callback | ENVIRONMENT | SIM | NÃO | CONFIGURATION_REQUIRED |
 | `GMAIL_EXPECTED_ACCOUNT` | Operação (env do processo) | Conta Google institucional autorizada (F14; comparada exatamente à identidade OIDC com `email_verified`) | OAuth start e callback (fail-closed sem ela) | ENVIRONMENT | NÃO | NÃO | CONFIGURATION_REQUIRED — sem ela NENHUMA conexão é aceita |
 | `GMAIL_ACCOUNT_FINGERPRINT` | Derivado | HMAC da CONTA Google VERIFICADA para `oauth_connection` (não do clientId) | Conexão OAuth, worker, refresh | DERIVED (identidade OIDC + chave HMAC) | NÃO (fingerprint) | NÃO | DERIVED |
-| Binding OAuth (cookie `ic_oauth_binding`) | Aplicação | Binding one-time start↔callback (nonce HttpOnly; F13) | Sempre (emitido pelo START autenticado) | APPLICATION | NÃO (nonce opaco) | NÃO | IMPLEMENTADO (consumo one-time; replay/expiração FAIL) |
-| Sessão operacional (cookie `ic_operator_session`) | Aplicação | Sessão de curta duração troca pelo `OPERATOR_TOKEN` UMA vez (F12; HttpOnly, SameSite=Strict, Secure em produção) | Rotas operacionais no Preview | APPLICATION | NÃO (id opaco; token NUNCA vai ao browser) | NÃO | IMPLEMENTADO (8h; invalidação via DELETE) |
+| Binding OAuth (cookie `ic_oauth_binding` + tabela `oauth_flow`) | Aplicação | Binding one-time start↔callback (nonce HttpOnly; hash SHA-256 persistido em PostgreSQL; F13/F18) | Sempre (emitido pelo START autenticado) | APPLICATION | NÃO (nonce opaco; banco recebe só o hash) | NÃO | IMPLEMENTADO (consumo atômico one-time entre instâncias; replay/expiração FAIL) |
+| Sessão operacional (cookie `ic_operator_session` stateless) | Aplicação | Sessão STATELESS assinada (HMAC-SHA256 derivado do `OPERATOR_TOKEN` via HKDF; F16): payload `version.issuedAt.expiresAt.nonce.signature` | Rotas operacionais no Preview | APPLICATION (DERIVED do OPERATOR_TOKEN) | NÃO (assinatura; token NUNCA vai ao cookie/browser) | NÃO | IMPLEMENTADO (8h; rotação do token invalida sessões; sem memória de processo — serverless-safe) |
 | Mapping (colunas → campos) | Operador (UI) | Confirmar mapping assistido do XLSX | Importação | APPLICATION (contrato versionado) | NÃO | NÃO | IMPLEMENTADO |
 | `PPN_ENABLED` | — | Motor PPN/Correios | (fora do escopo desta fase) | HUMAN_DECISION | NÃO | SIM (`false`) | DISABLED deliberadamente |
 | Liberação do lote (PREPARACAO → ATIVO) | Operador humano | GATE 2: elegibilidade da outbox | Envio (DRY_RUN também exige ATIVO) | HUMAN_DECISION + auditoria | NÃO | NÃO | IMPLEMENTADO (`/api/pilot/activate`) |
@@ -50,14 +50,18 @@ Para executar o DRY_RUN no Preview, o titular deve configurar **exatamente**:
 5. `PILOT_MODE=true` — habilita o worker run-once no ambiente;
 6. `OPERATOR_TOKEN` — habilita as rotas operacionais (F10; a rota pública de
    confirmação `/api/confirmation` não depende dele). A UI autentica via
-   `POST /api/operator/session` e passa a usar o cookie de sessão (o token
-   bruto nunca fica no navegador); Bearer direto permanece para CLI/admin.
+   `POST /api/operator/session`, que emite sessão STATELESS assinada (F16:
+   HMAC derivado do próprio token; rotação do token invalida sessões
+   anteriores) e a restaura via `GET /api/operator/session` (F17); Bearer
+   direto permanece para CLI/admin.
 
 Para o LIVE_PILOT acrescentam-se: `GMAIL_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI`,
 `GMAIL_OAUTH_STATE_KEY` (≥32 bytes) e `GMAIL_EXPECTED_ACCOUNT`
 (= carteiras@crtba.org.br) — sem a conta esperada, nenhuma conexão OAuth é
-aceita (F14, fail-closed). `.env.example` com placeholders vazios deve ser
-atualizado pelo titular (edição bloqueada por política no ambiente atual).
+aceita (F14, fail-closed). O binding one-time do fluxo OAuth é persistido em
+PostgreSQL (tabela `oauth_flow`, migration 0004; F18) — serverless-safe.
+`.env.example` com placeholders vazios deve ser atualizado pelo titular
+(edição bloqueada por política no ambiente atual).
 
 Não é necessário nenhum segredo do Google para o DRY_RUN (o gateway é
 sintético). Para o LIVE_PILOT, adicionam-se as credenciais OAuth do titular

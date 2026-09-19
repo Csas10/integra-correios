@@ -11,15 +11,18 @@ import type {
   BatchActivationState,
   BatchMode,
   ClaimedOutboxItem,
+  ConsumeOauthFlowBindingCommand,
   ConfirmationContext,
   ConfirmationOutcomeResult,
   CreateProfessionalCommand,
   EnqueueCommunicationBatchCommand,
   FailOutboxCommand,
   GmailOauthCredentialSource,
+  OauthFlowBindingConsumeResult,
   QueryResult,
   RefreshedOauthTokenCommand,
   RegisterConfirmationOutcomeCommand,
+  RegisterOauthFlowBindingCommand,
   SaveOauthConnectionCommand,
   SqlExecutor,
   SqlPool,
@@ -939,6 +942,54 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
     return row.expira_em
       ? { ...withRefresh, expiresAt: row.expira_em.toISOString() }
       : withRefresh;
+  }
+
+  // -------------------------------------------------------------------------
+  // F18 — Binding one-time do fluxo OAuth em PostgreSQL. START (instância A)
+  // registra o hash do nonce; CALLBACK (qualquer instância) consome
+  // atomicamente. O nonce em claro NUNCA é persistido.
+  // -------------------------------------------------------------------------
+
+  async registrarBindingOauthFlow(command: RegisterOauthFlowBindingCommand): Promise<void> {
+    if (!/^[0-9a-f]{64}$/.test(command.nonceHash)) {
+      throw new Error("nonceHash deve ser SHA-256 hex (64 caracteres)");
+    }
+    await this.pool.query(
+      `INSERT INTO oauth_flow (nonce_hash, expira_em) VALUES ($1, $2)`,
+      [command.nonceHash, command.expiresAt],
+    );
+  }
+
+  async consumirBindingOauthFlow(
+    command: ConsumeOauthFlowBindingCommand,
+  ): Promise<OauthFlowBindingConsumeResult> {
+    if (!/^[0-9a-f]{64}$/.test(command.nonceHash)) {
+      throw new Error("nonceHash deve ser SHA-256 hex (64 caracteres)");
+    }
+    // Consumo one-time ATÔMICO: o UPDATE com RETURNING vence exatamente uma
+    // vez mesmo com callbacks concorrentes (row lock do UPDATE). Replay,
+    // expiração e nonce desconhecido falham fechados.
+    const result = await this.pool.query<{ id: string }>(
+      `UPDATE oauth_flow
+      SET consumida_em = $2
+      WHERE nonce_hash = $1
+        AND consumida_em IS NULL
+        AND expira_em > $2
+      RETURNING id`,
+      [command.nonceHash, command.now],
+    );
+    if (result.rows.length > 0) return "CONSUMED";
+    // Não consumiu: distinguir MISSING de EXPIRED de REPLAY.
+    const estado = await this.pool.query<{
+      consumida_em: Date | null;
+      expira_em: Date;
+    }>(`SELECT consumida_em, expira_em FROM oauth_flow WHERE nonce_hash = $1`, [
+      command.nonceHash,
+    ]);
+    const row = estado.rows[0];
+    if (!row) return "MISSING";
+    if (row.consumida_em !== null) return "REPLAY";
+    return row.expira_em.getTime() <= new Date(command.now).getTime() ? "EXPIRED" : "MISSING";
   }
 }
 

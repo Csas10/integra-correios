@@ -14,7 +14,8 @@ DECLARE
   tabelas_operacionais text[] := ARRAY[
     'arquivo_importacao', 'perfil_mapeamento', 'importacao', 'linha_importada',
     'profissional', 'snapshot_cadastral', 'confirmacao', 'lote_comunicacao',
-    'comunicacao', 'oauth_connection', 'outbox_email', 'item_lote_comunicacao'
+    'comunicacao', 'oauth_connection', 'outbox_email', 'item_lote_comunicacao',
+    'oauth_flow'
   ];
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = runtime_role) THEN

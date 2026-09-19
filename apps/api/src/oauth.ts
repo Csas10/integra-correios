@@ -1,4 +1,4 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   buildAuthorizationUrl,
   derivarFingerprintContaGmail,
@@ -6,7 +6,6 @@ import {
   fetchGoogleAccountIdentity,
   loadGmailOauthConfig,
   OauthStateSigner,
-  OauthBindingStore,
   OauthIdentityError,
   GMAIL_SEND_SCOPE,
   type GmailTokenResponse,
@@ -14,7 +13,10 @@ import {
 import {
   Aes256GcmSecretBox,
   HmacSha256Fingerprinter,
+  type ConsumeOauthFlowBindingCommand,
+  type OauthFlowBindingConsumeResult,
   type PostgresOperationalRepository,
+  type RegisterOauthFlowBindingCommand,
 } from "@integra-correios/persistence";
 
 /**
@@ -49,15 +51,6 @@ function ambiente(): Environment {
   return process.env;
 }
 
-/**
- * F13 — Registro one-time compartilhado do processo (nonce de binding).
- * Instância por processo: em serverless multi-instância o registro deve
- * migrar a um store compartilhado antes do fluxo LIVE (limitação documentada).
- * Exportado para os testes de regressão exercitarem o MESMO registro usado
- * pelo fluxo (start/callback), sem duplicar estado.
- */
-export const fluxoOauthBinding = new OauthBindingStore();
-
 export function oauthConfigurado(): boolean {
   return loadGmailOauthConfig(ambiente()) !== undefined;
 }
@@ -91,16 +84,37 @@ function signer(): OauthStateSigner {
   return new OauthStateSigner(new Uint8Array(chave));
 }
 
+/** SHA-256 hex do nonce de binding — o valor bruto NUNCA é persistido/logado. */
+function hashDeNonce(nonce: string): string {
+  return createHash("sha256").update(nonce, "utf8").digest("hex");
+}
+
 /**
- * F13/F14 — URL de consentimento + state opaco + nonce de binding one-time.
- * O nonce é devolvido ao chamador (server.ts) para ser gravado no cookie
- * HttpOnly do fluxo OAuth e registrado como pendente: o callback só é aceito
- * quando state assinado E cookie carregam o MESMO nonce, emitido por um START
- * autenticado, dentro do TTL e não consumido.
+ * F18 — Porta de persistência do binding one-time (PostgreSQL).
+ * Mantida mínima e específica do fluxo OAuth para permitir injeção nos
+ * testes sem banco e sem duplicar a superfície do repositório operacional.
  */
-export function iniciarFluxoOauth(
+export interface OauthFlowBindingStore {
+  registrarBindingOauthFlow(command: RegisterOauthFlowBindingCommand): Promise<void>;
+  consumirBindingOauthFlow(command: ConsumeOauthFlowBindingCommand): Promise<OauthFlowBindingConsumeResult>;
+}
+
+/** TTL do binding one-time registrado no banco (espelha o cookie, 10 min). */
+export const OAUTH_FLOW_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * F13/F14/F18 — URL de consentimento + state opaco + binding one-time
+ * PERSISTIDO em PostgreSQL (serverless-safe: START na instância A, CALLBACK
+ * na instância B). O nonce é devolvido ao chamador (server.ts) para o cookie
+ * HttpOnly do fluxo; o banco recebe apenas o SHA-256 + expiração. O callback
+ * só é aceito quando state assinado E cookie carregam o MESMO nonce, emitido
+ * por um START autenticado, dentro do TTL e não consumido (atomicamente).
+ */
+export async function iniciarFluxoOauth(
   baseUrl: string,
-): { url: string; expiresAt: string; bindingNonce: string } {
+  bindingStore: OauthFlowBindingStore,
+  agora: Date = new Date(),
+): Promise<{ url: string; expiresAt: string; bindingNonce: string }> {
   const config = loadGmailOauthConfig(ambiente());
   if (!config) {
     throw new OauthFlowError(
@@ -114,56 +128,72 @@ export function iniciarFluxoOauth(
       "GMAIL_EXPECTED_ACCOUNT ausente — nenhuma conta pode ser autorizada sem alvo explícito.",
     );
   }
-  // O MESMO nonce é embutido no state assinado e registrado one-time: a
-  // verificação do callback compara assinatura + TTL + binding não consumido.
-  const bindingNonce = fluxoOauthBinding.issue();
-  const { state, expiresAt } = signer().issue(new Date(), bindingNonce);
+  // Nonce de alta entropia; o MESMO valor vai no state assinado e no cookie,
+  // e apenas seu HASH é registrado one-time no banco.
+  const bindingNonce = randomBytes(32).toString("base64url");
+  const expiraEm = new Date(agora.getTime() + OAUTH_FLOW_TTL_MS);
+  await bindingStore.registrarBindingOauthFlow({
+    nonceHash: hashDeNonce(bindingNonce),
+    expiresAt: expiraEm.toISOString(),
+  });
+  const { state, expiresAt } = signer().issue(agora, bindingNonce);
   const url = buildAuthorizationUrl(config, state);
   return { url, expiresAt, bindingNonce };
 }
 
 /**
- * F13 — Verificação do binding start↔callback:
- *  1. binding one-time registrado por um START autenticado (BOUND), com
- *     replay (REPLAY) e expiração (EXPIRED/ausente) falhando fechados;
- *  2. state assinado pela instalação e dentro do TTL;
- *  3. cookie do fluxo com o MESMO nonce do state (tempo constante).
- * Cookie ausente/divergente/replay → FAIL (callback sem START autenticado).
+ * F18 — Verificação do binding start↔callback, na ORDEM correta:
+ *  1. formato do state;
+ *  2. assinatura HMAC (timing-safe);
+ *  3. expiração server-side;
+ *  4. nonce extraído do state assinado;
+ *  5. igualdade timing-safe state↔cookie;
+ *  6. SOMENTE DEPOIS o consumo atômico no banco (one-time real entre
+ *     instâncias). Nada é consumido antes da validação completa.
+ * Cookie ausente/divergente/replay/expirado → FAIL (fail-closed).
  */
-export function validarBindingState(bindingCookie: string | undefined, state: string, agora: Date = new Date()): void {
+export async function validarBindingState(
+  bindingCookie: string | undefined,
+  state: string,
+  bindingStore: OauthFlowBindingStore,
+  agora: Date = new Date(),
+): Promise<void> {
   if (!bindingCookie?.trim()) {
     throw new OauthFlowError("STATE_BINDING_MISSING", "Binding do fluxo OAuth ausente — inicie o fluxo autenticado.");
   }
   const partes = state.split(".");
+  if (partes.length !== 3) {
+    throw new OauthFlowError("STATE_INVALID", "State OAuth inválido.");
+  }
   const nonce = partes[0] ?? "";
   if (!nonce) {
     throw new OauthFlowError("STATE_INVALID", "State OAuth inválido.");
   }
-  const bindingStatus = fluxoOauthBinding.consume(nonce, agora);
+  // Assinatura + expiração ANTES de qualquer acesso à persistência: um state
+  // inválido NUNCA consome o binding (evita DoS de consumo por forged states).
+  if (!signer().verify(state, agora)) {
+    throw new OauthFlowError("STATE_INVALID", "State OAuth inválido ou expirado.");
+  }
+  // Igualdade timing-safe entre o nonce do state e o cookie do fluxo.
+  const a = Buffer.from(nonce);
+  const b = Buffer.from(bindingCookie.trim());
+  if (a.length !== b.length || !timingSafeIgual(a, b)) {
+    throw new OauthFlowError("STATE_BINDING_MISMATCH", "State não corresponde ao fluxo iniciado.");
+  }
+  // Último passo: consumo ONE-TIME atômico no banco. Exatamente um callback
+  // vence; replay/expiração/nonce desconhecido falham fechados.
+  const bindingStatus = await bindingStore.consumirBindingOauthFlow({
+    nonceHash: hashDeNonce(nonce),
+    now: agora.toISOString(),
+  });
   if (bindingStatus === "REPLAY") {
     throw new OauthFlowError("STATE_REPLAY", "Binding do fluxo OAuth já utilizado.");
   }
   if (bindingStatus === "EXPIRED") {
     throw new OauthFlowError("STATE_EXPIRED", "Binding do fluxo OAuth expirado — inicie o fluxo novamente.");
   }
-  if (bindingStatus !== "BOUND") {
+  if (bindingStatus !== "CONSUMED") {
     throw new OauthFlowError("STATE_BINDING_MISSING", "Binding não originado por um START autorizado.");
-  }
-  // Consumido com sucesso: agora assinatura + TTL do state + igualdade com o
-  // cookie do fluxo (tempo constante). Qualquer falha descarta o nonce.
-  try {
-    if (!signer().verify(state, agora)) {
-      throw new OauthFlowError("STATE_INVALID", "State OAuth inválido ou expirado.");
-    }
-    const a = Buffer.from(nonce);
-    const b = Buffer.from(bindingCookie.trim());
-    if (a.length !== b.length || !timingSafeIgual(a, b)) {
-      throw new OauthFlowError("STATE_BINDING_MISMATCH", "State não corresponde ao fluxo iniciado.");
-    }
-  } catch (error) {
-    // Falha pós-consumo marca o nonce como replay — ninguém reaproveita.
-    fluxoOauthBinding.consume(nonce, agora);
-    throw error;
   }
 }
 
@@ -215,8 +245,9 @@ export async function concluirFluxoOauth(
   if (!config) {
     throw new OauthFlowError("OAUTH_NOT_CONFIGURED", "Credenciais OAuth ausentes.");
   }
-  // F13: binding one-time start↔callback (anti login-CSRF / account injection).
-  validarBindingState(bindingCookie, state, agora);
+  // F18: binding one-time start↔callback persistido em PostgreSQL
+  // (anti login-CSRF / account injection, serverless-safe).
+  await validarBindingState(bindingCookie, state, repository, agora);
   const tokens = await exchangeAuthorizationCode(config, code, transport);
   // F14: identidade verificada ANTES de persistir qualquer token.
   const identidade = await verificarContaAutorizada(tokens.accessToken, identityTransport);

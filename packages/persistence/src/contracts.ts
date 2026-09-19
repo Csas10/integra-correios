@@ -151,6 +151,27 @@ export interface GmailOauthCredentialSource {
   loadGmailConnection(accountFingerprint: string): Promise<StoredOauthConnection | undefined>;
 }
 
+// ===========================================================================
+// F18 — Binding one-time do fluxo OAuth persistido em PostgreSQL
+// (serverless-safe): START em uma instância, CALLBACK em outra. O nonce
+// BRUTO nunca é persistido — apenas seu SHA-256; o consumo é atômico
+// (UPDATE ... RETURNING vence exatamente uma vez sob corrida).
+// ===========================================================================
+
+export interface RegisterOauthFlowBindingCommand {
+  /** SHA-256 hex do nonce de binding (o nonce em claro NUNCA é persistido). */
+  readonly nonceHash: string;
+  readonly expiresAt: string;
+}
+
+export interface ConsumeOauthFlowBindingCommand {
+  readonly nonceHash: string;
+  readonly now: string;
+}
+
+/** Resultado do consumo atômico do binding one-time. */
+export type OauthFlowBindingConsumeResult = "CONSUMED" | "MISSING" | "EXPIRED" | "REPLAY";
+
 /**
  * Atualização segura do access token renovado (F3): persiste o novo envelope
  * cifrado preservando refresh token, scopes e identidade da conexão.

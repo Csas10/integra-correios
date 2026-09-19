@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Aes256GcmSecretBox } from "../src/crypto.js";
 import { NodePostgresPool } from "../src/driver.js";
 import { PostgresOperationalRepository } from "../src/postgres.js";
@@ -128,6 +128,63 @@ d("round-trip OAuth em PostgreSQL real (sintético)", () => {
         }),
       ).rejects.toThrow("Conflito entre identidade OAuth e fingerprint");
 
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("F18 — binding OAuth one-time: consumo atômico, replay, expiração e corrida", async () => {
+    const pool = new NodePostgresPool({
+      connectionString: process.env.DATABASE_URL!,
+    });
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      const agoraIso = new Date().toISOString();
+      const futuro = new Date(Date.now() + 60_000).toISOString();
+      const nonce = randomUUID();
+      const nonceHash = createHash("sha256").update(nonce).digest("hex");
+
+      await repository.registrarBindingOauthFlow({ nonceHash, expiresAt: futuro });
+
+      // Primeira tentativa vence; segunda é replay.
+      await expect(
+        repository.consumirBindingOauthFlow({ nonceHash, now: agoraIso }),
+      ).resolves.toBe("CONSUMED");
+      await expect(
+        repository.consumirBindingOauthFlow({ nonceHash, now: agoraIso }),
+      ).resolves.toBe("REPLAY");
+
+      // Binding expirado (registrado no passado) → EXPIRED.
+      const expiradoHash = createHash("sha256").update(`${nonce}-expirado`).digest("hex");
+      await repository.registrarBindingOauthFlow({
+        nonceHash: expiradoHash,
+        expiresAt: new Date(Date.now() - 1_000).toISOString(),
+      });
+      await expect(
+        repository.consumirBindingOauthFlow({ nonceHash: expiradoHash, now: agoraIso }),
+      ).resolves.toBe("EXPIRED");
+
+      // Nonce nunca registrado → MISSING.
+      await expect(
+        repository.consumirBindingOauthFlow({
+          nonceHash: createHash("sha256").update(`${nonce}-fantasma`).digest("hex"),
+          now: agoraIso,
+        }),
+      ).resolves.toBe("MISSING");
+
+      // Corrida: 8 consumos concorrentes do MESMO binding → exatamente 1 sucesso.
+      const corridaHash = createHash("sha256").update(`${nonce}-corrida`).digest("hex");
+      await repository.registrarBindingOauthFlow({
+        nonceHash: corridaHash,
+        expiresAt: futuro,
+      });
+      const resultados = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          repository.consumirBindingOauthFlow({ nonceHash: corridaHash, now: agoraIso }),
+        ),
+      );
+      expect(resultados.filter((r) => r === "CONSUMED")).toHaveLength(1);
+      expect(resultados.filter((r) => r === "REPLAY")).toHaveLength(7);
     } finally {
       await pool.close();
     }

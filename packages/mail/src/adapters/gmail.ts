@@ -145,58 +145,13 @@ export const OAUTH_BINDING_COOKIE = "ic_oauth_binding";
 export type OauthBindingStatus = "BOUND" | "MISSING" | "REPLAY" | "EXPIRED";
 
 /**
- * F13 — Registro one-time do binding start↔callback (anti login-CSRF e
- * account injection). O START autenticado emite um nonce criptograficamente
- * aleatório; o callback só é aceito quando o state assinado carrega um nonce
- * previamente emitido, dentro do TTL e NÃO consumido — e o cookie do fluxo
- * contém o MESMO nonce (comparação em tempo constante feita pelo chamador).
- * Instância por processo: em serverless multi-instância o registro deve
- * migrar a um store compartilhado (limitação documentada na PR).
+ * F18 — O registro one-time do binding start↔callback NÃO vive mais em
+ * memória de processo: foi migrado para PostgreSQL (`oauth_flow`), que garante
+ * consumo atômico one-time entre instâncias serverless (START na instância A,
+ * CALLBACK na instância B; corrida resolve exatamente um vencedor).
+ * O contrato de implementação vive em apps/api/src/oauth.ts
+ * (OauthFlowBindingStore) e a persistência em packages/persistence.
  */
-export class OauthBindingStore {
-  readonly #emitidos = new Map<string, number>();
-  readonly #consumidos = new Set<string>();
-
-  constructor(
-    private readonly ttlMs: number = 10 * 60 * 1000,
-    private readonly now: () => number = () => Date.now(),
-  ) {}
-
-  /** Emite e registra um nonce de binding (apenas pelo START autenticado). */
-  issue(): string {
-    this.varrer();
-    const nonce = randomBytes(32).toString("base64url");
-    this.#emitidos.set(nonce, this.now() + this.ttlMs);
-    return nonce;
-  }
-
-  /**
-   * Consome o binding UMA única vez. BOUND → prossiga comparando o cookie;
-   * MISSING → nonce nunca emitido; REPLAY → já consumido; EXPIRADO → fora do
-   * TTL. Qualquer estado ≠ BOUND rejeita o callback (fail-closed).
-   */
-  consume(nonce: string, agora: Date = new Date()): OauthBindingStatus {
-    this.varrer();
-    if (!this.#emitidos.has(nonce)) {
-      return this.#consumidos.has(nonce) ? "REPLAY" : "MISSING";
-    }
-    if ((this.#emitidos.get(nonce) ?? 0) <= agora.getTime()) {
-      this.#emitidos.delete(nonce);
-      return "EXPIRED";
-    }
-    this.#emitidos.delete(nonce);
-    this.#consumidos.add(nonce);
-    return "BOUND";
-  }
-
-  private varrer(): void {
-    const agora = this.now();
-    for (const [nonce, expira] of this.#emitidos) {
-      if (expira <= agora) this.#emitidos.delete(nonce);
-    }
-    if (this.#consumidos.size > 10_000) this.#consumidos.clear();
-  }
-}
 
 /** URLs do fluxo OAuth (start/callback) construídas com escopo mínimo. */
 export function buildAuthorizationUrl(

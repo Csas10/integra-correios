@@ -4,5 +4,8 @@
   "buildCommand": "npm run build:web",
   "outputDirectory": "apps/web/dist",
   "framework": "vite",
-  "rewrites": [{ "source": "/confirma/:token", "destination": "/index.html" }]
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index" },
+    { "source": "/confirma/:token", "destination": "/index.html" }
+  ]
 }

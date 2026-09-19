@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ufBrasileiraValida } from "@integra-correios/validation";
 
 interface ConfirmationForm {
@@ -39,20 +39,105 @@ function validate(form: ConfirmationForm): string | undefined {
 export function ConfirmationPage() {
   const [form, setForm] = useState<ConfirmationForm>(INITIAL_FORM);
   const [feedback, setFeedback] = useState<string>();
+  const [enviando, setEnviando] = useState(false);
+  const [erroServidor, setErroServidor] = useState<string>();
+  const [concluido, setConcluido] = useState<"APTO_PREPOSTAGEM" | "PENDENCIA_CADASTRAL">();
+  const [contexto, setContexto] = useState<{
+    nome: string;
+    enderecoApresentado: string;
+    telefoneMascarado: string;
+    expiraEm: string;
+  }>();
+
+  // F5: token vem da URL (/confirma/:token) — capability token, nunca CPF/código/id.
+  const token =
+    typeof window !== "undefined"
+      ? decodeURIComponent(window.location.pathname.split("/").pop() ?? "")
+      : "";
+
+  // F5: contexto mínimo do backend (nome, endereço apresentado, telefone
+  // mascarado). Token inválido/expirado/consumido → erro, sem dados.
+  useEffect(() => {
+    let cancelado = false;
+    if (!token) return;
+    fetch(`/api/confirmation?token=${encodeURIComponent(token)}`)
+      .then(async (resposta) => {
+        const corpo = (await resposta.json().catch(() => ({}))) as {
+          erro?: string;
+          nome?: string;
+          enderecoApresentado?: string;
+          telefoneMascarado?: string;
+          expiraEm?: string;
+        };
+        if (cancelado) return;
+        if (!resposta.ok) {
+          setErroServidor(corpo.erro ?? "Link de confirmação inválido ou expirado.");
+          return;
+        }
+        setContexto({
+          nome: corpo.nome ?? "",
+          enderecoApresentado: corpo.enderecoApresentado ?? "",
+          telefoneMascarado: corpo.telefoneMascarado ?? "—",
+          expiraEm: corpo.expiraEm ?? "",
+        });
+      })
+      .catch(() => {
+        if (!cancelado) setErroServidor("Serviço de confirmação indisponível.");
+      });
+    return () => {
+      cancelado = true;
+    };
+  }, [token]);
 
   function update(field: keyof ConfirmationForm, value: string) {
     setForm((current) => ({ ...current, [field]: value }));
     setFeedback(undefined);
   }
 
-  function submit(event: React.FormEvent<HTMLFormElement>) {
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const error = validate(form);
     if (error) {
       setFeedback(error);
       return;
     }
-    setFeedback("Validação local concluída. O envio será habilitado após a integração autorizada.");
+    setEnviando(true);
+    setErroServidor(undefined);
+    try {
+      const resposta = await fetch("/api/confirmation", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          token,
+          decision: form.decision,
+          ...(form.decision === "ATUALIZAR"
+            ? {
+                logradouro: form.logradouro,
+                numero: form.numero,
+                bairro: form.bairro,
+                cidade: form.cidade,
+                uf: form.uf,
+                cep: form.cep,
+                telefone: form.telefone,
+                ...(form.whatsapp ? { whatsapp: form.whatsapp } : {}),
+              }
+            : {}),
+        }),
+      });
+      const corpo = (await resposta.json().catch(() => ({}))) as {
+        erro?: string;
+        status?: string;
+      };
+      if (!resposta.ok) {
+        setErroServidor(corpo.erro ?? "Não foi possível registrar a confirmação.");
+        return;
+      }
+      setConcluido(corpo.status === "PENDENCIA_CADASTRAL" ? "PENDENCIA_CADASTRAL" : "APTO_PREPOSTAGEM");
+    } catch {
+      setErroServidor("Serviço de confirmação indisponível.");
+    } finally {
+      setEnviando(false);
+    }
   }
 
   return (
@@ -60,10 +145,29 @@ export function ConfirmationPage() {
       <div className="confirmation-card">
         <span className="eyebrow">Integra Correios · confirmação PF</span>
         <h1>Confirme seus dados cadastrais</h1>
-        <p className="confirmation-lead">
-          Revise as informações recebidas. Esta página não exibe nem solicita CPF e não envia dados
-          enquanto a integração autorizada não estiver ativa.
-        </p>
+        {concluido ? (
+          <p className="confirmation-lead" role="status">
+            {concluido === "APTO_PREPOSTAGEM"
+              ? "Confirmação registrada. Seus dados estão aptos para a pré-postagem da Carteira Profissional."
+              : "Confirmação registrada. Há pendências cadastrais a corrigir antes da pré-postagem — a CRT-BA entrará em contato."}
+          </p>
+        ) : erroServidor ? (
+          <p className="confirmation-lead" role="alert">{erroServidor}</p>
+        ) : (
+          <>
+            <p className="confirmation-lead">
+              Revise as informações recebidas. Esta página não exibe nem solicita CPF.
+            </p>
+            {contexto && (
+              <div className="confirmation-context">
+                <p><strong>{contexto.nome}</strong></p>
+                <p>Endereço registrado: {contexto.enderecoApresentado}</p>
+                <p>Telefone: {contexto.telefoneMascarado}</p>
+              </div>
+            )}
+          </>
+        )}
+        {!concluido && !erroServidor && (
 
         <form onSubmit={submit} noValidate>
           <fieldset>
@@ -102,9 +206,12 @@ export function ConfirmationPage() {
             </div>
           </fieldset>
 
-          <button className="confirmation-submit" type="submit">Enviar confirmação</button>
+          <button className="confirmation-submit" type="submit" disabled={enviando}>
+            {enviando ? "Enviando…" : "Enviar confirmação"}
+          </button>
           <p className="confirmation-feedback" role="status" aria-live="polite">{feedback}</p>
         </form>
+        )}
       </div>
     </main>
   );

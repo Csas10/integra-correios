@@ -1,4 +1,4 @@
-export const MAIL_PROVIDERS = ["GMAIL", "MICROSOFT_GRAPH", "RESEND"] as const;
+export const MAIL_PROVIDERS = ["GMAIL", "MICROSOFT_GRAPH", "RESEND", "DRY_RUN"] as const;
 
 export type MailProvider = (typeof MAIL_PROVIDERS)[number];
 
@@ -26,6 +26,8 @@ export interface OutboundMail {
 export interface MailReceipt {
   readonly provider: MailProvider;
   readonly messageId: string;
+  /** threadId do provedor quando disponível (Gmail messages.send). */
+  readonly threadId?: string;
   readonly acceptedAt: string;
 }
 

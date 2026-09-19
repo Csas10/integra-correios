@@ -6,6 +6,7 @@ import { MetricCard } from "./components/MetricCard";
 import { OriginFilter } from "./components/OriginFilter";
 import { WorkflowPanel } from "./components/WorkflowPanel";
 import { ConfirmationPage } from "./pages/ConfirmationPage";
+import { OperationalFlow } from "./pages/OperationalFlow";
 import {
   INDICADORES,
   obterArea,
@@ -29,6 +30,9 @@ export function App() {
   }
 
   const area = obterArea(areaAtiva);
+
+  // Área operacional da Fase B: fluxo completo do operador (import → cockpit
+  // → piloto → outbox), com envio real permanentemente bloqueado nesta fase.
 
   return (
     <div className="app-shell">
@@ -72,6 +76,8 @@ export function App() {
             </div>
             <span className="banner-tag">Sem dados amostrais</span>
           </div>
+
+          {areaAtiva === "entrada" && <OperationalFlow />}
 
           <section className="metrics-grid" aria-label="Indicadores operacionais">
             {INDICADORES.map((indicador) => (

@@ -109,11 +109,11 @@ jobs:
       - name: PostgreSQL runtime roles
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/tests/0002_runtime_roles.test.sql
 
-      - name: Build
-        run: npm run build
+      - name: Build Vercel application and backend runtime
+        run: npm run build:vercel
 
-      - name: Build web application
-        run: npm run build:web
+      - name: Verify Vercel serverless runtime contract
+        run: npm run verify:vercel-runtime
 
       - name: Git whitespace check
         # Vendor de terceiros (SheetJS) preserva o whitespace original do

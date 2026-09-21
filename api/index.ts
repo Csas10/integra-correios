@@ -12,7 +12,7 @@
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { despachar } from "../apps/api/src/server.js";
+import { despachar } from "@integra-correios/api";
 
 export const config = { api: { bodyParser: false } };
 

@@ -1,3 +1,5 @@
+export { despachar } from "./server.js";
+
 import { ORIGENS } from "@integra-correios/domain";
 
 export interface HealthResponse {

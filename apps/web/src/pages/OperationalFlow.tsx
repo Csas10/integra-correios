@@ -232,7 +232,25 @@ export function OperationalFlow() {
   const [tokenOperador, setTokenOperador] = useState("");
   const [entrando, setEntrando] = useState(false);
   const [workerExecutando, setWorkerExecutando] = useState(false);
+  const [chaveUpload, setChaveUpload] = useState(0);
   const arquivoRef = useRef<FormData | null>(null);
+
+  // Continuidade de UX: reinicia SOMENTE o estado efêmero do fluxo de validação.
+  // O processamento existente (lote/outbox) permanece carregado e acessível em
+  // "Acompanhamento". Nenhuma mutação no PostgreSQL.
+  function iniciarNovaValidacao() {
+    arquivoRef.current = null;
+    setArquivo(null);
+    setAnalise(null);
+    setMapeamento({});
+    setResumo(null);
+    setResultadoImportacao(null);
+    setSelecao(new Set());
+    setPreviews(null);
+    setErro(undefined);
+    setChaveUpload((k) => k + 1);
+    setEtapa("UPLOAD");
+  }
 
   // F12: estado de sessão claro antes de liberar qualquer operação.
   useEffect(() => {
@@ -498,10 +516,13 @@ export function OperationalFlow() {
           itens: OutboxItem[];
         };
         if (resposta.lote) {
+          // Continuidade de UX: o processamento recuperado fica acessível como
+          // cartão separado ("Processamento existente") e em "Acompanhamento",
+          // SEM sequestrar a etapa atual — iniciar nova validação permanece
+          // possível mesmo com lote histórico ATIVO no PostgreSQL.
           setLote(resposta.lote);
           setOutbox(resposta.itens);
           setAtivacao(resposta.lote.status === "ATIVO" ? "RECOVERED_ACTIVE" : null);
-          setEtapa("OUTBOX");
         }
       } catch {
         // Readiness continuará visível; recovery é best-effort de UI.
@@ -629,11 +650,32 @@ export function OperationalFlow() {
       {/* F12 — Fluxo operacional inteiro atrás da sessão autenticada. */}
       {sessao.status === "AUTENTICADO" && (
         <>
+      {/* Continuidade de UX — processamento existente (recuperado do PostgreSQL)
+          acessível separadamente; nunca impede iniciar uma nova validação. */}
+      {lote && etapa !== "OUTBOX" && (
+        <section className="flow-panel" aria-labelledby="existing-batch-title">
+          <h2 id="existing-batch-title">Processamento existente</h2>
+          <p>
+            Há um processamento <strong>{lote.codigo}</strong> · {lote.totalItens} comunicação(ões)
+            · <strong>{rotuloStatus(lote.status)}</strong>. Ele permanece inalterado caso você
+            inicie uma nova validação de arquivo.
+          </p>
+          <div className="flow-filters">
+            <button type="button" onClick={() => setEtapa("OUTBOX")}>
+              Abrir acompanhamento
+            </button>
+            <button type="button" onClick={iniciarNovaValidacao}>
+              Iniciar nova validação de arquivo
+            </button>
+          </div>
+        </section>
+      )}
       {etapa === "UPLOAD" && (
         <section className="flow-panel" aria-labelledby="upload-title">
           <h2 id="upload-title">Importar profissionais</h2>
           <p>Selecione a planilha institucional de profissionais. Esta etapa apenas lê e confere os dados.</p>
           <input
+            key={chaveUpload}
             type="file"
             accept=".xlsx"
             onChange={(e) => setArquivo(e.target.files?.[0] ?? null)}
@@ -930,6 +972,9 @@ export function OperationalFlow() {
               disabled={ocupado || lote.status !== "ATIVO"}
             >
               {workerExecutando ? "Processando teste…" : "Executar teste de processamento"}
+            </button>
+            <button type="button" onClick={iniciarNovaValidacao}>
+              Iniciar nova validação de arquivo
             </button>
           </div>
           {ativacao && (

@@ -289,6 +289,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         [command.sha256],
       );
       let arquivoId = existente.rows[0]?.id;
+      const arquivoJaExistia = Boolean(arquivoId);
       if (!arquivoId) {
         arquivoId = randomUUID();
         await sql.query(
@@ -344,12 +345,19 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         if (!profissional) continue;
 
         const jaExiste = await sql.query<{ id: string }>(
-          `SELECT id
-          FROM profissional
-          WHERE origem = 'PF'
-            AND (codigo_operacional = $1 OR documento_fingerprint = $2)
-          LIMIT 1`,
-          [profissional.codigoOperacional, linha.documentoFingerprint],
+          arquivoJaExistia
+            ? `SELECT id
+              FROM profissional
+              WHERE origem = 'PF'
+                AND (codigo_operacional = $1 OR documento_fingerprint = $2)
+              LIMIT 1`
+            : `SELECT id
+              FROM profissional
+              WHERE origem = 'PF' AND codigo_operacional = $1
+              LIMIT 1`,
+          arquivoJaExistia
+            ? [profissional.codigoOperacional, linha.documentoFingerprint]
+            : [profissional.codigoOperacional],
         );
         if (jaExiste.rows[0]) continue;
 

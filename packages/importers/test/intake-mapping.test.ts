@@ -315,7 +315,8 @@ describe("sugestão e confirmação de mapeamento", () => {
 
   it("mapeamento sem obrigatórios de PF é rejeitado na origem PF", () => {
     const erros = validarMapeamento({ itens: [{ campo: "NOME", coluna: 0 }] }, 9, "PF");
-    expect(erros.some((e) => e.includes("PF") && e.includes("ORIGEM"))).toBe(true);
+    expect(erros.some((e) => e.includes("PF") && e.includes("CODIGO"))).toBe(true);
+    expect(erros.some((e) => e.includes("ORIGEM"))).toBe(false);
   });
 
   it("obrigatoriedade é DISTINTA por origem (PF exige TELEFONE, PJ não)", () => {

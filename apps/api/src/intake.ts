@@ -336,7 +336,10 @@ export async function confirmarImportacao(
         ? {
             id: randomUUID(),
             codigoOperacional: codigo,
-            status: "CARTEIRA_IDENTIFICADA",
+            // O preflight + confirmação da importação constituem a triagem
+            // operacional desta vertical slice: linha íntegra entra apta ao
+            // contato; linha com pendência fica bloqueada para revisão.
+            status: statusLinha === "VALIDA" ? "APTO_CONTATO" : "PENDENCIA_TRIAGEM",
             documento: caixa.seal(documento, "documento:cpf"),
             originalSnapshot: caixa.seal(
               JSON.stringify({

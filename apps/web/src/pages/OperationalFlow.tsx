@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { atualizarSelecaoMapeamento } from "../mapping-state.js";
 
 /**
  * Fluxo operacional do operador (Fase B):
@@ -605,10 +606,9 @@ export function OperationalFlow() {
                     <select
                       value={mapeamento[s.campo] ?? ""}
                       onChange={(e) =>
-                        setMapeamento((m) => ({
-                          ...m,
-                          [s.campo]: Number(e.target.value),
-                        }))
+                        setMapeamento((m) =>
+                          atualizarSelecaoMapeamento(m, s.campo, e.target.value),
+                        )
                       }
                     >
                       <option value="">— não mapeado —</option>

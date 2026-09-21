@@ -1381,3 +1381,144 @@ button:focus-visible {
   line-height: 1.5;
   white-space: pre-wrap;
 }
+
+
+/* ==========================================================================
+   Console operacional PF — superfície única e não técnica
+   ========================================================================== */
+
+.pf-operator-shell {
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.7), rgba(255, 255, 255, 0)) 0 0 / 100% 260px
+      no-repeat,
+    #eef2f6;
+}
+
+.pf-operator-main {
+  width: min(100%, 1380px);
+  margin: 0 auto;
+  padding: 38px clamp(18px, 4vw, 52px) 64px;
+}
+
+.pf-operator-hero {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 28px;
+  margin-bottom: 18px;
+}
+
+.pf-operator-hero h1 {
+  max-width: 820px;
+  margin: 0;
+  color: var(--ink-900);
+  font-size: clamp(30px, 4vw, 44px);
+  font-weight: 760;
+  letter-spacing: -0.04em;
+  line-height: 1.08;
+}
+
+.pf-operator-hero p {
+  max-width: 760px;
+  margin: 12px 0 0;
+  color: var(--ink-700);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.pf-environment-badge {
+  display: grid;
+  min-width: 250px;
+  gap: 4px;
+  padding: 14px 16px;
+  color: #165f49;
+  border: 1px solid #b9dbd0;
+  border-radius: 12px;
+  background: var(--success-soft);
+}
+
+.pf-environment-badge strong {
+  font-size: 12px;
+}
+
+.pf-environment-badge span {
+  color: #467667;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.pf-safety-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border: 1px solid #d7e2ec;
+  border-radius: 13px;
+  background: #f8fafc;
+}
+
+.pf-safety-banner strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--navy-800);
+  font-size: 12px;
+}
+
+.pf-safety-banner p {
+  margin: 0;
+  color: var(--ink-500);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.pf-safety-banner > span {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  place-items: center;
+  color: #fff;
+  border-radius: 50%;
+  background: var(--blue-600);
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.flow-diagnostics {
+  padding: 16px 20px;
+}
+
+.flow-diagnostics > summary {
+  cursor: pointer;
+  color: var(--ink-500);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.flow-tech-details {
+  padding: 8px 0;
+  border: 0 !important;
+  background: transparent !important;
+}
+
+.flow-tech-details summary {
+  color: var(--ink-500);
+  font-size: 10px;
+}
+
+@media (max-width: 760px) {
+  .pf-operator-main {
+    padding: 28px 16px 44px;
+  }
+
+  .pf-operator-hero {
+    display: grid;
+    align-items: start;
+  }
+
+  .pf-environment-badge {
+    min-width: 0;
+  }
+}

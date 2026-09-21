@@ -160,14 +160,38 @@ type Etapa =
   | "OUTBOX";
 
 const ETAPAS: readonly { id: Etapa; rotulo: string }[] = [
-  { id: "UPLOAD", rotulo: "1. Upload XLSX" },
-  { id: "MAPPING", rotulo: "2. Mapping" },
-  { id: "PREFLIGHT", rotulo: "3. Validar" },
-  { id: "PERSISTIDO", rotulo: "4. Confirmar" },
-  { id: "COCKPIT", rotulo: "5. Profissionais" },
-  { id: "LOTE", rotulo: "6. Lote" },
-  { id: "OUTBOX", rotulo: "7. Outbox" },
+  { id: "UPLOAD", rotulo: "1. Importar arquivo" },
+  { id: "MAPPING", rotulo: "2. Conferir colunas" },
+  { id: "PREFLIGHT", rotulo: "3. Revisar dados" },
+  { id: "PERSISTIDO", rotulo: "4. Salvar profissionais" },
+  { id: "COCKPIT", rotulo: "5. Selecionar contatos" },
+  { id: "LOTE", rotulo: "6. Revisar comunicação" },
+  { id: "OUTBOX", rotulo: "7. Acompanhar processamento" },
 ];
+
+const ROTULOS_FILTRO: Readonly<Record<string, string>> = {
+  TODOS: "Todos",
+  APTOS_CONTATO: "Prontos para contato",
+  PENDENCIA_CADASTRAL: "Revisão cadastral",
+  EMAIL_INVALIDO: "E-mail para revisar",
+  ENDERECO_PENDENTE: "Endereço para revisar",
+};
+
+function rotuloStatus(status: string): string {
+  const rotulos: Readonly<Record<string, string>> = {
+    APTO_CONTATO: "Pronto para contato",
+    PENDENCIA_CADASTRAL: "Revisão cadastral",
+    PENDENCIA_TRIAGEM: "Revisão necessária",
+    PENDING: "Aguardando processamento",
+    PROCESSING: "Em processamento",
+    SENT: "Processado",
+    FAILED: "Falha — revisar",
+    PREPARACAO: "Preparado",
+    ATIVO: "Autorizado",
+    CONCLUIDO: "Concluído",
+  };
+  return rotulos[status] ?? status.replaceAll("_", " ").toLowerCase();
+}
 
 export function OperationalFlow() {
   const [etapa, setEtapa] = useState<Etapa>("UPLOAD");
@@ -607,26 +631,30 @@ export function OperationalFlow() {
         <>
       {etapa === "UPLOAD" && (
         <section className="flow-panel" aria-labelledby="upload-title">
-          <h2 id="upload-title">Importar base de profissionais</h2>
-          <p>Selecione o arquivo .xlsx institucional. A importação NÃO envia e-mail.</p>
+          <h2 id="upload-title">Importar profissionais</h2>
+          <p>Selecione a planilha institucional de profissionais. Esta etapa apenas lê e confere os dados.</p>
           <input
             type="file"
             accept=".xlsx"
             onChange={(e) => setArquivo(e.target.files?.[0] ?? null)}
           />
           <button type="button" disabled={!arquivo || ocupado} onClick={enviarArquivo}>
-            {ocupado ? "Analisando…" : "Analisar arquivo"}
+            {ocupado ? "Analisando…" : "Continuar"}
           </button>
         </section>
       )}
 
       {analise && etapa === "MAPPING" && (
         <section className="flow-panel" aria-labelledby="mapping-title">
-          <h2 id="mapping-title">Revisar mapping</h2>
-          <p>
-            SHA-256: <code>{analise.sha256.slice(0, 16)}…</code> · Folha{" "}
-            <strong>{analise.folha}</strong> · {analise.totalLinhas} linhas
-          </p>
+          <h2 id="mapping-title">Conferir associação das colunas</h2>
+          <p>{analise.totalLinhas} registros encontrados na planilha selecionada.</p>
+          <details className="flow-tech-details">
+            <summary>Detalhes técnicos do arquivo</summary>
+            <small>
+              Identificador SHA-256: <code>{analise.sha256.slice(0, 16)}…</code> · Folha{" "}
+              <strong>{analise.folha}</strong>
+            </small>
+          </details>
           {analise.cabecalhosDuplicados.length > 0 && (
             <p className="flow-warn">
               Cabeçalhos duplicados: {analise.cabecalhosDuplicados.join(", ")}
@@ -636,7 +664,7 @@ export function OperationalFlow() {
             <thead>
               <tr>
                 <th>Campo</th>
-                <th>Coluna sugerida</th>
+                <th>Coluna da planilha</th>
               </tr>
             </thead>
             <tbody>
@@ -652,7 +680,7 @@ export function OperationalFlow() {
                         )
                       }
                     >
-                      <option value="">— não mapeado —</option>
+                      <option value="">— não associado —</option>
                       {analise.cabecalhos.map((h, i) => (
                         <option key={`${h}-${i}`} value={i}>
                           [{i}] {h}
@@ -665,14 +693,14 @@ export function OperationalFlow() {
             </tbody>
           </table>
           <button type="button" disabled={ocupado} onClick={rodarPreflight}>
-            Executar preflight (validação sem persistir)
+            Revisar dados da importação
           </button>
         </section>
       )}
 
       {resumo && etapa === "PREFLIGHT" && (
         <section className="flow-panel" aria-labelledby="preflight-title">
-          <h2 id="preflight-title">Validar importação</h2>
+          <h2 id="preflight-title">Revisar dados antes de salvar</h2>
           <ul className="flow-stats">
             <li>Total: {resumo.total}</li>
             <li>Válidos: {resumo.validos}</li>
@@ -696,7 +724,7 @@ export function OperationalFlow() {
                   <th>CPF</th>
                   <th>E-mail</th>
                   <th>Endereço</th>
-                  <th>Issues</th>
+                  <th>Pendências</th>
                 </tr>
               </thead>
               <tbody>
@@ -715,21 +743,21 @@ export function OperationalFlow() {
             </table>
           </div>
           <button type="button" disabled={ocupado} onClick={confirmarImportacao}>
-            Confirmar importação (persistir no PostgreSQL)
+            Salvar profissionais
           </button>
         </section>
       )}
 
       {resultadoImportacao && etapa === "PERSISTIDO" && (
         <section className="flow-panel" aria-labelledby="persisted-title">
-          <h2 id="persisted-title">Importação confirmada</h2>
+          <h2 id="persisted-title">Profissionais salvos</h2>
           <ul className="flow-stats">
             <li>Profissionais criados: {resultadoImportacao.profissionaisCriados}</li>
             <li>Linhas pendentes: {resultadoImportacao.linhasPendentes}</li>
             <li>Linhas inválidas: {resultadoImportacao.linhasInvalidas}</li>
           </ul>
           <button type="button" onClick={() => setEtapa("COCKPIT")}>
-            Ir para profissionais
+            Selecionar profissionais
           </button>
         </section>
       )}
@@ -741,7 +769,7 @@ export function OperationalFlow() {
             {["TODOS", "APTOS_CONTATO", "PENDENCIA_CADASTRAL", "EMAIL_INVALIDO", "ENDERECO_PENDENTE"].map(
               (f) => (
                 <button
-                  key={f}
+                  key={ROTULOS_FILTRO[f] ?? f}
                   type="button"
                   className={filtro === f ? "is-selected" : ""}
                   onClick={() => {
@@ -749,26 +777,26 @@ export function OperationalFlow() {
                     void carregarProfissionais();
                   }}
                 >
-                  {f}
+                  {ROTULOS_FILTRO[f] ?? f}
                 </button>
               ),
             )}
           </div>
           <p>
-            Selecionados: {selecao.size} / {PILOT_MAX} (limite do piloto validado no backend)
+            Selecionados: {selecao.size} de {PILOT_MAX} profissionais permitidos nesta validação
           </p>
           <div className="flow-scroll">
             <table className="flow-table">
               <thead>
                 <tr>
-                  <th>Piloto</th>
+                  <th>Selecionar</th>
                   <th>Código</th>
                   <th>Nome</th>
                   <th>E-mail</th>
                   <th>Telefone</th>
                   <th>Endereço</th>
                   <th>Status</th>
-                  <th>Issues</th>
+                  <th>Pendências</th>
                 </tr>
               </thead>
               <tbody>
@@ -788,7 +816,7 @@ export function OperationalFlow() {
                     <td>{p.emailMascarado}</td>
                     <td>{p.telefoneMascarado}</td>
                     <td>{p.enderecoResumo}</td>
-                    <td>{p.status}</td>
+                    <td>{rotuloStatus(p.status)}</td>
                     <td>{p.issues.join("; ") || "—"}</td>
                   </tr>
                 ))}
@@ -796,14 +824,14 @@ export function OperationalFlow() {
             </table>
           </div>
           <button type="button" disabled={selecao.size === 0 || ocupado} onClick={gerarPreview}>
-            Gerar preview das comunicações (não envia)
+            Revisar comunicações selecionadas
           </button>
         </section>
       )}
 
       {previews && (
         <section className="flow-panel" aria-labelledby="preview-title">
-          <h2 id="preview-title">Preview das comunicações</h2>
+          <h2 id="preview-title">Revisar comunicações</h2>
           <p>
             Remetente: {previews.remetente} · Quantidade: {previews.quantidade}/{previews.maximo}
           </p>
@@ -814,7 +842,7 @@ export function OperationalFlow() {
                 {p.codigo} → {p.destinatarioMascarado} · {p.assunto}
               </summary>
               <pre>{p.corpoTexto}</pre>
-              <small>Template: {p.templateVersion}</small>
+              <small>Modelo de comunicação: {p.templateVersion}</small>
             </details>
           ))}
           <button
@@ -823,17 +851,16 @@ export function OperationalFlow() {
             disabled={ocupado}
             onClick={prepararLote}
           >
-            CONFIRMAR PREPARAÇÃO DO LOTE ({previews.quantidade}/{previews.maximo})
+            Preparar comunicações ({previews.quantidade}/{previews.maximo})
           </button>
         </section>
       )}
 
       {readiness && (
-        <section className="flow-panel" aria-labelledby="readiness-title">
-          <h2 id="readiness-title">Prontidão operacional</h2>
+        <details className="flow-panel flow-diagnostics">
+          <summary id="readiness-title">Diagnóstico técnico do ambiente</summary>
           <p>
-            Modo atual: <strong>{readiness.executionMode}</strong> — a ausência de configuração
-            deixa de ser ambígua. Nenhum valor sensível é exibido.
+            Informações para suporte e validação técnica. Nenhum valor sensível é exibido.
           </p>
           <table className="flow-table">
             <thead>
@@ -871,22 +898,22 @@ export function OperationalFlow() {
               ))}
             </tbody>
           </table>
-        </section>
+        </details>
       )}
 
       {etapa === "OUTBOX" && lote && (
         <section className="flow-panel" aria-labelledby="outbox-title">
-          <h2 id="outbox-title">Status da outbox</h2>
+          <h2 id="outbox-title">Acompanhamento do processamento</h2>
           <p>
-            Lote <strong>{lote.codigo}</strong> com {lote.totalItens} item(ns), em{" "}
-            <strong>{lote.status}</strong>
+            Processamento <strong>{lote.codigo}</strong> · {lote.totalItens} comunicação(ões) ·{" "}
+            <strong>{rotuloStatus(lote.status)}</strong>.
             {lote.status === "PREPARACAO"
-              ? " — não elegível ao worker até liberação humana explícita (PREPARACAO → ATIVO)."
-              : " — elegível ao worker DRY_RUN; envio real continua bloqueado."}
+              ? " Revise e autorize antes de iniciar o teste."
+              : " O processamento de teste está autorizado; nenhum envio real será realizado."}
           </p>
           <div className="flow-filters">
             <button type="button" onClick={atualizarOutbox} disabled={ocupado}>
-              Atualizar status
+              Atualizar andamento
             </button>
             <button
               type="button"
@@ -894,26 +921,25 @@ export function OperationalFlow() {
               disabled={ocupado || lote.status === "ATIVO"}
             >
               {lote.status === "ATIVO"
-                ? "LOTE ATIVO — liberação concluída"
-                : "LIBERAR LOTE (PREPARACAO → ATIVO) — decisão humana"}
+                ? "Processamento autorizado"
+                : "Autorizar processamento"}
             </button>
             <button
               type="button"
               onClick={executarWorkerUmaVez}
               disabled={ocupado || lote.status !== "ATIVO"}
             >
-              {workerExecutando ? "Executando worker DRY_RUN…" : "Executar worker uma iteração (DRY_RUN)"}
+              {workerExecutando ? "Processando teste…" : "Executar teste de processamento"}
             </button>
           </div>
           {ativacao && (
             <p className="flow-stats">
-              Liberação: <code>{ativacao}</code> — lote ATIVO para o motor. Envio real permanece
-              bloqueado (REAL_SEND_ENABLED=false).
+              Autorização registrada. O ambiente continua em modo de validação, sem envio real.
             </p>
           )}
           {workerRun && (
             <div className="flow-stats">
-              <p>Worker one-shot ({workerRun.modo ?? "DRY_RUN"}):</p>
+              <p>Resultado do teste de processamento:</p>
               {workerRun.motivo && <p>Motivo do bloqueio: <code>{workerRun.motivo}</code></p>}
               {workerRun.resultado && (
                 <ul>
@@ -928,11 +954,11 @@ export function OperationalFlow() {
           <table className="flow-table">
             <thead>
               <tr>
-                <th>Outbox</th>
-                <th>Lote</th>
+                <th>Registro</th>
+                <th>Processamento</th>
                 <th>Status</th>
                 <th>Tentativas</th>
-                <th>Erro</th>
+                <th>Observação</th>
               </tr>
             </thead>
             <tbody>
@@ -942,7 +968,7 @@ export function OperationalFlow() {
                     <code>{o.outboxId.slice(0, 8)}…</code>
                   </td>
                   <td>{o.codigo ?? "—"}</td>
-                  <td>{o.status}</td>
+                  <td>{rotuloStatus(o.status)}</td>
                   <td>{o.tentativas}</td>
                   <td>{o.erroCodigo ?? "—"}</td>
                 </tr>

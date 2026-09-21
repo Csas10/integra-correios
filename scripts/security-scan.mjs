@@ -29,6 +29,8 @@ const IMPORTER_TEST_CNPJ = ["11", "222", "333", "0001", "81"].join("");
 const HISTORICAL_DOC_CPF = ["000", ".000", ".000", "-00"].join("");
 const HISTORICAL_DOC_CNPJ = ["00", ".000", ".000", "/0000", "-00"].join("");
 const HISTORICAL_TEST_CPF = ["123", ".456", ".789", "-09"].join("");
+const HISTORICAL_INTAKE_PILOT_CPF_1 = ["000", "000", "001", "91"].join("");
+const HISTORICAL_INTAKE_PILOT_CPF_2 = ["168", "995", "350", "09"].join("");
 const HISTORICAL_DOC_DSN = ["postgres://user", ":senha", "@..."].join("");
 const HISTORICAL_TEST_DSN = [
   "postgresql://integra_test",
@@ -98,6 +100,13 @@ const ALLOWLIST_NARROW = [
     matches: new Set([HISTORICAL_TEST_CPF]),
     historyOnly: true,
     motivo: "fixture sintética presente em commit anterior desta PR",
+  },
+  {
+    file: "apps/api/test/intake-pilot.test.ts",
+    rule: "cpf-sem-mascara",
+    matches: new Set([HISTORICAL_INTAKE_PILOT_CPF_1, HISTORICAL_INTAKE_PILOT_CPF_2]),
+    historyOnly: true,
+    motivo: "fixtures sintéticas válidas introduzidas em commit intermediário e posteriormente fragmentadas no source",
   },
   {
     file: "tests/security-scan.test.mjs",

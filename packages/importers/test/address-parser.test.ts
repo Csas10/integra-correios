@@ -99,29 +99,23 @@ describe("mapping institucional da base real (colunas CRT)", () => {
         { campo: "TELEFONE" as const, coluna: 6 },
       ],
     };
-    // PF: sem ORIGEM — a origem do fluxo é PF; ORIGEM obrigatório no contrato
-    // do intake-mapping (linha do arquivo não precisa da coluna ORIGEM quando
-    // a base institucional não a possui? A política exige ORIGEM mapeado —
-    // mas a base CRT não tem; aqui documentamos o gap pela exceção explícita).
+    // PF: a origem é autoridade do próprio fluxo de ingestão; a base
+    // institucional não precisa inventar uma coluna ORIGEM inexistente.
     const erros = validarMapeamento(mapeamento, CABECALHOS_INSTITUCIONAIS.length, "PF");
-    // O contrato exige ORIGEM mapeado: a base real não possui essa coluna,
-    // então o operador DEVE decidir — bloqueamos sem campo ORIGEM.
-    expect(erros.some((e) => e.includes("ORIGEM"))).toBe(true);
+    expect(erros).toEqual([]);
+    expect(() => confirmarMapeamento(mapeamento, CABECALHOS_INSTITUCIONAIS.length, "PF")).not.toThrow();
   });
 
-  it("ORIGEM não mapeada é exigida mesmo com o resto completo (fail-closed)", () => {
+  it("ORIGEM permanece opcional no arquivo PF porque a origem vem do fluxo", () => {
     const mapeamento = {
       itens: [
-        { campo: "ORIGEM" as const, coluna: 0 },
-        { campo: "CODIGO" as const, coluna: 1 },
+        { campo: "CODIGO" as const, coluna: 0 },
         { campo: "NOME" as const, coluna: 3 },
         { campo: "CPF_CNPJ" as const, coluna: 2 },
         { campo: "ENDERECO_COMPOSTO" as const, coluna: 7 },
         { campo: "TELEFONE" as const, coluna: 6 },
       ],
     };
-    const erros = validarMapeamento(mapeamento, CABECALHOS_INSTITUCIONAIS.length, "PF");
-    expect(erros).toEqual([]);
-    expect(() => confirmarMapeamento(mapeamento, CABECALHOS_INSTITUCIONAIS.length, "PF")).not.toThrow();
+    expect(validarMapeamento(mapeamento, CABECALHOS_INSTITUCIONAIS.length, "PF")).toEqual([]);
   });
 });

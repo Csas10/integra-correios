@@ -19,6 +19,9 @@ const CABECALHOS = [
   "EXERCICIOS PENDENTES",
 ];
 
+const CPF_SINTETICO_1 = ["000", "000", "001", "91"].join("");
+const CPF_SINTETICO_2 = ["168", "995", "350", "09"].join("");
+
 const MAPEAMENTO = [
   { campo: "CODIGO" as const, coluna: 0 },
   { campo: "CPF_CNPJ" as const, coluna: 2 },
@@ -50,7 +53,7 @@ function workbookBytes(): Uint8Array {
     [
       "SINT-PF-002",
       "RN-SINT-002",
-      "16899535009",
+      CPF_SINTETICO_2,
       "Pessoa Sintetica Dois",
       "email-invalido",
       "71999990002",

@@ -28,6 +28,7 @@ código (nomes reais, nada hipotético). Nenhum valor real no Git.
 | Mapping (colunas → campos) | Operador (UI) | Confirmar mapping assistido do XLSX | Importação | APPLICATION (contrato versionado) | NÃO | NÃO | IMPLEMENTADO |
 | `PPN_ENABLED` | — | Motor PPN/Correios | (fora do escopo desta fase) | HUMAN_DECISION | NÃO | SIM (`false`) | DISABLED deliberadamente |
 | Liberação do lote (PREPARACAO → ATIVO) | Operador humano | GATE 2: elegibilidade da outbox | Envio (DRY_RUN também exige ATIVO) | HUMAN_DECISION + auditoria | NÃO | NÃO | IMPLEMENTADO (`/api/pilot/activate`) |
+| Encerramento do lote (ATIVO → CONCLUIDO) | Aplicação, após confirmação | Libera a reserva do profissional e encerra o ciclo da comunicação | Confirmação consumida e comunicação ACCEPTED/DELIVERED | APPLICATION + auditoria | NÃO | NÃO | IMPLEMENTADO de forma transacional |
 
 ## Regras aplicadas
 
@@ -66,3 +67,13 @@ PostgreSQL (tabela `oauth_flow`, migration 0004; F18) — serverless-safe.
 Não é necessário nenhum segredo do Google para o DRY_RUN (o gateway é
 sintético). Para o LIVE_PILOT, adicionam-se as credenciais OAuth do titular
 (`GMAIL_OAUTH_*`) e a decisão humana de liberação do lote + `REAL_SEND_ENABLED`.
+
+## Encerramento do ciclo
+
+O receipt do worker não encerra o lote sozinho: ele deixa a comunicação
+`ACCEPTED`, a outbox `SENT` e o item `ENVIADO`. A confirmação do profissional
+consome o token uma única vez e, na mesma transação do snapshot e da auditoria,
+promove o item para `CONCLUIDO`. Quando não restam itens não terminais
+(`CONCLUIDO` ou `CANCELADO`), o lote é promovido de `ATIVO` para `CONCLUIDO`.
+Até essa confirmação, o índice parcial de reserva mantém o profissional
+impedido de entrar em outro lote ativo.

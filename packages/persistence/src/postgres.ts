@@ -881,6 +881,71 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         metadata: { confirmationId: command.confirmationId, decisao: command.decisao, statusFinal: novoStatus },
         eventHash: createHash("sha256").update(command.confirmationId).update(agora).digest("hex"),
       });
+
+      // A confirmação encerra o item somente depois de uma comunicação aceita.
+      // Assim, um token consumido fora de ordem nunca libera uma reserva que
+      // ainda não passou pelo worker.
+      const comunicacao = await sql.query<{
+        id: string;
+        lote_comunicacao_id: string;
+        status: string;
+      }>(
+        `SELECT c.id, c.lote_comunicacao_id, c.status
+        FROM comunicacao c
+        WHERE c.confirmacao_id = $1 AND c.profissional_id = $2
+        FOR UPDATE`,
+        [command.confirmationId, command.professionalId],
+      );
+      const vinculada = comunicacao.rows[0];
+      if (vinculada && (vinculada.status === "ACCEPTED" || vinculada.status === "DELIVERED")) {
+        await sql.query(
+          `UPDATE item_lote_comunicacao
+          SET status = 'CONCLUIDO', atualizado_em = $2
+          WHERE comunicacao_id = $1 AND status = 'ENVIADO'`,
+          [vinculada.id, agora],
+        );
+
+        const lote = await sql.query<{ status: string }>(
+          `SELECT status
+          FROM lote_comunicacao
+          WHERE id = $1
+          FOR UPDATE`,
+          [vinculada.lote_comunicacao_id],
+        );
+        const statusLote = lote.rows[0]?.status;
+        if (statusLote === "ATIVO") {
+          const pendencias = await sql.query<{ total: string; pendentes: string }>(
+            `SELECT count(*)::text AS total,
+              count(*) FILTER (WHERE status NOT IN ('CONCLUIDO', 'CANCELADO'))::text AS pendentes
+            FROM item_lote_comunicacao
+            WHERE lote_comunicacao_id = $1`,
+            [vinculada.lote_comunicacao_id],
+          );
+          const resumo = pendencias.rows[0];
+          if (resumo && Number(resumo.total) > 0 && Number(resumo.pendentes) === 0) {
+            await sql.query(
+              `UPDATE lote_comunicacao
+              SET status = 'CONCLUIDO', concluido_em = $2
+              WHERE id = $1 AND status = 'ATIVO'`,
+              [vinculada.lote_comunicacao_id, agora],
+            );
+            await insertAudit(sql, {
+              id: randomUUID(),
+              aggregateType: "LOTE_COMUNICACAO",
+              aggregateId: vinculada.lote_comunicacao_id,
+              type: "PF_LOTE_COMUNICACAO_CONCLUIDO",
+              actorId: command.fonte,
+              occurredAt: agora,
+              metadata: { totalItens: Number(resumo.total), motivo: "TODAS_CONFIRMADAS" },
+              eventHash: createHash("sha256")
+                .update(vinculada.lote_comunicacao_id)
+                .update("CONCLUIDO")
+                .update(agora)
+                .digest("hex"),
+            });
+          }
+        }
+      }
       return {
         confirmationId: command.confirmationId,
         professionalId: command.professionalId,

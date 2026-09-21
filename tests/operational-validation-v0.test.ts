@@ -1502,4 +1502,194 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
       await pool.close();
     }
   });
+
+  it("fecha item e lote somente após receipt aceito e confirmação consumida", async () => {
+    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      const ownership = new PostgresConfirmationOwnership(pool);
+      const profissionalId = randomUUID();
+      const loteId = randomUUID();
+      const confirmationId = randomUUID();
+      const communicationId = randomUUID();
+      const outboxId = randomUUID();
+      const codigo = `FECHAMENTO-${randomUUID().slice(0, 8).toUpperCase()}`;
+      const agora = new Date().toISOString();
+      const tokenHash = hash64(`fechamento-token-${loteId}`);
+
+      await repository.createProfessional({
+        id: profissionalId,
+        origin: "PF",
+        operationalCode: codigo,
+        status: "APTO_CONTATO",
+        document: {
+          documentType: "CPF",
+          fingerprint: fingerprinter.fingerprint("cpf-fechamento", `${codigo}:${CPF_VALIDO}`),
+          encrypted: caixa.seal(CPF_VALIDO, "documento:cpf"),
+        },
+        originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "PROFISSIONAL",
+          aggregateId: profissionalId,
+          type: "PF_IMPORTADO_FECHAMENTO",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`importado-${profissionalId}`),
+        },
+      });
+
+      await repository.enqueueCommunicationBatch({
+        id: loteId,
+        code: `PF-MAIL-FECHAMENTO-${codigo}`,
+        origin: "PF",
+        templateVersion: "pf-pilot-crtba-v1",
+        mode: "DRY_RUN",
+        createdBy: "teste-fechamento",
+        createdAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_CRIADO_FECHAMENTO",
+          occurredAt: agora,
+          metadata: { totalItens: 1 },
+          eventHash: hash64(`lote-${loteId}`),
+        },
+        items: [
+          {
+            professionalId: profissionalId,
+            confirmationId,
+            communicationId,
+            outboxId,
+            tokenHash,
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+            recipientFingerprint: fingerprinter.fingerprint("email-fechamento", "sintetico@exemplo.test"),
+            idempotencyKey: `pf-fechamento:${confirmationId}`,
+            encryptedPayload: caixa.seal("payload-fechamento", "outbox:email"),
+            auditEvent: {
+              id: randomUUID(),
+              aggregateType: "PROFISSIONAL",
+              aggregateId: profissionalId,
+              type: "PF_CONFIRMACAO_EMITIDA_FECHAMENTO",
+              occurredAt: agora,
+              metadata: { loteComunicacaoId: loteId },
+              eventHash: hash64(`confirmacao-${confirmationId}`),
+            },
+          },
+        ],
+      });
+
+      await repository.ativarLoteComunicacao({
+        batchId: loteId,
+        origin: "PF",
+        actorId: "teste-fechamento",
+        activatedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_ATIVADO_FECHAMENTO",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`ativado-${loteId}`),
+        },
+      });
+      const claimed = await repository.claimOutbox("worker-fechamento", 10, agora);
+      expect(claimed).toHaveLength(1);
+      await repository.markOutboxAccepted({
+        outboxId,
+        communicationId,
+        provider: "DRY_RUN",
+        providerMessageId: `dryrun-${confirmationId}`,
+        acceptedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "COMUNICACAO",
+          aggregateId: communicationId,
+          type: "PF_COMMUNICATION_ACCEPTED_FECHAMENTO",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`accepted-${communicationId}`),
+        },
+      });
+      const aposReceipt = await pool.query<{ lote: string; item: string; confirmacao: string }>(
+        `SELECT l.status AS lote, i.status AS item, c.status AS confirmacao
+        FROM lote_comunicacao l
+        JOIN item_lote_comunicacao i ON i.lote_comunicacao_id = l.id
+        JOIN comunicacao cm ON cm.id = i.comunicacao_id
+        JOIN confirmacao c ON c.id = cm.confirmacao_id
+        WHERE l.id = $1`,
+        [loteId],
+      );
+      expect(aposReceipt.rows[0]).toEqual({
+        lote: "ATIVO",
+        item: "ENVIADO",
+        confirmacao: "PENDING",
+      });
+
+      const consumida = await ownership.consumePending({
+        confirmationId,
+        tokenHash,
+        usedAt: agora,
+        decision: "CONFIRMAR",
+      });
+      expect(consumida?.status).toBe("SUBMITTED");
+
+      const decidido = snapshotPf();
+      const resultado = await repository.registrarResultadoConfirmacao({
+        confirmationId,
+        professionalId: profissionalId,
+        snapshotCifrado: caixa.seal(JSON.stringify(decidido), "snapshot:original"),
+        snapshotDecidido: decidido as unknown as Record<string, unknown>,
+        decisao: "CONFIRMAR",
+        fonte: "CONFIRMACAO_WEB",
+        occurredAt: agora,
+      });
+      expect(resultado.status).toBe("APTO_PREPOSTAGEM");
+
+      const estado = await pool.query<{
+        lote: string;
+        item: string;
+        profissional: string;
+        confirmacao: string;
+        comunicacao: string;
+        outbox: string;
+      }>(
+        `SELECT
+          l.status AS lote,
+          i.status AS item,
+          p.status AS profissional,
+          c.status AS confirmacao,
+          cm.status AS comunicacao,
+          o.status AS outbox
+        FROM lote_comunicacao l
+        JOIN item_lote_comunicacao i ON i.lote_comunicacao_id = l.id
+        JOIN profissional p ON p.id = i.profissional_id
+        JOIN comunicacao cm ON cm.id = i.comunicacao_id
+        JOIN confirmacao c ON c.id = cm.confirmacao_id
+        JOIN outbox_email o ON o.comunicacao_id = cm.id
+        WHERE l.id = $1`,
+        [loteId],
+      );
+      expect(estado.rows[0]).toEqual({
+        lote: "CONCLUIDO",
+        item: "CONCLUIDO",
+        profissional: "APTO_PREPOSTAGEM",
+        confirmacao: "SUBMITTED",
+        comunicacao: "ACCEPTED",
+        outbox: "SENT",
+      });
+
+      const auditoria = await pool.query<{ total: string }>(
+        `SELECT count(*)::text AS total
+        FROM evento_auditoria
+        WHERE agregado_id = $1 AND tipo = 'PF_LOTE_COMUNICACAO_CONCLUIDO'`,
+        [loteId],
+      );
+      expect(auditoria.rows[0]?.total).toBe("1");
+    } finally {
+      await pool.close();
+    }
+  });
 });

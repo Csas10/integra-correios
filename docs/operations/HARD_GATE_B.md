@@ -19,6 +19,7 @@ XLSX (real ou sintético)
   → LIBERAÇÃO humana        POST /api/pilot/activate        (CAS PREPARACAO → ATIVO + auditoria)
   → worker run-once         POST /api/pilot/worker/run-once (uma iteração, mesmo motor do CLI)
   → DRY_RUN: gateway sintético → receipt persistido → auditoria
+  → confirmação do profissional → item CONCLUIDO → lote CONCLUIDO
   → LIVE_PILOT: GmailHttpTransport (messages.send) — exige GATE 1 + GATE 2
 ```
 
@@ -41,6 +42,7 @@ XLSX (real ou sintético)
 | **F5** Confirmação somente visual | Alto | FIX_NOW | `GET /api/confirmation?token=` (contexto mínimo) + `POST /api/confirmation` (consumePending CAS → snapshot decidido cifrado → workflow → APTO_PREPOSTAGEM/PENDENCIA_CADASTRAL → auditoria); ConfirmationPage chama o backend real | Replay/expiração FAIL CLOSED; sem CPF/código/UUID na URL |
 | **F6** Browser escolhia LIVE | Alto | FIX_NOW | run-once executa `executarWorkerUmaVez` (DRY_RUN hardcoded server-side; corpo da requisição ignorado); LIVE em `executarWorkerUmaVezLive` separado, não exposto por rota nenhuma | `REAL_SEND_EXECUTED=false` |
 | **F7** DRY_RUN indistinguível de LIVE | Alto | FIX_NOW | Migration 0003: `lote_comunicacao.modo` (DRY_RUN\|LIVE_PILOT, nascido no INSERT, auditado) + `provider='DRY_RUN'` na comunicação; claim filtra por lote; worker valida divergência de modo (fail-closed) | messageId sintético nunca ocupa identidade Gmail |
+| Lote permanecia ATIVO após receipt aceito | Alto | FIX_NOW | A confirmação consumida fecha o item `ENVIADO → CONCLUIDO`; quando todos os itens estão `CONCLUIDO`/`CANCELADO`, a mesma transação fecha o lote `ATIVO → CONCLUIDO` e registra auditoria | Índice de reserva deixa de reter profissionais após a confirmação |
 | **F8** Importação não atômica | Alto | FIX_NOW | `registrarImportacaoPf` no persistence package: UMA transação (arquivo → importação → linhas → profissionais → snapshots → auditoria); intake só pré-processa | Teste de falha no meio: ROLLBACK integral nas 6 tabelas |
 | **F9** `linhas_validas` incorreta | Alto | FIX_NOW | Contagens semânticas no persistence: válidas (elegíveis) / pendentes / inválidas / criados separados | Regressão: 1ª importação e reimportação do mesmo SHA (criados=0, válidas=2) |
 | **F10** Rotas operacionais abertas | Alto | FIX_NOW | `OPERATOR_TOKEN` (Bearer, comparação em tempo constante) em TODA rota operacional; fail-closed sem o segredo; `ROTAS_PUBLICAS` explícitas (health, confirmação) | `/api/confirmation` permanece pública por capability token |
@@ -78,7 +80,8 @@ XLSX (real ou sintético)
 ## INTERNAL_TODOS = 0
 
 Caminho XLSX → mapping → persistence → cockpit → pilot batch → outbox →
-worker → Gmail adapter → confirmation → audit: sem pendências internas.
+worker → receipt → confirmation → encerramento do item/lote → audit: sem
+pendências internas.
 Pendentes apenas EXTERNAL_CONFIGURATION e HUMAN_RELEASE (ver DECISION_LOG).
 
 ## Limitações conhecidas

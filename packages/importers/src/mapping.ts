@@ -112,6 +112,18 @@ export interface Mapeamento {
   readonly itens: readonly ItemMapeamento[];
 }
 
+/**
+ * Erro de contrato de mapping. Os detalhes contêm somente nomes de campos e
+ * índices de coluna — nunca valores das linhas/PII — e podem ser retornados
+ * ao operador para corrigir o mapping sem transformar todo erro em 422 opaco.
+ */
+export class MapeamentoInvalidoError extends Error {
+  constructor(readonly erros: readonly string[]) {
+    super(`Mapeamento inválido: ${erros.join(" ")}`);
+    this.name = "MapeamentoInvalidoError";
+  }
+}
+
 /** Marca privada: somente confirmarMapeamento pode criar este contrato. */
 const MAPEAMENTO_CONFIRMADO: unique symbol = Symbol("MapeamentoConfirmado");
 
@@ -181,7 +193,7 @@ export function confirmarMapeamento(
 ): MapeamentoConfirmado {
   const erros = validarMapeamento(mapeamento, totalColunas, origem);
   if (erros.length > 0) {
-    throw new Error(`Mapeamento inválido: ${erros.join(" ")}`);
+    throw new MapeamentoInvalidoError(erros);
   }
   const itens = Object.freeze(
     mapeamento.itens.map((item) => Object.freeze({ ...item })),

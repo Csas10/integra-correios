@@ -41,6 +41,7 @@ import {
   type ConfirmationDecisionInput,
 } from "./confirmation.js";
 import { createWebTokenService } from "@integra-correios/pf-workflow";
+import { MapeamentoInvalidoError } from "@integra-correios/importers";
 import {
   loadGmailOauthConfig,
   oauthStatusFromEnvironment,
@@ -488,6 +489,14 @@ const ROTAS: readonly Rota[] = [
           json(res, 400, { erro: error.message, codigo: error.codigo });
           return;
         }
+        if (error instanceof MapeamentoInvalidoError) {
+          json(res, 400, {
+            erro: "Mapeamento inválido.",
+            codigo: "MAPPING_INVALID",
+            detalhes: error.erros,
+          });
+          return;
+        }
         json(res, 422, { erro: "Preflight não pôde ser executado (arquivo/mapping inválidos)." });
       }
     },
@@ -518,6 +527,14 @@ const ROTAS: readonly Rota[] = [
       } catch (error) {
         if (error instanceof ContratoInvalidoError) {
           json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        if (error instanceof MapeamentoInvalidoError) {
+          json(res, 400, {
+            erro: "Mapeamento inválido.",
+            codigo: "MAPPING_INVALID",
+            detalhes: error.erros,
+          });
           return;
         }
         const mensagem = error instanceof Error ? error.message : "Falha na importação.";

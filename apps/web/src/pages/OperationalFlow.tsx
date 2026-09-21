@@ -194,7 +194,12 @@ export function OperationalFlow() {
     maximo: number;
     aviso: string;
   } | null>(null);
-  const [lote, setLote] = useState<{ loteId: string; codigo: string; totalItens: number } | null>(null);
+  const [lote, setLote] = useState<{
+    loteId: string;
+    codigo: string;
+    totalItens: number;
+    status: "PREPARACAO" | "ATIVO";
+  } | null>(null);
   const [outbox, setOutbox] = useState<OutboxItem[]>([]);
   const [readiness, setReadiness] = useState<ReadinessReport | null>(null);
   const [workerRun, setWorkerRun] = useState<WorkerRun | null>(null);
@@ -202,6 +207,7 @@ export function OperationalFlow() {
   const [sessao, setSessao] = useState<EstadoSessao>({ status: "DESCONHECIDO" });
   const [tokenOperador, setTokenOperador] = useState("");
   const [entrando, setEntrando] = useState(false);
+  const [workerExecutando, setWorkerExecutando] = useState(false);
   const arquivoRef = useRef<FormData | null>(null);
 
   // F12: estado de sessão claro antes de liberar qualquer operação.
@@ -402,6 +408,13 @@ export function OperationalFlow() {
     }
   }
 
+  async function carregarOutboxDoLote(loteId: string) {
+    const resposta = (await chamar(`/api/pilot/outbox?loteId=${loteId}`)) as {
+      itens: OutboxItem[];
+    };
+    setOutbox(resposta.itens);
+  }
+
   async function prepararLote() {
     setOcupado(true);
     setErro(undefined);
@@ -411,7 +424,8 @@ export function OperationalFlow() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ professionalIds: [...selecao] }),
       })) as { loteId: string; codigo: string; totalItens: number };
-      setLote(resposta);
+      setLote({ ...resposta, status: "PREPARACAO" });
+      await carregarOutboxDoLote(resposta.loteId);
       setEtapa("OUTBOX");
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha ao preparar lote.");
@@ -424,10 +438,7 @@ export function OperationalFlow() {
     if (!lote) return;
     setOcupado(true);
     try {
-      const resposta = (await chamar(`/api/pilot/outbox?loteId=${lote.loteId}`)) as {
-        itens: OutboxItem[];
-      };
-      setOutbox(resposta.itens);
+      await carregarOutboxDoLote(lote.loteId);
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha ao consultar outbox.");
     } finally {
@@ -443,10 +454,35 @@ export function OperationalFlow() {
     }
   }, []);
 
-  // F12: recarrega a prontidão quando a sessão operacional muda.
+  // F12/F22: ao restaurar a sessão, também recupera do PostgreSQL qualquer
+  // lote PF/DRY_RUN já persistido. Refresh/reabertura não reinicia o fluxo.
   useEffect(() => {
-    if (sessao.status === "AUTENTICADO") void carregarReadiness();
-    else setReadiness(null);
+    if (sessao.status !== "AUTENTICADO") {
+      setReadiness(null);
+      return;
+    }
+    void carregarReadiness();
+    void (async () => {
+      try {
+        const resposta = (await chamar("/api/pilot/recovery")) as {
+          lote: {
+            loteId: string;
+            codigo: string;
+            totalItens: number;
+            status: "PREPARACAO" | "ATIVO";
+          } | null;
+          itens: OutboxItem[];
+        };
+        if (resposta.lote) {
+          setLote(resposta.lote);
+          setOutbox(resposta.itens);
+          setAtivacao(resposta.lote.status === "ATIVO" ? "RECOVERED_ACTIVE" : null);
+          setEtapa("OUTBOX");
+        }
+      } catch {
+        // Readiness continuará visível; recovery é best-effort de UI.
+      }
+    })();
   }, [sessao.status, carregarReadiness]);
 
   async function liberarLote() {
@@ -460,6 +496,8 @@ export function OperationalFlow() {
         body: JSON.stringify({ loteId: lote.loteId }),
       })) as { resultado?: { resultCode: string }; modoEnvio?: string; aviso?: string };
       setAtivacao(resposta.resultado?.resultCode ?? "ACTIVATED");
+      setLote((atual) => (atual ? { ...atual, status: "ATIVO" } : atual));
+      await carregarOutboxDoLote(lote.loteId);
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha na liberação do lote.");
     } finally {
@@ -469,6 +507,7 @@ export function OperationalFlow() {
 
   async function executarWorkerUmaVez() {
     setOcupado(true);
+    setWorkerExecutando(true);
     setErro(undefined);
     try {
       const resposta = (await chamar("/api/pilot/worker/run-once", {
@@ -477,9 +516,11 @@ export function OperationalFlow() {
         body: JSON.stringify({ dryRun: true }),
       })) as WorkerRun;
       setWorkerRun(resposta);
+      if (lote) await carregarOutboxDoLote(lote.loteId);
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha na execução do worker.");
     } finally {
+      setWorkerExecutando(false);
       setOcupado(false);
     }
   }
@@ -837,18 +878,31 @@ export function OperationalFlow() {
         <section className="flow-panel" aria-labelledby="outbox-title">
           <h2 id="outbox-title">Status da outbox</h2>
           <p>
-            Lote <strong>{lote.codigo}</strong> com {lote.totalItens} item(ns), em PREPARACAO —
-            não elegível a envio até liberação humana explícita (PREPARACAO → ATIVO).
+            Lote <strong>{lote.codigo}</strong> com {lote.totalItens} item(ns), em{" "}
+            <strong>{lote.status}</strong>
+            {lote.status === "PREPARACAO"
+              ? " — não elegível ao worker até liberação humana explícita (PREPARACAO → ATIVO)."
+              : " — elegível ao worker DRY_RUN; envio real continua bloqueado."}
           </p>
           <div className="flow-filters">
             <button type="button" onClick={atualizarOutbox} disabled={ocupado}>
               Atualizar status
             </button>
-            <button type="button" onClick={liberarLote} disabled={ocupado}>
-              LIBERAR LOTE (PREPARACAO → ATIVO) — decisão humana
+            <button
+              type="button"
+              onClick={liberarLote}
+              disabled={ocupado || lote.status === "ATIVO"}
+            >
+              {lote.status === "ATIVO"
+                ? "LOTE ATIVO — liberação concluída"
+                : "LIBERAR LOTE (PREPARACAO → ATIVO) — decisão humana"}
             </button>
-            <button type="button" onClick={executarWorkerUmaVez} disabled={ocupado}>
-              Executar worker uma iteração (DRY_RUN)
+            <button
+              type="button"
+              onClick={executarWorkerUmaVez}
+              disabled={ocupado || lote.status !== "ATIVO"}
+            >
+              {workerExecutando ? "Executando worker DRY_RUN…" : "Executar worker uma iteração (DRY_RUN)"}
             </button>
           </div>
           {ativacao && (

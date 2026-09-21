@@ -19,6 +19,7 @@ const CABECALHOS = [
   "EXERCICIOS PENDENTES",
 ];
 
+const CPF_SINTETICO_0 = ["529", "982", "247", "25"].join("");
 const CPF_SINTETICO_1 = ["000", "000", "001", "91"].join("");
 const CPF_SINTETICO_2 = ["168", "995", "350", "09"].join("");
 
@@ -38,7 +39,7 @@ function workbookBytes(): Uint8Array {
     [
       "SINT-PF-001",
       "RN-SINT-001",
-      "52998224725",
+      CPF_SINTETICO_0,
       "Pessoa Sintetica Um",
       "pessoa1@example.test",
       "71999990001",

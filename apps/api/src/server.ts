@@ -25,7 +25,9 @@ import {
   gerarPreviewComunicacao,
   listarProfissionais,
   prepararLotePiloto,
+  recuperarLotePilotoEmAndamento,
   statusOutbox,
+  LotePilotoEmAndamentoError,
   type FiltroCockpit,
 } from "./pilot.js";
 import {
@@ -623,8 +625,46 @@ const ROTAS: readonly Rota[] = [
         );
         json(res, 200, resultado);
       } catch (error) {
-        json(res, 422, { erro: error instanceof Error ? error.message : "Falha na preparação do lote." });
+        if (error instanceof LotePilotoEmAndamentoError) {
+          json(res, 409, {
+            erro: error.message,
+            codigo: "BATCH_ALREADY_IN_PROGRESS",
+            lote: error.lote,
+          });
+          return;
+        }
+        const pg = error as { code?: string; constraint?: string };
+        if (pg?.code === "23505" && pg.constraint === "item_lote_profissional_ativo_idx") {
+          json(res, 409, {
+            erro: "Um ou mais profissionais já pertencem a um lote de comunicação em andamento.",
+            codigo: "BATCH_ALREADY_IN_PROGRESS",
+          });
+          return;
+        }
+        json(res, 422, { erro: "Falha na preparação do lote." });
       }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // RECOVERY — restaura o lote persistido após refresh/reabertura da UI.
+  // Sem mutação: apenas lê o lote PF/DRY_RUN em PREPARACAO/ATIVO e a outbox.
+  // ------------------------------------------------------------------
+  {
+    metodo: "GET",
+    caminhoExato: "/api/pilot/recovery",
+    handler: async (req, res) => {
+      if (!exigirOperador(req, res)) return;
+      const { pool } = requireDb();
+      const lote = await recuperarLotePilotoEmAndamento(pool);
+      if (!lote) {
+        json(res, 200, { lote: null, itens: [] });
+        return;
+      }
+      json(res, 200, {
+        lote,
+        itens: await statusOutbox(pool, lote.loteId),
+      });
     },
   },
   {

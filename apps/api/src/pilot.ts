@@ -75,6 +75,74 @@ export function mascararTelefone(telefone: string): string {
   return `***${digitos.slice(-4)}`;
 }
 
+export interface LotePilotoRecuperavel {
+  readonly loteId: string;
+  readonly codigo: string;
+  readonly status: "PREPARACAO" | "ATIVO";
+  readonly modo: "DRY_RUN";
+  readonly totalItens: number;
+}
+
+/**
+ * Recupera o lote PF/DRY_RUN que ficou em andamento após refresh/reabertura
+ * da interface. O PostgreSQL é a autoridade; a UI não pode depender apenas
+ * de estado React efêmero para continuar uma operação já persistida.
+ */
+export async function recuperarLotePilotoEmAndamento(
+  pool: {
+    query: (text: string, values?: readonly unknown[]) => Promise<{ rows: readonly any[]; rowCount: number | null }>;
+  },
+): Promise<LotePilotoRecuperavel | undefined> {
+  const result = await pool.query(
+    `SELECT l.id, l.codigo, l.status, l.modo,
+      count(i.id)::int AS total_itens
+    FROM lote_comunicacao l
+    JOIN item_lote_comunicacao i ON i.lote_comunicacao_id = l.id
+    WHERE l.origem = 'PF'
+      AND l.modo = 'DRY_RUN'
+      AND l.status IN ('PREPARACAO', 'ATIVO')
+    GROUP BY l.id, l.codigo, l.status, l.modo, l.criado_em
+    ORDER BY l.criado_em DESC
+    LIMIT 1`,
+  );
+  const row = result.rows[0];
+  if (!row) return undefined;
+  return {
+    loteId: row.id,
+    codigo: row.codigo,
+    status: row.status,
+    modo: "DRY_RUN",
+    totalItens: Number(row.total_itens),
+  };
+}
+
+export class LotePilotoEmAndamentoError extends Error {
+  constructor(readonly lote: { loteId: string; codigo: string; status: string }) {
+    super(`Já existe lote em andamento para um ou mais profissionais selecionados (${lote.codigo}).`);
+    this.name = "LotePilotoEmAndamentoError";
+  }
+}
+
+async function encontrarLoteConflitante(
+  pool: {
+    query: (text: string, values?: readonly unknown[]) => Promise<{ rows: readonly any[]; rowCount: number | null }>;
+  },
+  professionalIds: readonly string[],
+): Promise<{ loteId: string; codigo: string; status: string } | undefined> {
+  const result = await pool.query(
+    `SELECT DISTINCT l.id, l.codigo, l.status, l.criado_em
+    FROM item_lote_comunicacao i
+    JOIN lote_comunicacao l ON l.id = i.lote_comunicacao_id
+    WHERE i.profissional_id = ANY($1::uuid[])
+      AND i.status IN ('RESERVADO', 'ENFILEIRADO', 'PROCESSANDO', 'ENVIADO', 'FALHOU')
+    ORDER BY l.criado_em DESC
+    LIMIT 1`,
+    [professionalIds],
+  );
+  const row = result.rows[0];
+  return row ? { loteId: row.id, codigo: row.codigo, status: row.status } : undefined;
+}
+
 /** Cockpit com filtros mínimos da seção 6. */
 export type FiltroCockpit =
   | "TODOS"
@@ -275,6 +343,11 @@ export async function prepararLotePiloto(
         `Profissional ${row.codigo_operacional} em status ${row.status} — somente APTO_CONTATO/APTO_PREPOSTAGEM entram em lote.`,
       );
     }
+  }
+
+  const loteExistente = await encontrarLoteConflitante(pool, [...idsUnicos]);
+  if (loteExistente) {
+    throw new LotePilotoEmAndamentoError(loteExistente);
   }
 
   const loteId = randomUUID();

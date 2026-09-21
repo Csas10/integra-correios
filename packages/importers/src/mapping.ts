@@ -32,14 +32,15 @@ export type Campo = (typeof CAMPOS_TODOS)[number];
 
 /**
  * Obrigatoriedade distinta por origem.
- * - PF: campos do workflow de confirmação cadastral (pf-workflow).
- * - PJ: razão social e fantasia, sem dependentes do fluxo PF.
- * ORIGEM é sempre obrigatória (segregação de identidade).
+ * - PF: a origem é definida pelo fluxo de ingestão (endpoint PF), porque a
+ *   planilha institucional CRT não possui coluna ORIGEM. Exigir uma coluna
+ *   inexistente obrigava o operador a criar um mapping semanticamente falso.
+ * - PJ: mantém o contrato legado com ORIGEM explícita nesta etapa.
  */
 export const CAMPOS_OBRIGATORIOS: Readonly<
   Record<OrigemMapeamento, readonly Campo[]>
 > = {
-  PF: ["ORIGEM", "CODIGO", "NOME", "CPF_CNPJ", "ENDERECO_COMPOSTO", "TELEFONE"],
+  PF: ["CODIGO", "NOME", "CPF_CNPJ", "ENDERECO_COMPOSTO", "TELEFONE"],
   PJ: ["ORIGEM", "CODIGO", "NOME", "NOME_FANTASIA", "CPF_CNPJ", "CEP", "LOGRADOURO", "CIDADE", "UF"],
 };
 
@@ -166,8 +167,9 @@ export function validarMapeamento(
  * Fronteira explícita da confirmação do operador. Valida e congela uma cópia
  * do mapeamento; aplicarMapeamento não aceita o contrato estrutural comum.
  *
- * Fluxo institucional PF (base real CRT): a base possui ENDERECO composto
- * (sem CEP/UF/logradouro decompostos), então os obrigatórios PF são
+ * Fluxo institucional PF (base real CRT): a origem PF vem do próprio fluxo,
+ * e a base possui ENDERECO composto (sem CEP/UF/logradouro decompostos).
+ * Portanto os obrigatórios no arquivo são
  * CODIGO/NOME/CPF/ENDERECO_COMPOSTO/TELEFONE. O parsing assistido do
  * endereço (address-parser) sugere a decomposição depois, sempre com
  * endereco_origem preservado e revisão do operador quando ambíguo.

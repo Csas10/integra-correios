@@ -64,6 +64,9 @@ jobs:
           SECURITY_SCAN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: npm run security:pii
 
+      - name: Production dependency audit
+        run: npm audit --omit=dev
+
       - name: Typecheck
         run: npm run typecheck
 

@@ -1,19 +1,19 @@
 export function AppHeader() {
   return (
     <header className="app-header">
-      <div className="brand" aria-label="Integra Correios">
+      <div className="brand" aria-label="Integra Correios — Carteiras Profissionais">
         <span className="brand-mark" aria-hidden="true">
           IC
         </span>
         <span className="brand-copy">
           <strong>Integra Correios</strong>
-          <small>Operação PF e PJ</small>
+          <small>Carteiras Profissionais</small>
         </span>
       </div>
 
-      <div className="environment-chip" aria-label="Ambiente Preview">
+      <div className="environment-chip" aria-label="Ambiente de validação controlada">
         <span aria-hidden="true" />
-        Preview de fundação
+        Validação controlada
       </div>
     </header>
   );

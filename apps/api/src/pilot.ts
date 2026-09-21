@@ -198,17 +198,27 @@ export async function listarProfissionais(
     const issues: string[] = [];
     if (!snapshot.email || !snapshot.email.includes("@")) issues.push("E-mail inválido");
     const endereco = snapshot.endereco ?? {};
-    if (!endereco.logradouro || !endereco.cidade || !endereco.uf) issues.push("Endereço pendente");
+    const enderecoInformado =
+      snapshot.enderecoInformado === true ||
+      Boolean(snapshot.enderecoOrigem) ||
+      Boolean(endereco.logradouro || endereco.numero || endereco.bairro || endereco.cidade || endereco.uf || endereco.cep);
+    if (enderecoInformado && (!endereco.logradouro || !endereco.cidade || !endereco.uf)) {
+      issues.push("Endereço pendente");
+    }
     todos.push({
       id: row.id,
       codigo: row.codigo_operacional,
       nome: snapshot.nome ?? "",
       emailMascarado: snapshot.email ? mascararEmail(snapshot.email) : "—",
       telefoneMascarado: snapshot.telefone ? mascararTelefone(snapshot.telefone) : "—",
-      enderecoClassificacao: issues.includes("Endereço pendente") ? "REVIEW_REQUIRED" : "PARSED",
+      enderecoClassificacao: !enderecoInformado
+        ? "NOT_PROVIDED"
+        : issues.includes("Endereço pendente")
+          ? "REVIEW_REQUIRED"
+          : "PARSED",
       enderecoResumo: endereco.logradouro
         ? `${endereco.logradouro}${endereco.numero ? ", " + endereco.numero : ""} — ${endereco.cidade ?? ""}/${endereco.uf ?? ""}`
-        : (snapshot.enderecoOrigem ?? "—"),
+        : (snapshot.enderecoOrigem || "Não informado"),
       status: row.status,
       issues,
       elegivelComunicacao: row.status === "APTO_CONTATO" || row.status === "APTO_PREPOSTAGEM",

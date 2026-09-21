@@ -77,7 +77,7 @@ export function analisarXlsx(nomeArquivo: string, bytes: Uint8Array, folha?: str
 // ---------------------------------------------------------------------------
 
 export interface StatusEndereco {
-  readonly classificacao: "PARSED" | "REVIEW_REQUIRED" | "INVALID";
+  readonly classificacao: "PARSED" | "REVIEW_REQUIRED" | "INVALID" | "NOT_PROVIDED";
   readonly enderecoOrigem: string;
   readonly issues: readonly string[];
 }
@@ -133,6 +133,37 @@ function opcoesLeitura(folha?: string, linhaCabecalho?: number): OpcoesLeituraXl
   return opcoes;
 }
 
+type AnaliseEndereco = {
+  readonly enderecoOrigem: string;
+  readonly informado: boolean;
+  readonly parsing?: ReturnType<typeof parsearEnderecoComposto>;
+};
+
+function analisarEndereco(
+  valores: Readonly<Partial<Record<Campo, string>>>,
+): AnaliseEndereco {
+  const composto = (valores.ENDERECO_COMPOSTO ?? "").trim();
+  const logradouro = (valores.LOGRADOURO ?? "").trim();
+  const numero = (valores.NUMERO ?? "").trim();
+  const partes = [
+    [logradouro, numero].filter(Boolean).join(", "),
+    (valores.COMPLEMENTO ?? "").trim(),
+    (valores.BAIRRO ?? "").trim(),
+    (valores.CIDADE ?? "").trim(),
+    (valores.UF ?? "").trim(),
+    (valores.CEP ?? "").trim(),
+  ].filter(Boolean);
+  const enderecoOrigem = composto || partes.join(" - ");
+  if (!enderecoOrigem) {
+    return { enderecoOrigem: "", informado: false };
+  }
+  return {
+    enderecoOrigem,
+    informado: true,
+    parsing: parsearEnderecoComposto(enderecoOrigem),
+  };
+}
+
 export function executarPreflight(input: PreflightInput): ResumoPreflight {
   const leitura = lerXlsx(
     { nome: input.nomeArquivo, bytes: input.bytes },
@@ -159,9 +190,8 @@ export function executarPreflight(input: PreflightInput): ResumoPreflight {
     const email = (linha.valores.EMAIL ?? "").trim();
     const telefone = (linha.valores.TELEFONE ?? "").trim();
     const documento = (linha.valores.CPF_CNPJ ?? "").replace(/\D/g, "");
-    const enderecoOrigem = (linha.valores.ENDERECO_COMPOSTO ?? "").trim();
+    const endereco = analisarEndereco(linha.valores);
 
-    if (!codigo) issues.push("CODIGO vazio.");
     if (!nome) issues.push("NOME vazio.");
     const emailOk = email.length > 0 && emailValido(email);
     if (!emailOk) issues.push("E-mail inválido ou ausente.");
@@ -171,10 +201,9 @@ export function executarPreflight(input: PreflightInput): ResumoPreflight {
       issues.push(`Bloqueio: ${alerta}`);
     }
 
-    const parsing = parsearEnderecoComposto(enderecoOrigem);
-    if (parsing.classificacao === "REVIEW_REQUIRED") {
+    if (endereco.parsing?.classificacao === "REVIEW_REQUIRED") {
       issues.push("Endereço requer revisão (decomposição assistida incompleta).");
-    } else if (parsing.classificacao === "INVALID") {
+    } else if (endereco.parsing?.classificacao === "INVALID") {
       issues.push("Endereço inválido/não parseável.");
     }
 
@@ -199,16 +228,16 @@ export function executarPreflight(input: PreflightInput): ResumoPreflight {
       emailValido: emailOk,
       cpfValido: cpfOk,
       endereco: {
-        classificacao: parsing.classificacao,
-        enderecoOrigem,
-        issues: parsing.issues,
+        classificacao: endereco.parsing?.classificacao ?? "NOT_PROVIDED",
+        enderecoOrigem: endereco.enderecoOrigem,
+        issues: endereco.parsing?.issues ?? [],
       },
       issues: duplicada ? [...issues, "Duplicada."] : issues,
       aptoContato,
     });
   }
 
-  const validos = registros.filter((r) => !r.issues.includes("CODIGO vazio.") && r.cpfValido).length;
+  const validos = registros.filter((r) => r.cpfValido).length;
   return {
     sha256: leitura.sha256,
     total: registros.length,
@@ -262,8 +291,9 @@ export interface ResultadoConfirmarImportacao {
  *
  * Idempotência: reimportar o MESMO arquivo (mesmo SHA-256) é determinístico —
  * o arquivo é registrado uma única vez e os profissionais existentes
- * (mesma origem+codigo) não são recriados. Duplicidade de CPF entre
- * códigos diferentes é bloqueada pela UNIQUE (origem, documento_fingerprint).
+ * (mesma origem+codigo ou mesmo fingerprint documental) não são recriados.
+ * Duplicidade de CPF entre códigos diferentes é bloqueada pela UNIQUE
+ * (origem, documento_fingerprint).
  */
 export async function confirmarImportacao(
   command: ConfirmarImportacaoCommand,
@@ -304,14 +334,14 @@ export async function confirmarImportacao(
     const telefone = (linha.valores.TELEFONE ?? "").trim();
     const celular = (linha.valores.CELULAR ?? "").trim();
     const documento = (linha.valores.CPF_CNPJ ?? "").replace(/\D/g, "");
-    const enderecoOrigem = (linha.valores.ENDERECO_COMPOSTO ?? "").trim();
-    const parsing = parsearEnderecoComposto(enderecoOrigem);
+    const endereco = analisarEndereco(linha.valores);
+    const parsing = endereco.parsing;
 
     const issues: string[] = [];
     let statusLinha: "VALIDA" | "PENDENTE" | "INVALIDA" = "VALIDA";
-    if (!codigo || !nome) {
+    if (!nome) {
       statusLinha = "INVALIDA";
-      issues.push("CODIGO/NOME obrigatórios.");
+      issues.push("NOME obrigatório.");
     }
     if (!cpfValido(documento)) {
       statusLinha = statusLinha === "INVALIDA" ? "INVALIDA" : "PENDENTE";
@@ -321,7 +351,7 @@ export async function confirmarImportacao(
       statusLinha = statusLinha === "INVALIDA" ? "INVALIDA" : "PENDENTE";
       issues.push("E-mail inválido.");
     }
-    if (parsing.classificacao !== "PARSED") {
+    if (parsing && parsing.classificacao !== "PARSED") {
       statusLinha = statusLinha === "INVALIDA" ? "INVALIDA" : "PENDENTE";
       issues.push(`Endereço ${parsing.classificacao}.`);
     }
@@ -331,11 +361,13 @@ export async function confirmarImportacao(
     }
 
     const fingerprint = documento ? fingerprinter.fingerprint("cpf-importacao", documento) : null;
+    const profissionalId = randomUUID();
+    const codigoOperacional = codigo || profissionalId;
     const profissionalElegivel =
-      statusLinha !== "INVALIDA" && codigo && fingerprint
+      statusLinha !== "INVALIDA" && fingerprint
         ? {
-            id: randomUUID(),
-            codigoOperacional: codigo,
+            id: profissionalId,
+            codigoOperacional,
             // O preflight + confirmação da importação constituem a triagem
             // operacional desta vertical slice: linha íntegra entra apta ao
             // contato; linha com pendência fica bloqueada para revisão.
@@ -349,15 +381,16 @@ export async function confirmarImportacao(
                 telefone,
                 whatsapp: celular || undefined,
                 endereco: {
-                  logradouro: parsing.sugerido.logradouro,
-                  numero: parsing.sugerido.numero,
-                  complemento: parsing.sugerido.complemento,
-                  bairro: parsing.sugerido.bairro,
-                  cidade: parsing.sugerido.cidade,
-                  uf: parsing.sugerido.uf,
-                  cep: parsing.sugerido.cep,
+                  logradouro: parsing?.sugerido.logradouro ?? "",
+                  numero: parsing?.sugerido.numero ?? "",
+                  complemento: parsing?.sugerido.complemento ?? "",
+                  bairro: parsing?.sugerido.bairro ?? "",
+                  cidade: parsing?.sugerido.cidade ?? "",
+                  uf: parsing?.sugerido.uf ?? "",
+                  cep: parsing?.sugerido.cep ?? "",
                 },
-                enderecoOrigem,
+                enderecoOrigem: endereco.enderecoOrigem,
+                enderecoInformado: endereco.informado,
               }),
               "snapshot:original",
             ),

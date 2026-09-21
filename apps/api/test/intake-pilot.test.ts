@@ -72,6 +72,37 @@ function workbookBytes(): Uint8Array {
   return new Uint8Array(XLSX.write(wb, { type: "buffer", bookType: "xlsx" }));
 }
 
+function workbookBytesSemCodigoSemEndereco(): Uint8Array {
+  const ws = XLSX.utils.aoa_to_sheet([
+    ["CPF", "NOME", "EMAIL", "TELEFONE"],
+    [CPF_SINTETICO_0, "Pessoa Sem Codigo", "sem-codigo@example.test", "7133330001"],
+  ]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "PF");
+  return new Uint8Array(XLSX.write(wb, { type: "buffer", bookType: "xlsx" }));
+}
+
+function workbookBytesComEnderecoIndividual(): Uint8Array {
+  const ws = XLSX.utils.aoa_to_sheet([
+    ["CPF", "NOME", "EMAIL", "TELEFONE", "LOGRADOURO", "NUMERO", "BAIRRO", "CIDADE", "UF", "CEP"],
+    [
+      CPF_SINTETICO_0,
+      "Pessoa Com Endereco Individual",
+      "endereco-individual@example.test",
+      "7133330001",
+      "Rua de Teste",
+      "10",
+      "Centro",
+      "Salvador",
+      "BA",
+      "40020000",
+    ],
+  ]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "PF");
+  return new Uint8Array(XLSX.write(wb, { type: "buffer", bookType: "xlsx" }));
+}
+
 const oldEnv = {
   data: process.env.DATA_ENCRYPTION_KEY_BASE64,
   fp: process.env.DOCUMENT_FINGERPRINT_KEY_BASE64,
@@ -136,5 +167,87 @@ describe("intake PF institucional → triagem operacional", () => {
     expect(commandCapturado.linhas[0].profissional.status).toBe("APTO_CONTATO");
     expect(commandCapturado.linhas[1].statusLinha).toBe("PENDENTE");
     expect(commandCapturado.linhas[1].profissional.status).toBe("PENDENCIA_TRIAGEM");
+  });
+
+  it("aceita PF sem CODIGO e ENDERECO_COMPOSTO, usando UUID interno e APTO_CONTATO", async () => {
+    const bytes = workbookBytesSemCodigoSemEndereco();
+    const mapeamento = [
+      { campo: "CPF_CNPJ" as const, coluna: 0 },
+      { campo: "NOME" as const, coluna: 1 },
+      { campo: "EMAIL" as const, coluna: 2 },
+      { campo: "TELEFONE" as const, coluna: 3 },
+    ];
+
+    const preflight = executarPreflight({
+      nomeArquivo: "pf-sem-codigo-sem-endereco.xlsx",
+      bytes,
+      folha: "PF",
+      mapeamento,
+    });
+    expect(preflight.aptosContato).toBe(1);
+    expect(preflight.registros[0]?.issues).toEqual([]);
+    expect(preflight.registros[0]?.endereco.classificacao).toBe("NOT_PROVIDED");
+
+    process.env.DATA_ENCRYPTION_KEY_BASE64 = Buffer.alloc(32, 1).toString("base64");
+    process.env.DOCUMENT_FINGERPRINT_KEY_BASE64 = Buffer.alloc(32, 2).toString("base64");
+    process.env.DATA_ENCRYPTION_KEY_VERSION = "test-v1";
+
+    let commandCapturado: any;
+    const repository = {
+      async registrarImportacaoPf(command: any) {
+        commandCapturado = command;
+        return {
+          arquivoImportacaoId: "10000000-0000-4000-8000-000000000011",
+          importacaoId: "10000000-0000-4000-8000-000000000012",
+          profissionaisCriados: 1,
+          linhasValidas: 1,
+          linhasPendentes: 0,
+          linhasInvalidas: 0,
+        };
+      },
+    } as unknown as PostgresOperationalRepository;
+
+    await confirmarImportacao(
+      {
+        nomeArquivo: "pf-sem-codigo-sem-endereco.xlsx",
+        bytes,
+        folha: "PF",
+        mapeamento,
+        operador: "teste",
+      },
+      repository,
+    );
+
+    const profissional = commandCapturado.linhas[0].profissional;
+    expect(commandCapturado.linhas[0].statusLinha).toBe("VALIDA");
+    expect(profissional.status).toBe("APTO_CONTATO");
+    expect(profissional.codigoOperacional).toBe(profissional.id);
+  });
+
+  it("compõe ENDERECO_COMPOSTO a partir dos campos individuais", () => {
+    const bytes = workbookBytesComEnderecoIndividual();
+    const mapeamento = [
+      { campo: "CPF_CNPJ" as const, coluna: 0 },
+      { campo: "NOME" as const, coluna: 1 },
+      { campo: "EMAIL" as const, coluna: 2 },
+      { campo: "TELEFONE" as const, coluna: 3 },
+      { campo: "LOGRADOURO" as const, coluna: 4 },
+      { campo: "NUMERO" as const, coluna: 5 },
+      { campo: "BAIRRO" as const, coluna: 6 },
+      { campo: "CIDADE" as const, coluna: 7 },
+      { campo: "UF" as const, coluna: 8 },
+      { campo: "CEP" as const, coluna: 9 },
+    ];
+
+    const preflight = executarPreflight({
+      nomeArquivo: "pf-endereco-individual.xlsx",
+      bytes,
+      folha: "PF",
+      mapeamento,
+    });
+    expect(preflight.aptosContato).toBe(1);
+    expect(preflight.registros[0]?.endereco.classificacao).toBe("PARSED");
+    expect(preflight.registros[0]?.endereco.enderecoOrigem).toContain("Rua de Teste, 10");
+    expect(preflight.registros[0]?.endereco.enderecoOrigem).toContain("Salvador");
   });
 });

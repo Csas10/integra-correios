@@ -89,7 +89,7 @@ describe("mapping institucional da base real (colunas CRT)", () => {
     expect(porCampo.get("ENDERECO_COMPOSTO")?.coluna).toBe(7);
   });
 
-  it("obrigatórios PF satisfazíveis SEM CEP/UF decompostos (ENDERECO_COMPOSTO cobre)", () => {
+  it("mapping PF legado com CODIGO e ENDERECO_COMPOSTO continua válido", () => {
     const mapeamento = {
       itens: [
         { campo: "CODIGO" as const, coluna: 0 },
@@ -117,5 +117,16 @@ describe("mapping institucional da base real (colunas CRT)", () => {
       ],
     };
     expect(validarMapeamento(mapeamento, CABECALHOS_INSTITUCIONAIS.length, "PF")).toEqual([]);
+  });
+
+  it("PF aceita somente os campos realmente necessários", () => {
+    const mapeamento = {
+      itens: [
+        { campo: "NOME" as const, coluna: 0 },
+        { campo: "CPF_CNPJ" as const, coluna: 1 },
+        { campo: "TELEFONE" as const, coluna: 2 },
+      ],
+    };
+    expect(validarMapeamento(mapeamento, 3, "PF")).toEqual([]);
   });
 });

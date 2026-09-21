@@ -344,8 +344,12 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         if (!profissional) continue;
 
         const jaExiste = await sql.query<{ id: string }>(
-          `SELECT id FROM profissional WHERE origem = 'PF' AND codigo_operacional = $1`,
-          [profissional.codigoOperacional],
+          `SELECT id
+          FROM profissional
+          WHERE origem = 'PF'
+            AND (codigo_operacional = $1 OR documento_fingerprint = $2)
+          LIMIT 1`,
+          [profissional.codigoOperacional, linha.documentoFingerprint],
         );
         if (jaExiste.rows[0]) continue;
 

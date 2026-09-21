@@ -315,8 +315,23 @@ describe("sugestão e confirmação de mapeamento", () => {
 
   it("mapeamento sem obrigatórios de PF é rejeitado na origem PF", () => {
     const erros = validarMapeamento({ itens: [{ campo: "NOME", coluna: 0 }] }, 9, "PF");
-    expect(erros.some((e) => e.includes("PF") && e.includes("CODIGO"))).toBe(true);
+    expect(erros.some((e) => e.includes("PF") && e.includes("CPF_CNPJ"))).toBe(true);
+    expect(erros.some((e) => e.includes("TELEFONE"))).toBe(true);
+    expect(erros.some((e) => e.includes("CODIGO"))).toBe(false);
+    expect(erros.some((e) => e.includes("ENDERECO_COMPOSTO"))).toBe(false);
     expect(erros.some((e) => e.includes("ORIGEM"))).toBe(false);
+  });
+
+  it("PF aceita mapping sem CODIGO e ENDERECO_COMPOSTO", () => {
+    const mapeamento: Mapeamento = {
+      itens: [
+        { campo: "NOME", coluna: 0 },
+        { campo: "CPF_CNPJ", coluna: 1 },
+        { campo: "TELEFONE", coluna: 2 },
+      ],
+    };
+    expect(validarMapeamento(mapeamento, 3, "PF")).toEqual([]);
+    expect(() => confirmarMapeamento(mapeamento, 3, "PF")).not.toThrow();
   });
 
   it("obrigatoriedade é DISTINTA por origem (PF exige TELEFONE, PJ não)", () => {

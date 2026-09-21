@@ -35,12 +35,14 @@ export type Campo = (typeof CAMPOS_TODOS)[number];
  * - PF: a origem é definida pelo fluxo de ingestão (endpoint PF), porque a
  *   planilha institucional CRT não possui coluna ORIGEM. Exigir uma coluna
  *   inexistente obrigava o operador a criar um mapping semanticamente falso.
+ *   CODIGO e ENDERECO_COMPOSTO são opcionais: o primeiro recebe o UUID
+ *   interno na persistência e o segundo pode ser composto de campos individuais.
  * - PJ: mantém o contrato legado com ORIGEM explícita nesta etapa.
  */
 export const CAMPOS_OBRIGATORIOS: Readonly<
   Record<OrigemMapeamento, readonly Campo[]>
 > = {
-  PF: ["CODIGO", "NOME", "CPF_CNPJ", "ENDERECO_COMPOSTO", "TELEFONE"],
+  PF: ["NOME", "CPF_CNPJ", "TELEFONE"],
   PJ: ["ORIGEM", "CODIGO", "NOME", "NOME_FANTASIA", "CPF_CNPJ", "CEP", "LOGRADOURO", "CIDADE", "UF"],
 };
 
@@ -181,10 +183,12 @@ export function validarMapeamento(
  *
  * Fluxo institucional PF (base real CRT): a origem PF vem do próprio fluxo,
  * e a base possui ENDERECO composto (sem CEP/UF/logradouro decompostos).
- * Portanto os obrigatórios no arquivo são
- * CODIGO/NOME/CPF/ENDERECO_COMPOSTO/TELEFONE. O parsing assistido do
- * endereço (address-parser) sugere a decomposição depois, sempre com
- * endereco_origem preservado e revisão do operador quando ambíguo.
+ * Portanto os obrigatórios no arquivo são NOME/CPF/TELEFONE. CODIGO pode
+ * faltar (o UUID interno vira o código operacional) e ENDERECO_COMPOSTO pode
+ * faltar quando não há endereço composto na fonte; campos individuais podem
+ * ser compostos pelo intake. O parsing assistido sugere a decomposição
+ * depois, sempre com endereco_origem preservado e revisão do operador quando
+ * ambíguo.
  */
 export function confirmarMapeamento(
   mapeamento: Mapeamento,
@@ -305,8 +309,9 @@ export interface ResultadoValidacaoPfPj {
 
 /**
  * Validação PF/PJ das linhas mapeadas.
- * - ORIGEM deve ser PF ou PJ e corresponder à origem do fluxo.
- * - CEP deve ter 8 dígitos (hífen tolerado).
+ * - ORIGEM, quando presente no fluxo PF, deve ser PF; no fluxo PJ permanece
+ *   obrigatória.
+ * - CEP deve ter 8 dígitos quando o endereço for informado (hífen tolerado).
  * - CPF (PF) e CNPJ (PJ) têm validadores distintos.
  */
 export function validarLinhasPfPj(
@@ -323,14 +328,27 @@ export function validarLinhasPfPj(
     }
 
     const valorOrigem = (linha.valores.ORIGEM ?? "").trim().toUpperCase();
-    if (valorOrigem !== origem) {
+    if ((origem === "PJ" && valorOrigem !== origem) || (origem === "PF" && valorOrigem && valorOrigem !== origem)) {
       erros.push(
         `ORIGEM inválida: "${linha.valores.ORIGEM ?? ""}" (esperado ${origem} para este fluxo).`,
       );
     }
 
+    const enderecoInformado = [
+      "ENDERECO_COMPOSTO",
+      "CEP",
+      "LOGRADOURO",
+      "NUMERO",
+      "COMPLEMENTO",
+      "BAIRRO",
+      "CIDADE",
+      "UF",
+    ].some((campo) => Boolean(linha.valores[campo as Campo]?.trim()));
     const cep = (linha.valores.CEP ?? "").replace(/\D/g, "");
-    if (cep.length !== 8) {
+    if (
+      (origem === "PJ" && cep.length !== 8) ||
+      (origem === "PF" && enderecoInformado && cep.length > 0 && cep.length !== 8)
+    ) {
       erros.push(`CEP inválido: "${linha.valores.CEP ?? ""}" (esperado 8 dígitos).`);
     }
 
@@ -348,7 +366,7 @@ export function validarLinhasPfPj(
       erros.push(`CNPJ inválido: "${linha.valores.CPF_CNPJ ?? ""}".`);
     }
 
-    if (!(linha.valores.CODIGO ?? "").trim()) {
+    if (origem === "PJ" && !(linha.valores.CODIGO ?? "").trim()) {
       erros.push("CODIGO vazio.");
     }
 

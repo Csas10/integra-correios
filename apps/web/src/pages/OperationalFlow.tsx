@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { atualizarSelecaoMapeamento } from "../mapping-state.js";
+import { mensagemErroApi, type ApiErrorBody } from "../api-error.js";
 
 /**
  * Fluxo operacional do operador (Fase B):
@@ -303,9 +304,9 @@ export function OperationalFlow() {
 
   async function chamar(caminho: string, init?: RequestInit): Promise<unknown> {
     const resposta = await fetch(`${API_BASE}${caminho}`, init);
-    const corpo = await resposta.json().catch(() => ({}));
+    const corpo = (await resposta.json().catch(() => ({}))) as ApiErrorBody & Record<string, unknown>;
     if (!resposta.ok) {
-      throw new Error((corpo as { erro?: string }).erro ?? `HTTP ${resposta.status}`);
+      throw new Error(mensagemErroApi(corpo, resposta.status));
     }
     return corpo;
   }

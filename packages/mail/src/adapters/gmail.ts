@@ -1,5 +1,9 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
+  GmailAmbiguousError,
+  GmailAuthError,
+  GmailPermanentPolicyError,
+  GmailRateLimitError,
   MailProviderNaoConfiguradoError,
   MailProviderRequestError,
   type MailGateway,
@@ -370,6 +374,9 @@ export type MailProvider_ = MailProvider;
 
 export const GMAIL_SEND_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
 
+/** Seção 7 — limite de tempo da chamada de envio (sem dependência externa). */
+export const GMAIL_SEND_TIMEOUT_MS = 15_000;
+
 export interface GmailSendResponse {
   readonly id: string;
   readonly threadId?: string;
@@ -398,12 +405,17 @@ export function composeMimeMessage(message: OutboundMail): string {
     ? subject
     : `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
   const boundary = `ic-${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}-${randomBytes(8).toString("hex")}`;
+  // Seção 6 — Message-ID determinístico por communication_id (RFC 5322
+  // msg-id sem aspas angulares, reservado ao provedor): permite detecção de
+  // duplicidade e reconstrução do MIME em casos ambíguos.
+  const messageIdentifier = `${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}.pf-confirmation@pilot.crtba.org.br`;
 
   return [
     `From: ${from}`,
     `Reply-To: ${replyTo}`,
     `To: ${to}`,
     `Subject: ${subjectEncoded}`,
+    `Message-ID: <${messageIdentifier}>`,
     `MIME-Version: 1.0`,
     `Content-Type: multipart/alternative; boundary="${boundary}"`,
     `X-Integra-Confirmation-Id: ${headerSanitize(message.confirmationId)}`,
@@ -442,13 +454,23 @@ export class GmailHttpTransport {
           "content-type": "application/json",
         },
         body,
+        // Seção 7 — timeout: rede lenta não pode segurar o lease indefinidamente.
+        signal: AbortSignal.timeout(GMAIL_SEND_TIMEOUT_MS),
       });
-    } catch {
+    } catch (error) {
+      // Timeout/abort é ambíguo: a requisição pode ter chegado ao Gmail.
+      // Classe dedicada para o worker classificar como DELIVERY_UNKNOWN.
+      if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+        throw new GmailAmbiguousError("messages.send");
+      }
       throw new MailProviderRequestError("GMAIL", "messages.send (rede)");
     }
     if (!response.ok) {
-      // Erro sanitizado: status + código curto; corpo da resposta NUNCA é
-      // propagado (pode conter PII do payload ou detalhes internos).
+      // Erro sanitizado: classe por status + código curto; corpo da resposta
+      // NUNCA é propagado (pode conter PII do payload ou detalhes internos).
+      if (response.status === 401) throw new GmailAuthError("messages.send");
+      if (response.status === 403) throw new GmailPermanentPolicyError("messages.send");
+      if (response.status === 429) throw new GmailRateLimitError("messages.send");
       throw new MailProviderRequestError("GMAIL", `messages.send (HTTP ${response.status})`);
     }
     const data = (await response.json()) as GmailSendResponse;

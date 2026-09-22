@@ -16,6 +16,12 @@ import {
   type ClaimedOutboxItem,
   type GmailOauthCredentialSource,
 } from "@integra-correios/persistence";
+import {
+  GmailAmbiguousError,
+  GmailAuthError,
+  GmailPermanentPolicyError,
+  GmailRateLimitError,
+} from "@integra-correios/mail";
 import { avaliarReadiness, workerPodeExecutar, type ReadinessReport } from "./readiness.js";
 
 /**
@@ -52,9 +58,16 @@ export interface WorkerResult {
 // F7: o gateway sintético agora vive em @integra-correios/mail com provider
 // explícito "DRY_RUN" — nenhum registro persistido pode ser lido como Gmail real.
 
-function mailFromPayload(payload: any): OutboundMail {
+/** (Exportada para testes — construção determinística da mensagem.) */
+export function mailFromPayload(payload: any): OutboundMail {
   const base = new URL(payload.confirmationBaseUrl);
   const confirmUrl = new URL(`/confirma/${encodeURIComponent(payload.plainToken)}`, base).toString();
+  // Seção 6: conteúdo HTML é SEMPRE escapado — nome, endereço e telefone vêm
+  // do XLSX institucional e nunca podem injetar marcação no template.
+  const nomeSeguro = escapeHtml(String(payload.nome ?? ""));
+  const enderecoSeguro = escapeHtml(String(payload.enderecoApresentado ?? ""));
+  const telefoneSeguro = escapeHtml(String(payload.telefone ?? ""));
+  const whatsappSeguro = payload.whatsapp ? escapeHtml(String(payload.whatsapp)) : "";
   // Mesma URL base com decision=ATUALIZAR preservada no token; o form do
   // profissional escolhe CONFIRMAR/ATUALIZAR — uma única URL one-time.
   return {
@@ -71,7 +84,7 @@ function mailFromPayload(payload: any): OutboundMail {
       "Confirme ou atualize seus dados no link seguro:",
       confirmUrl,
     ].join("\n"),
-    htmlBody: `<p>Olá, <strong>${payload.nome}</strong>.</p><p>Confirme ou atualize seus dados cadastrais.</p><p><a href="${confirmUrl}">CONFIRMAR DADOS / ATUALIZAR DADOS</a></p>`,
+    htmlBody: `<p>Olá, <strong>${nomeSeguro}</strong>.</p><p>A CRT-BA precisa confirmar seus dados cadastrais antes do envio da sua Carteira Profissional pelos Correios.</p><p>Endereço registrado: ${enderecoSeguro}</p><p>Telefone: ${telefoneSeguro}${payload.whatsapp ? ` | WhatsApp: ${whatsappSeguro}` : ""}</p><p><a href="${confirmUrl}">CONFIRMAR DADOS / ATUALIZAR DADOS</a></p>`,
     templateVersion: "pf-pilot-crtba-v1",
   };
 }
@@ -170,24 +183,21 @@ export async function processarOutboxUmaVez(
     } catch (error) {
       const codigo = sanitizarErro(error);
       codigosErro.push(codigo);
+      const retryAt = calcularRetryAt(codigo, item.attempts, now);
       await repository.markOutboxFailed({
         outboxId: item.id,
         communicationId: item.communicationId,
         errorCode: codigo,
-        retryAt:
-          item.attempts >= MAX_TENTATIVAS
-            ? new Date(now.getTime() + 30 * 24 * 3_600_000).toISOString()
-            : new Date(now.getTime() + 5 * 60_000).toISOString(),
+        retryAt: retryAt.toISOString(),
         auditEvent: {
           id: crypto.randomUUID(),
           aggregateType: "COMUNICACAO",
           aggregateId: item.communicationId,
           type: "PF_COMMUNICATION_FAILED",
           occurredAt: now.toISOString(),
-          metadata:
-            item.attempts >= MAX_TENTATIVAS
-              ? { codigo, final: true }
-              : { codigo },
+          metadata: retryAt.getTime() - now.getTime() >= 30 * 24 * 3_600_000
+            ? { codigo, final: true }
+            : { codigo },
           eventHash: await hashEvento(item.id, codigo),
         },
       });
@@ -203,13 +213,59 @@ export async function processarOutboxUmaVez(
   };
 }
 
-/** Erro sanitizado: código curto determinístico, sem payload nem PII. */
-function sanitizarErro(error: unknown): string {
+/**
+ * Seção 6 — escape de conteúdo HTML. Padrão idêntico aos templates
+ * homologados (@integra-correios/mail/templates/pf-pilot.ts) — componente
+ * reutilizado por convenção, sem duplicar export público.
+ */
+function escapeHtml(value: string): string {
+  return value.replace(
+    /[&<>"']/g,
+    (character) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        character
+      ] ?? character,
+  );
+}
+
+/**
+ * Erro sanitizado: código curto determinístico, sem payload nem PII.
+ * Seção 7 — classes específicas do transporte Gmail têm precedência sobre a
+ * classificação por mensagem: a categoria orienta o retry do chamador.
+ * (Exportada para testes unitários — função pura, sem secret.)
+ */
+export function sanitizarErro(error: unknown): string {
+  if (error instanceof GmailAuthError) return "AUTH_REQUIRED";
+  if (error instanceof GmailPermanentPolicyError) return "FAILED_PERMANENT";
+  if (error instanceof GmailRateLimitError) return "RATE_LIMITED";
+  if (error instanceof GmailAmbiguousError) return "DELIVERY_UNKNOWN";
   const mensagem = error instanceof Error ? error.message : String(error);
   if (/REAL_SEND_ENABLED/.test(mensagem)) return "SEND_DISABLED";
   if (/não configurado/.test(mensagem)) return "PROVIDER_NOT_CONFIGURED";
   if (/não conectada/.test(mensagem)) return "OAUTH_NOT_CONNECTED";
   return "PROVIDER_ERROR";
+}
+
+/**
+ * Seção 7 — política de retry por código:
+ *  - DELIVERY_UNKNOWN / AUTH_REQUIRED: SEM retry automático (resultado
+ *    ambíguo nunca reenviado durante o piloto; auth exige reconexão humana);
+ *  - RATE_LIMITED: backoff exponencial truncado com jitter;
+ *  - demais falhas: retry curto fixo até MAX_TENTATIVAS.
+ */
+export function calcularRetryAt(codigo: string, tentativas: number, now: Date): Date {
+  if (codigo === "DELIVERY_UNKNOWN" || codigo === "AUTH_REQUIRED") {
+    return new Date(now.getTime() + 30 * 24 * 3_600_000);
+  }
+  if (tentativas >= MAX_TENTATIVAS) {
+    return new Date(now.getTime() + 30 * 24 * 3_600_000);
+  }
+  if (codigo === "RATE_LIMITED") {
+    const backoffMs = Math.min(2 ** tentativas * 60_000, 30 * 60_000);
+    const jitterMs = Math.floor(Math.random() * 30_000);
+    return new Date(now.getTime() + backoffMs + jitterMs);
+  }
+  return new Date(now.getTime() + 5 * 60_000);
 }
 
 async function hashEvento(id: string, sal: string): Promise<string> {
@@ -321,6 +377,28 @@ export async function avaliarReadinessDoProcesso(
     try {
       const repository = new PostgresOperationalRepository(pool);
       return await repository.existeConexaoGmailAtiva();
+    } catch {
+      return false;
+    } finally {
+      await pool.close();
+    }
+  }, async () => {
+    // Seção 5 — REAL_SEND_EXECUTED: evidência vem do ledger de auditoria
+    // existente (aceitação persistida em lote LIVE_PILOT). Sem DSN, falso.
+    if (!env.DATABASE_URL?.trim()) return false;
+    const pool = new NodePostgresPool({ connectionString: env.DATABASE_URL, max: 1 });
+    try {
+      const resultado = await pool.query(
+        `SELECT 1
+         FROM evento_auditoria ea
+         JOIN comunicacao c ON c.id = ea.agregado_id
+           AND ea.agregado_tipo = 'COMUNICACAO'
+         JOIN lote_comunicacao lc ON lc.id = c.lote_comunicacao_id
+         WHERE ea.tipo = 'PF_COMMUNICATION_ACCEPTED'
+           AND lc.modo = 'LIVE_PILOT'
+         LIMIT 1`,
+      );
+      return (resultado.rowCount ?? 0) > 0;
     } catch {
       return false;
     } finally {

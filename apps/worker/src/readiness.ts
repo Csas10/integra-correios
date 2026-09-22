@@ -16,6 +16,7 @@ export type ReadinessStatus =
   | "DISABLED"
   | "CONFIGURATION_REQUIRED"
   | "BLOCKED_EXTERNAL"
+  | "EXECUTED"
   | "ERROR";
 
 export interface ReadinessItem {
@@ -84,11 +85,15 @@ export async function avaliarDatabase(
 /**
  * Readiness completo a partir do ambiente. `sondarDatabase` injeta a checagem
  * real (SELECT 1) para que este módulo permaneça puro e testável.
+ * `lerLedgerEnvioReal` injeta a consulta ao ledger de auditoria que detecta
+ * PF_COMMUNICATION_ACCEPTED persistido em modo LIVE_PILOT — evidência de que
+ * um envio real já aconteceu. Sem banco (ou sem prova), permanece falso.
  */
 export async function avaliarReadiness(
   env: Environment,
   sondarDatabase: () => Promise<boolean>,
   lerConexaoOauth?: () => Promise<boolean>,
+  lerLedgerEnvioReal?: () => Promise<boolean>,
 ): Promise<ReadinessReport> {
   // F2: quando o chamador injeta a leitura da oauth_connection persistida,
   // o status CONNECTED passa a refletir a conexão real (não mais um
@@ -102,6 +107,9 @@ export async function avaliarReadiness(
   const oauthStatus = oauthStatusFromEnvironment(env, await (lerConexaoOauth?.() ?? Promise.resolve(false)));
   const realSendEnabled = env.REAL_SEND_ENABLED === "true";
   const pilotMode = env.PILOT_MODE === "true";
+  // Seção 5 — REAL_SEND_EXECUTED: derivado do ledger de auditoria existente
+  // (PF_COMMUNICATION_ACCEPTED em lote LIVE_PILOT). Nenhum mecanismo novo.
+  const realSendExecuted = realSendEnabled && Boolean(await (lerLedgerEnvioReal?.() ?? Promise.resolve(false)));
   // F-GMAIL: modo controlado — transporte real restrito a destinatário
   // controlado configurado fora do Git (defesa independente do GATE 1).
   const controlledMode = env.GMAIL_CONTROLLED_MODE === "true";
@@ -147,12 +155,18 @@ export async function avaliarReadiness(
     : item("Gmail transport", "DISABLED", "Transporte real bloqueado (REAL_SEND_ENABLED=false).");
 
   const realSend = realSendEnabled
-    ? item(
-        "Real send",
-        "BLOCKED_EXTERNAL",
-        "GATE 1 ativo; envio real exige GATE 2 (lote ATIVO por decisão humana).",
-        "Titular libera o lote (PREPARACAO → ATIVO) para o piloto one-time.",
-      )
+    ? realSendExecuted
+      ? item(
+          "Real send",
+          "EXECUTED",
+          "Envio real já registrado no ledger (PF_COMMUNICATION_ACCEPTED em LIVE_PILOT).",
+        )
+      : item(
+          "Real send",
+          "BLOCKED_EXTERNAL",
+          "GATE 1 ativo; envio real exige GATE 2 (lote ATIVO por decisão humana).",
+          "Titular libera o lote (PREPARACAO → ATIVO) para o piloto one-time.",
+        )
     : item("Real send", "DISABLED", "Envio real desabilitado por política desta fase.");
 
   const executionMode: ReadinessReport["executionMode"] = realSendEnabled

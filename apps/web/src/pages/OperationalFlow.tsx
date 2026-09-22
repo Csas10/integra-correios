@@ -1017,6 +1017,14 @@ export function OperationalFlow() {
                   readiness.gmailTransport,
                   readiness.gmailOauth,
                   readiness.realSend,
+                  {
+                    name: "Real send executed",
+                    status: readiness.realSend.status === "EXECUTED" ? "EXECUTED" : "DISABLED",
+                    detail:
+                      readiness.realSend.status === "EXECUTED"
+                        ? "Existe aceite real registrado no ledger de auditoria."
+                        : "Nenhum envio real registrado (REAL_SEND_EXECUTED=false).",
+                  },
                   readiness.ppn,
                 ] as ReadinessItem[]
               ).map((item) => (

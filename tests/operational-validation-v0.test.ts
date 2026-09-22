@@ -328,6 +328,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
         mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: new Date().toISOString(),
         auditEvent: {
@@ -497,6 +498,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
         mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: new Date().toISOString(),
         auditEvent: {
@@ -605,6 +607,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           origin: "PF",
           templateVersion: "pf-confirmation-v1",
           mode: "DRY_RUN",
+          source: "INSTITUCIONAL_XLSX",
           createdBy: "validacao-v0",
           createdAt: new Date().toISOString(),
           auditEvent: {
@@ -713,6 +716,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
         mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: agora,
         auditEvent: {
@@ -882,6 +886,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
         mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: new Date().toISOString(),
         auditEvent: {
@@ -990,6 +995,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
         mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: agora,
         auditEvent: {
@@ -1115,6 +1121,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           origin: "PF",
           templateVersion: "pf-confirmation-v1",
           mode: "DRY_RUN",
+          source: "INSTITUCIONAL_XLSX",
           createdBy: "validacao-v0",
           createdAt: agora,
           auditEvent: {
@@ -1416,6 +1423,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         origin: "PF",
         templateVersion: "pf-pilot-crtba-v1",
         mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: agora,
         auditEvent: {
@@ -1545,6 +1553,7 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         origin: "PF",
         templateVersion: "pf-pilot-crtba-v1",
         mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "teste-fechamento",
         createdAt: agora,
         auditEvent: {

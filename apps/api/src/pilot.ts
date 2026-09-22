@@ -12,6 +12,7 @@ import {
   type CommunicationSource,
   type EncryptedValue,
 } from "@integra-correios/persistence";
+import { executarWorkerUmaVezLive } from "@integra-correios/worker";
 
 /**
  * Piloto PF — seleção com hard cap SERVER-SIDE, preview e criação
@@ -888,6 +889,221 @@ export async function prepararLoteTesteControlado(
     codigo: CODIGO_LOTE_TESTE_CONTROLADO,
     totalItens: 1,
     estado,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// ATIVAÇÃO + EXECUÇÃO LIVE CONTROLADA (uma única mensagem).
+//
+// Ativação: reutiliza o mecanismo auditado existente (CAS PREPARACAO → ATIVO
+// + PF_LOTE_COMUNICACAO_ATIVADO). Restrita ao lote CONTROLLED_GMAIL_TEST.
+//
+// Execução: run-once LIVE com pré-voo fail-closed — exatamente 1 comunicação,
+// zero receipts Gmail globais, nenhum outro lote ATIVO e nenhuma pendência fora
+// do teste. Nenhum loop e nenhum retry automático (DELIVERY_UNKNOWN/
+// AUTH_REQUIRED/FAILED_PERMANENT interrompem; o motor existente já impede
+// retry desses códigos).
+// ---------------------------------------------------------------------------
+
+export class BloqueioExecucaoControladaError extends Error {
+  constructor(
+    readonly codigo: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BloqueioExecucaoControladaError";
+  }
+}
+
+/**
+ * Ativa (CAS PREPARACAO → ATIVO) exclusivamente o lote CONTROLLED_GMAIL_TEST,
+ * com pré-voo idêntico ao da preparação (outbox/lotes fora do teste zerados).
+ * A confirmação humana textual é validada pelo chamador (rota da API).
+ */
+export async function ativarLoteControlado(
+  command: { loteId: string; operador: string },
+  repository: Pick<PostgresOperationalRepository, "ativarLoteComunicacao">,
+  pool: PoolConsulta,
+  politica: PoliticaControlada,
+): Promise<{ resultCode: string; status: string; loteId: string }> {
+  if (!politica.controlledMode) {
+    throw new BloqueioLoteControladoError(
+      "CONTROLLED_MODE_REQUIRED",
+      "GMAIL_CONTROLLED_MODE deve estar ativo para ativar o lote controlado.",
+    );
+  }
+  if (!politica.controlledRecipient) {
+    throw new BloqueioLoteControladoError(
+      "CONTROLLED_RECIPIENT_REQUIRED",
+      "GMAIL_CONTROLLED_RECIPIENT não configurado — destinatário controlado ausente.",
+    );
+  }
+  if (politica.realSendEnabled === false) {
+    // Ativação SEM armamento é permitida (gate humano antecipado), mas a
+    // execução LIVE continua impossível enquanto REAL_SEND_ENABLED=false.
+  }
+  const estado = await lerEstadoLoteControlado(pool);
+  if (estado.outboxPendenteForaDoTeste > 0) {
+    throw new BloqueioLoteControladoError(
+      "OUTBOX_PENDING_OUTSIDE_TEST",
+      `Outbox pendente fora do teste: ${estado.outboxPendenteForaDoTeste}.`,
+    );
+  }
+  if (estado.outboxProcessamento > 0) {
+    throw new BloqueioLoteControladoError(
+      "OUTBOX_PROCESSING",
+      `Outbox em processamento: ${estado.outboxProcessamento}.`,
+    );
+  }
+  if (estado.lotesAtivosForaDoTeste > 0) {
+    throw new BloqueioLoteControladoError(
+      "ACTIVE_BATCHES_OUTSIDE_TEST",
+      `Lotes ATIVOS fora do teste: ${estado.lotesAtivosForaDoTeste}.`,
+    );
+  }
+  if (!estado.lote || estado.lote.loteId !== command.loteId) {
+    throw new BloqueioLoteControladoError(
+      "LOTE_CONTROLADO_INEXISTENTE",
+      "Lote controlado inexistente ou loteId divergente do canônico.",
+    );
+  }
+  if (estado.lote.status === "ATIVO") {
+    return { resultCode: "ALREADY_ACTIVE", status: "ATIVO", loteId: command.loteId };
+  }
+  if (estado.lote.status !== "PREPARACAO") {
+    throw new BloqueioLoteControladoError(
+      "INVALID_STATE",
+      `Lote controlado em status ${estado.lote.status} não pode ser ativado.`,
+    );
+  }
+  const agora = new Date().toISOString();
+  const resultado = await repository.ativarLoteComunicacao({
+    batchId: command.loteId,
+    origin: "PF",
+    actorId: command.operador,
+    activatedAt: agora,
+    auditEvent: {
+      id: randomUUID(),
+      aggregateType: "LOTE_COMUNICACAO",
+      aggregateId: command.loteId,
+      type: "PF_LOTE_COMUNICACAO_ATIVADO",
+      actorId: command.operador,
+      occurredAt: agora,
+      metadata: { totalItens: estado.lote.totalItens, finalidade: "envio-controlado-unico" },
+      eventHash: hashEvento(command.loteId, agora),
+    },
+  });
+  return { resultCode: resultado.resultCode, status: resultado.status, loteId: command.loteId };
+}
+
+export interface ResultadoExecucaoControlada {
+  readonly executionMode: "CONTROLLED_GMAIL_TEST";
+  readonly communicationId: string;
+  readonly estadoComunicacao: string;
+  readonly sentItems: number;
+  readonly falhas: number;
+}
+
+export type ExecucaoLiveControlada = typeof executarWorkerUmaVezLive;
+
+/**
+ * Executa o worker LIVE run-once com pré-voo fail-closed. Nunca chama o Gmail
+ * quando qualquer condição diverge; executa exatamente UMA iteração (sem loop,
+ * sem retry — o motor classifica DELIVERY_UNKNOWN/AUTH_REQUIRED e para).
+ */
+export async function executarWorkerControladoUmaVez(
+  pool: PoolConsulta,
+  politica: PoliticaControlada,
+  executarLive: ExecucaoLiveControlada = executarWorkerUmaVezLive,
+): Promise<ResultadoExecucaoControlada> {
+  if (!politica.controlledMode) {
+    throw new BloqueioExecucaoControladaError(
+      "CONTROLLED_MODE_REQUIRED",
+      "GMAIL_CONTROLLED_MODE inativo — execução LIVE controlada bloqueada.",
+    );
+  }
+  if (!politica.realSendEnabled) {
+    throw new BloqueioExecucaoControladaError(
+      "REAL_SEND_DISABLED",
+      "REAL_SEND_ENABLED=false — o envio real não está armado.",
+    );
+  }
+  if (!politica.controlledRecipient) {
+    throw new BloqueioExecucaoControladaError(
+      "CONTROLLED_RECIPIENT_REQUIRED",
+      "GMAIL_CONTROLLED_RECIPIENT ausente — executar apenas com REAL_SEND_ENABLED=false.",
+    );
+  }
+  const preflight = await pool.query(
+    `SELECT
+      (SELECT count(*) FROM comunicacao c JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1) AS comunicacoes_teste,
+      (SELECT c.id FROM comunicacao c JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1 LIMIT 1) AS communication_id,
+      (SELECT count(*) FROM comunicacao c WHERE c.provider = 'GMAIL') AS receipts_globais,
+      (SELECT count(*) FROM lote_comunicacao l WHERE l.status = 'ATIVO' AND l.codigo <> $1) AS ativos_fora,
+      (SELECT count(*) FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE o.status IN ('PENDING', 'FAILED') AND l.codigo <> $1) AS pendente_fora,
+      (SELECT count(*) FROM outbox_email o WHERE o.status = 'PROCESSING') AS processamento,
+      (SELECT modo FROM lote_comunicacao WHERE codigo = $1) AS modo,
+      (SELECT status FROM lote_comunicacao WHERE codigo = $1) AS status_lote`,
+    [CODIGO_LOTE_TESTE_CONTROLADO],
+  );
+  const p = preflight.rows[0] ?? {};
+  if (Number(p.comunicacoes_teste ?? 0) !== 1) {
+    throw new BloqueioExecucaoControladaError(
+      "COMMUNICATION_COUNT_INVALID",
+      `Lote controlado deve ter exatamente 1 comunicação (encontrado ${Number(p.comunicacoes_teste ?? 0)}).`,
+    );
+  }
+  if (Number(p.receipts_globais ?? 0) > 0) {
+    throw new BloqueioExecucaoControladaError(
+      "RECEIPT_ALREADY_EXISTS",
+      "Já existe receipt Gmail registrado — nenhum segundo envio é permitido.",
+    );
+  }
+  if (Number(p.ativos_fora ?? 0) > 0) {
+    throw new BloqueioExecucaoControladaError(
+      "ACTIVE_BATCHES_OUTSIDE_TEST",
+      `Lotes ATIVOS fora do teste: ${Number(p.ativos_fora)}.`,
+    );
+  }
+  if (Number(p.pendente_fora ?? 0) > 0 || Number(p.processamento ?? 0) > 0) {
+    throw new BloqueioExecucaoControladaError(
+      "OUTBOX_NOT_SETTLED",
+      "Outbox pendente/processing fora do teste — executar apenas com fila zerada.",
+    );
+  }
+  if (p.modo !== "LIVE_PILOT" || p.status_lote !== "ATIVO") {
+    throw new BloqueioExecucaoControladaError(
+      "BATCH_NOT_ACTIVE",
+      `Lote controlado deve estar ATIVO em LIVE_PILOT (atual: ${p.status_lote ?? "—"}/${p.modo ?? "—"}).`,
+    );
+  }
+
+  // EXATAMENTE UMA execução run-once. O motor LIVE aplica GATE 1/2 e o gate
+  // controlado por comunicação (fonte + destinatário) imediatamente antes de
+  // users.messages.send; nenhum retry automático acontece.
+  await executarLive({ env: process.env });
+
+  const posflight = await pool.query(
+    `SELECT c.id AS communication_id, c.status AS estado,
+      (SELECT count(*) FROM comunicacao c2 WHERE c2.provider = 'GMAIL') AS receipts_globais
+    FROM comunicacao c
+    JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+    WHERE l.codigo = $1
+    LIMIT 1`,
+    [CODIGO_LOTE_TESTE_CONTROLADO],
+  );
+  const s = posflight.rows[0] ?? {};
+  return {
+    executionMode: "CONTROLLED_GMAIL_TEST",
+    communicationId: String(s.communication_id ?? ""),
+    estadoComunicacao: String(s.estado ?? "UNKNOWN"),
+    sentItems: Number(s.receipts_globais ?? 0) > 0 ? 1 : 0,
+    falhas: Number(s.receipts_globais ?? 0) > 0 || s.estado === "FAILED" ? 0 : 1,
   };
 }
 

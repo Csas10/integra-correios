@@ -21,7 +21,10 @@ import {
   type PreflightInput,
 } from "./intake.js";
 import {
+  BloqueioExecucaoControladaError,
   CODIGO_LOTE_HISTORICO_DRY_RUN,
+  ativarLoteControlado,
+  executarWorkerControladoUmaVez,
   validarCancelamentoLoteHistorico,
 } from "./pilot.js";
 import {
@@ -824,6 +827,94 @@ const ROTAS: readonly Rota[] = [
   },
 
   // ------------------------------------------------------------------
+  // ATIVAÇÃO AUDITADA do lote CONTROLLED_GMAIL_TEST — OPERATOR_ROUTE. Ação
+  // humana deliberada com confirmação textual; reutiliza o CAS de ativação
+  // existente (PF_LOTE_COMUNICACAO_ATIVADO) restrito ao lote canônico.
+  // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/pilot/controlled/activate",
+    handler: async (req, res, _url, corpo) => {
+      if (!exigirOperador(req, res)) return;
+      const { pool, repository } = requireDb();
+      const body = JSON.parse(corpo.toString("utf8") || "{}") as {
+        loteId?: string;
+        confirmacao?: string;
+      };
+      if (!body.loteId || !body.confirmacao) {
+        json(res, 422, {
+          erro: "loteId e confirmação humana obrigatórios.",
+          codigo: "BLOCKED_ACTIVATE_INPUT",
+        });
+        return;
+      }
+      const confirmacaoEsperada =
+        "AUTORIZO ATIVAR O LOTE CONTROLLED_GMAIL_TEST PARA ENVIO REAL CONTROLADO " +
+        "DE UMA ÚNICA MENSAGEM AO DESTINATÁRIO SOB MEU CONTROLE";
+      if (body.confirmacao.trim() !== confirmacaoEsperada) {
+        json(res, 422, {
+          erro: "Confirmação humana não corresponde ao texto obrigatório.",
+          codigo: "BLOCKED_ACTIVATE_CONFIRMATION",
+        });
+        return;
+      }
+      try {
+        const resultado = await ativarLoteControlado(
+          { loteId: body.loteId, operador: "operador-autenticado" },
+          repository,
+          pool,
+          carregarPoliticaControlada(),
+        );
+        json(res, 200, {
+          resultado,
+          aviso:
+            "Lote controlado ATIVO. O envio em si permanece bloqueado até REAL_SEND_ENABLED=true (redeploy do Preview).",
+        });
+      } catch (error) {
+        if (error instanceof BloqueioLoteControladoError) {
+          json(res, 409, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 500, { erro: "Falha na ativação do lote controlado." });
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // ENVIO LIVE CONTROLADO — OPERATOR_ROUTE, exatamente UMA tentativa.
+  // Pré-voo fail-closed server-side; nenhum retry e nenhuma segunda chamada.
+  // A rota DRY_RUN (/api/pilot/worker/run-once) permanece intocada.
+  // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/pilot/controlled/execute",
+    handler: async (req, res) => {
+      if (!exigirOperador(req, res)) return;
+      const { pool } = requireDb();
+      if (process.env.REAL_SEND_ENABLED !== "true") {
+        json(res, 409, {
+          erro: "REAL_SEND_ENABLED=false — envio real não está armado.",
+          codigo: "REAL_SEND_DISABLED",
+        });
+        return;
+      }
+      try {
+        const resultado = await executarWorkerControladoUmaVez(
+          pool,
+          carregarPoliticaControlada(),
+        );
+        json(res, 200, { resultado, aviso: "Execução run-once concluída; desarmar REAL_SEND_ENABLED imediatamente." });
+      } catch (error) {
+        if (error instanceof BloqueioExecucaoControladaError) {
+          json(res, 409, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 500, { erro: "Falha na execução controlada." });
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
   // CANCELAMENTO AUDITADO do lote DRY_RUN histórico — OPERATOR_ROUTE,
   // ação humana deliberada com confirmação específica. Fail-closed:
   //   - somente o lote EXATO PF-MAIL-PILOTO-MUB37G1H (código + ATIVO/DRY_RUN);
@@ -935,6 +1026,8 @@ const ROTAS: readonly Rota[] = [
       }
       // F6: dryRun=true HARDCODED server-side. Não há caminho de request
       // para o envio real — executarWorkerUmaVezLive não é exposto aqui.
+      // (O LIVE controlado vive exclusivamente em /api/pilot/controlled/execute,
+      // com pré-voo próprio e gates GATE 1/2 + modo controlado por comunicação.)
       const resultado = await executarWorkerUmaVez({ env: process.env });
       json(res, 200, {
         modo: resultado.resultado?.modo ?? "DRY_RUN",

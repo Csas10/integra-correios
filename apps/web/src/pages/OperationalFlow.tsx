@@ -259,6 +259,10 @@ export function OperationalFlow() {
     confirmacao: string;
     resultado: string | null;
   }>({ aberto: false, confirmacao: "", resultado: null });
+  const [ativacaoControlada, setAtivacaoControlada] = useState<{
+    confirmacao: string;
+    resultado: string | null;
+  }>({ confirmacao: "", resultado: null });
   const [outbox, setOutbox] = useState<OutboxItem[]>([]);
   const [readiness, setReadiness] = useState<ReadinessReport | null>(null);
   const [gmail, setGmail] = useState<GmailIntegracao | null>(null);
@@ -687,6 +691,61 @@ export function OperationalFlow() {
       await carregarEstadoControlado();
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha no cancelamento do lote histórico.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  // Ativação auditada do lote CONTROLLED_GMAIL_TEST (CAS + PF_LOTE_COMUNICACAO_ATIVADO).
+  const CONFIRMACAO_ATIVACAO_CONTROLADA_UI =
+    "AUTORIZO ATIVAR O LOTE CONTROLLED_GMAIL_TEST PARA ENVIO REAL CONTROLADO " +
+    "DE UMA ÚNICA MENSAGEM AO DESTINATÁRIO SOB MEU CONTROLE";
+  async function ativarLoteControladoUI() {
+    if (!estadoControlado?.lote) return;
+    if (ativacaoControlada.confirmacao.trim() !== CONFIRMACAO_ATIVACAO_CONTROLADA_UI) return;
+    setOcupado(true);
+    setErro(undefined);
+    try {
+      const resposta = (await chamar("/api/pilot/controlled/activate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          loteId: estadoControlado.lote.loteId,
+          confirmacao: ativacaoControlada.confirmacao.trim(),
+        }),
+      })) as { aviso?: string };
+      setAtivacaoControlada({ confirmacao: "", resultado: resposta.aviso ?? "Lote controlado ATIVO." });
+      await carregarEstadoControlado();
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha na ativação do lote controlado.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  // Execução LIVE run-once: exatamente UMA tentativa de envio controlado.
+  async function executarEnvioControlado() {
+    setOcupado(true);
+    setErro(undefined);
+    try {
+      const resposta = (await chamar("/api/pilot/controlled/execute", {
+        method: "POST",
+      })) as {
+        resultado?: { communicationId: string; estadoComunicacao: string; sentItems: number };
+        aviso?: string;
+      };
+      const r = resposta.resultado;
+      setAtivacaoControlada((atual) => ({
+        ...atual,
+        resultado:
+          resposta.aviso ??
+          (r
+            ? `Execução concluída: comunicação ${r.estadoComunicacao} (enviadas: ${r.sentItems}).`
+            : "Execução concluída."),
+      }));
+      await carregarEstadoControlado();
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha na execução controlada.");
     } finally {
       setOcupado(false);
     }
@@ -1142,6 +1201,66 @@ export function OperationalFlow() {
                   Preparar lote de teste controlado
                 </button>
               </div>
+              {estadoControlado.lote && estadoControlado.lote.status === "PREPARACAO" && (
+                <div className="flow-stats">
+                  <p>
+                    <strong>Ativar lote controlado</strong> — registra a liberação humana auditada
+                    (PF_LOTE_COMUNICACAO_ATIVADO). Não envia nada; o envio só acontece depois de
+                    REAL_SEND_ENABLED=true no Preview e da execução run-once explícita.
+                  </p>
+                  <p>
+                    Cole exatamente a frase:
+                    <br />
+                    <code>{CONFIRMACAO_ATIVACAO_CONTROLADA_UI}</code>
+                  </p>
+                  <input
+                    value={ativacaoControlada.confirmacao}
+                    onChange={(e) =>
+                      setAtivacaoControlada((atual) => ({ ...atual, confirmacao: e.target.value }))
+                    }
+                    placeholder="Cole a frase de autorização aqui"
+                    disabled={ocupado}
+                    style={{ width: "100%" }}
+                  />
+                  <div className="flow-filters">
+                    <button
+                      type="button"
+                      onClick={ativarLoteControladoUI}
+                      disabled={
+                        ocupado || ativacaoControlada.confirmacao.trim() !== CONFIRMACAO_ATIVACAO_CONTROLADA_UI
+                      }
+                    >
+                      Ativar lote controlado (auditado)
+                    </button>
+                  </div>
+                </div>
+              )}
+              {estadoControlado.lote && estadoControlado.lote.status === "ATIVO" && (
+                <div className="flow-stats">
+                  <p>
+                    <strong>Envio real controlado</strong> — executa o worker run-once UMA única vez
+                    para o lote ATIVO (exatamente 1 comunicação, destinatário controlado). Sem loop e
+                    sem retry. Após qualquer resultado, REAL_SEND_ENABLED deve voltar a false.
+                  </p>
+                  <div className="flow-filters">
+                    <button
+                      type="button"
+                      onClick={executarEnvioControlado}
+                      disabled={
+                        ocupado ||
+                        !gmail.realSendEnabled ||
+                        estadoControlado.lote.receiptAnterior ||
+                        estadoControlado.outboxPendenteForaDoTeste > 0 ||
+                        estadoControlado.outboxProcessamento > 0 ||
+                        estadoControlado.lotesAtivosForaDoTeste > 0
+                      }
+                    >
+                      Executar envio controlado (uma única vez)
+                    </button>
+                  </div>
+                </div>
+              )}
+              {ativacaoControlada.resultado && <p>{ativacaoControlada.resultado}</p>}
             </div>
           )}
         </details>

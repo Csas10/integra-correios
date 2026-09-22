@@ -11,12 +11,14 @@ import type {
   BatchActivationState,
   BatchMode,
   ClaimedOutboxItem,
+  CommunicationSource,
   ConsumeOauthFlowBindingCommand,
   ConfirmationContext,
   ConfirmationOutcomeResult,
   CreateProfessionalCommand,
   EnqueueCommunicationBatchCommand,
   FailOutboxCommand,
+  GmailControlledSendCommand,
   GmailOauthCredentialSource,
   OauthFlowBindingConsumeResult,
   QueryResult,
@@ -229,8 +231,8 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         await sql.query(
           `INSERT INTO comunicacao (
             id, profissional_id, confirmacao_id, lote_comunicacao_id, origem, provider,
-            destinatario_fingerprint, template_versao, idempotency_key, status, criada_em
-          ) VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, 'QUEUED', $9)`,
+            destinatario_fingerprint, template_versao, idempotency_key, status, fonte_registro, criada_em
+          ) VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, 'QUEUED', $9, $10)`,
           [
             item.communicationId,
             item.professionalId,
@@ -240,6 +242,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
             item.recipientFingerprint,
             command.templateVersion,
             item.idempotencyKey,
+            command.source,
             command.createdAt,
           ],
         );
@@ -508,7 +511,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         payload_auth_tag: Uint8Array;
         chave_versao: string;
         tentativas: number;
-        modo: string;
+        fonte: string | null;
       }>(
         `WITH candidatas AS (
           SELECT outbox.id
@@ -531,7 +534,9 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         WHERE outbox.id = candidatas.id
         RETURNING outbox.id, outbox.comunicacao_id, outbox.idempotency_key,
           outbox.payload_ciphertext, outbox.payload_nonce, outbox.payload_auth_tag,
-          outbox.chave_versao, outbox.tentativas`,
+          outbox.chave_versao, outbox.tentativas,
+          (SELECT comunicacao.fonte_registro FROM comunicacao
+            WHERE comunicacao.id = outbox.comunicacao_id) AS fonte`,
         [now, limit, workerId],
       );
       if (result.rows.length > 0) {
@@ -567,6 +572,9 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         },
         attempts: row.tentativas,
         modo: (modoPorComunicacao.get(row.comunicacao_id) ?? "DRY_RUN") as BatchMode,
+        // FINAL CLOSURE GATE item 2: origem do registro — 0006 backfills
+        // 'INSTITUCIONAL_XLSX'; default conservador idêntico.
+        fonte: (row.fonte ?? "INSTITUCIONAL_XLSX") as CommunicationSource,
       }));
     });
   }
@@ -1056,13 +1064,79 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
   // atomicamente. O nonce em claro NUNCA é persistido.
   // -------------------------------------------------------------------------
 
+  async verificarEnvioControlado(
+    command: GmailControlledSendCommand,
+  ): Promise<{ ok: true } | { ok: false; motivo: string }> {
+    // FINAL CLOSURE GATE item 2 — GATE 2 REAL (não apenas readiness):
+    // verificação server-side imediatamente antes de users.messages.send.
+    // Falha fechada: qualquer divergência → zero chamadas ao Gmail.
+    if (command.fonte !== "CONTROLADO_SINTETICO") {
+      return { ok: false, motivo: "SOURCE_NOT_SYNTHETIC" };
+    }
+    const controlado = (process.env.GMAIL_CONTROLLED_RECIPIENT ?? "").trim().toLowerCase();
+    if (!controlado) {
+      return { ok: false, motivo: "CONTROLLED_RECIPIENT_MISSING" };
+    }
+    // Normalização RFC 5322 mínima: extrai endereço de "Nome <a@b>".
+    const endereco = /<([^>]+)>/.exec(command.destinatario)?.[1] ?? command.destinatario;
+    if (endereco.trim().toLowerCase() !== controlado) {
+      return { ok: false, motivo: "RECIPIENT_MISMATCH" };
+    }
+    if (!command.oauthPronto) {
+      return { ok: false, motivo: "OAUTH_NOT_READY" };
+    }
+    // Lote ATIVO, exatamente 1 item, liberação humana auditada
+    // (PF_LOTE_COMUNICACAO_ATIVADO) e ausência de receipt Gmail anterior —
+    // tudo derivado do banco, na mesma consulta.
+    const estado = await this.pool.query<{
+      lote_status: string;
+      total_itens: string;
+      ativacoes: string;
+      receipts: string;
+    }>(
+      `SELECT
+        l.status AS lote_status,
+        (SELECT count(*) FROM item_lote_comunicacao i WHERE i.lote_comunicacao_id = l.id) AS total_itens,
+        (SELECT count(*) FROM evento_auditoria ea
+          WHERE ea.agregado_tipo = 'LOTE_COMUNICACAO' AND ea.agregado_id = l.id
+            AND ea.tipo = 'PF_LOTE_COMUNICACAO_ATIVADO') AS ativacoes,
+        (SELECT count(*) FROM comunicacao c2
+          WHERE c2.lote_comunicacao_id = l.id AND c2.provider = 'GMAIL') AS receipts
+      FROM comunicacao c
+      JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+      WHERE c.id = $1`,
+      [command.communicationId],
+    );
+    const linha = estado.rows[0];
+    if (!linha) return { ok: false, motivo: "COMMUNICATION_NOT_FOUND" };
+    if (linha.lote_status !== "ATIVO") return { ok: false, motivo: "BATCH_NOT_ACTIVE" };
+    if (Number(linha.total_itens) !== 1) return { ok: false, motivo: "CONTROLLED_BATCH_SIZE" };
+    if (Number(linha.ativacoes) < 1) return { ok: false, motivo: "HUMAN_RELEASE_NOT_AUDITED" };
+    if (Number(linha.receipts) > 0) return { ok: false, motivo: "PREVIOUS_RECEIPT" };
+    return { ok: true };
+  }
+
   async registrarBindingOauthFlow(command: RegisterOauthFlowBindingCommand): Promise<void> {
     if (!/^[0-9a-f]{64}$/.test(command.nonceHash)) {
       throw new Error("nonceHash deve ser SHA-256 hex (64 caracteres)");
     }
+    if (!/^[0-9a-f]{64}$/.test(command.operadorHash)) {
+      throw new Error("operadorHash deve ser SHA-256 hex (64 caracteres)");
+    }
+    // FINAL CLOSURE GATE item 1: o code_verifier PKCE fica NO BANCO (cifrado,
+    // AES-256-GCM) — nunca no state/browser. O hash do operador ancora a
+    // sessão do START; callback divergente é rejeitado (SESSION_MISMATCH).
     await this.pool.query(
-      `INSERT INTO oauth_flow (nonce_hash, expira_em) VALUES ($1, $2)`,
-      [command.nonceHash, command.expiresAt],
+      `INSERT INTO oauth_flow (
+        nonce_hash, code_verifier_ciphertext, code_verifier_nonce,
+        code_verifier_auth_tag, code_verifier_chave_versao, operador_hash, expira_em
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        command.nonceHash,
+        ...encryptedParameters(command.codeVerifier),
+        command.operadorHash,
+        command.expiresAt,
+      ],
     );
   }
 
@@ -1072,30 +1146,66 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
     if (!/^[0-9a-f]{64}$/.test(command.nonceHash)) {
       throw new Error("nonceHash deve ser SHA-256 hex (64 caracteres)");
     }
+    if (!/^[0-9a-f]{64}$/.test(command.operadorHash)) {
+      throw new Error("operadorHash deve ser SHA-256 hex (64 caracteres)");
+    }
     // Consumo one-time ATÔMICO: o UPDATE com RETURNING vence exatamente uma
-    // vez mesmo com callbacks concorrentes (row lock do UPDATE). Replay,
-    // expiração e nonce desconhecido falham fechados.
-    const result = await this.pool.query<{ id: string }>(
+    // vez mesmo com callbacks concorrentes (row lock do UPDATE) e EXIGE o
+    // MESMO operador do START. Replay, expiração, nonce desconhecido e
+    // sessão divergente falham fechados.
+    const result = await this.pool.query<{
+      id: string;
+      code_verifier_ciphertext: Uint8Array;
+      code_verifier_nonce: Uint8Array;
+      code_verifier_auth_tag: Uint8Array;
+      code_verifier_chave_versao: string;
+    }>(
       `UPDATE oauth_flow
-      SET consumida_em = $2
+      SET consumida_em = $3
       WHERE nonce_hash = $1
+        AND operador_hash = $2
         AND consumida_em IS NULL
-        AND expira_em > $2
-      RETURNING id`,
-      [command.nonceHash, command.now],
+        AND expira_em > $3
+      RETURNING id, code_verifier_ciphertext, code_verifier_nonce,
+        code_verifier_auth_tag, code_verifier_chave_versao`,
+      [command.nonceHash, command.operadorHash, command.now],
     );
-    if (result.rows.length > 0) return "CONSUMED";
-    // Não consumiu: distinguir MISSING de EXPIRED de REPLAY.
+    const row = result.rows[0];
+    if (row) {
+      if (
+        !row.code_verifier_ciphertext ||
+        !row.code_verifier_nonce ||
+        !row.code_verifier_auth_tag
+      ) {
+        // Binding pré-PKCE (sem verifier): fail-closed, nunca consumido.
+        return { status: "SESSION_MISMATCH" };
+      }
+      return {
+        status: "CONSUMED",
+        codeVerifierSealed: {
+          ciphertext: row.code_verifier_ciphertext,
+          nonce: row.code_verifier_nonce,
+          authTag: row.code_verifier_auth_tag,
+          keyVersion: row.code_verifier_chave_versao,
+        },
+      };
+    }
+    // Não consumiu: distinguir MISSING/EXPIRED/REPLAY/SESSION_MISMATCH.
     const estado = await this.pool.query<{
       consumida_em: Date | null;
       expira_em: Date;
-    }>(`SELECT consumida_em, expira_em FROM oauth_flow WHERE nonce_hash = $1`, [
+      operador_hash: string | null;
+    }>(`SELECT consumida_em, expira_em, operador_hash FROM oauth_flow WHERE nonce_hash = $1`, [
       command.nonceHash,
     ]);
-    const row = estado.rows[0];
-    if (!row) return "MISSING";
-    if (row.consumida_em !== null) return "REPLAY";
-    return row.expira_em.getTime() <= new Date(command.now).getTime() ? "EXPIRED" : "MISSING";
+    const registro = estado.rows[0];
+    if (!registro) return { status: "MISSING" };
+    if (registro.consumida_em !== null) return { status: "REPLAY" };
+    if (registro.expira_em.getTime() <= new Date(command.now).getTime()) {
+      return { status: "EXPIRED" };
+    }
+    if (registro.operador_hash !== command.operadorHash) return { status: "SESSION_MISMATCH" };
+    return { status: "MISSING" };
   }
 }
 

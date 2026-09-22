@@ -21,6 +21,11 @@ export interface OutboundMail {
   readonly textBody: string;
   readonly htmlBody: string;
   readonly templateVersion: string;
+  /**
+   * FINAL CLOSURE GATE item 2 — id da comunicação (chave da outbox) para o
+   * GATE 2 do modo controlado, derivado do payload pelo worker.
+   */
+  readonly communicationId?: string;
 }
 
 export interface MailReceipt {

@@ -9,6 +9,7 @@ import {
   type PostgresOperationalRepository,
   type CommunicationBatchItem,
   type AuditEventInput,
+  type CommunicationSource,
   type EncryptedValue,
 } from "@integra-correios/persistence";
 
@@ -291,6 +292,8 @@ export interface PrepararLoteCommand {
   readonly operador: string;
   readonly confirmationBaseUrl: string;
   readonly confirmationTtlMs?: number;
+  /** Origem dos registros do lote (FINAL CLOSURE GATE item 2). */
+  readonly source: CommunicationSource;
 }
 
 export interface ResultadoPrepararLote {
@@ -396,6 +399,7 @@ export async function prepararLotePiloto(
       whatsapp: snapshot.whatsapp,
       plainToken: token.plainToken,
       confirmationId,
+      communicationId,
       confirmationBaseUrl: command.confirmationBaseUrl,
     };
 
@@ -428,6 +432,7 @@ export async function prepararLotePiloto(
     origin: "PF",
     templateVersion: PF_PILOT_TEMPLATE_VERSION,
     mode: "DRY_RUN",
+    source: command.source,
     createdBy: command.operador,
     createdAt: agora,
     auditEvent: {

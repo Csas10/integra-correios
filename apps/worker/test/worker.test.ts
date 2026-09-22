@@ -143,6 +143,7 @@ d("executarWorkerUmaVez (motor completo, PostgreSQL real)", () => {
         origin: "PF",
         templateVersion: "pf-pilot-crtba-v1",
         mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "worker-test",
         createdAt: agora,
         auditEvent: {
@@ -277,6 +278,7 @@ d("executarWorkerUmaVez (motor completo, PostgreSQL real)", () => {
         origin: "PF",
         templateVersion: "pf-pilot-crtba-v1",
         mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "worker-test",
         createdAt: agora,
         auditEvent: {

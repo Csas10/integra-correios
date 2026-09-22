@@ -35,6 +35,7 @@ import {
   concluirFluxoOauth,
   contaGmailEsperada,
   hdOrganizacionalEsperado,
+  hashOperadorGmail,
   OauthFlowError,
   oauthConfigurado,
 } from "./oauth.js";
@@ -617,6 +618,7 @@ const ROTAS: readonly Rota[] = [
             professionalIds: selecao.professionalIds,
             operador: "operador-autenticado",
             confirmationBaseUrl: process.env.CONFIRMATION_BASE_URL ?? "https://preview.exemplo.test",
+            source: "INSTITUCIONAL_XLSX",
           },
           repository,
           pool,
@@ -920,20 +922,29 @@ const ROTAS: readonly Rota[] = [
       if (!exigirOperador(req, res)) return;
       try {
         const origin = process.env.CONFIRMATION_BASE_URL?.trim() || `${url.protocol}//${url.host}`;
-        // F18: binding one-time registrado em PostgreSQL — START em qualquer
-        // instância é consumível pelo CALLBACK em qualquer outra.
+        // F18 + closure item 1: binding one-time registrado em PostgreSQL —
+        // START em qualquer instância é consumível pelo CALLBACK em qualquer
+        // outra. O verifier PKCE fica CIFRADO no banco; o hash do operador
+        // ancora a sessão no cookie HttpOnly (nunca o token).
+        const tokenOperador = process.env.OPERATOR_TOKEN?.trim() ?? "";
+        if (!tokenOperador) {
+          throw new OauthFlowError("OPERATOR_TOKEN_MISSING", "OPERATOR_TOKEN ausente.");
+        }
+        const operadorHash = hashOperadorGmail(tokenOperador);
         const { repository } = requireDb();
         const { url: consentUrl, expiresAt, bindingNonce } = await iniciarFluxoOauth(
           origin,
           repository,
+          new Date(),
+          { caixa: caixa(), operadorHash },
         );
-        // F13: nonce de binding no cookie HttpOnly do fluxo — consumido
-        // one-time pelo callback; nenhum secret na URL além do state OAuth.
+        // F13: cookie HttpOnly do fluxo com <nonce>:<operadorHash> — consumido
+        // one-time pelo callback; nenhum secret no cookie, URL ou log.
         json(
           res,
           200,
           { authorizationUrl: consentUrl, expiresAt },
-          { "set-cookie": bindingCookie(bindingNonce) },
+          { "set-cookie": bindingCookie(`${bindingNonce}:${operadorHash}`) },
         );
       } catch (error) {
         if (error instanceof OauthFlowError) {

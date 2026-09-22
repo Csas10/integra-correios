@@ -75,6 +75,8 @@ export interface EnqueueCommunicationBatchCommand {
   readonly templateVersion: string;
   /** Modo de execução do lote — persistido em lote_comunicacao.modo (F7). */
   readonly mode: BatchMode;
+  /** Origem do registro de cada comunicação (GATE 2, item 2 do closure). */
+  readonly source: CommunicationSource;
   readonly createdBy: string;
   readonly createdAt: string;
   readonly auditEvent: AuditEventInput;
@@ -104,6 +106,14 @@ export interface BatchActivationState {
     | "ALREADY_SENT";
 }
 
+/**
+ * FINAL CLOSURE GATE item 2 — origem persistida do registro da comunicação:
+ *  - CONTROLADO_SINTETICO: registro sintético do modo controlado;
+ *  - INSTITUCIONAL_XLSX: proveniente do upload do XLSX institucional.
+ * backfill 0006 → linhas pré-existentes = INSTITUCIONAL_XLSX (conservador).
+ */
+export type CommunicationSource = "CONTROLADO_SINTETICO" | "INSTITUCIONAL_XLSX";
+
 export interface ClaimedOutboxItem {
   readonly id: string;
   readonly communicationId: string;
@@ -112,6 +122,8 @@ export interface ClaimedOutboxItem {
   readonly attempts: number;
   /** Modo do lote de origem (F7): inequívoco também na memória do worker. */
   readonly modo: BatchMode;
+  /** Origem do registro (GATE 2): sintético controlado vs XLSX institucional. */
+  readonly fonte: CommunicationSource;
 }
 
 export interface StoredOauthConnection {
@@ -161,16 +173,37 @@ export interface GmailOauthCredentialSource {
 export interface RegisterOauthFlowBindingCommand {
   /** SHA-256 hex do nonce de binding (o nonce em claro NUNCA é persistido). */
   readonly nonceHash: string;
+  /** Envelope AES-256-GCM do code_verifier PKCE: o valor em claro NUNCA é
+   * persistido nem transportado pelo state/browser (FINAL CLOSURE GATE item
+   * 1) — o callback autenticado recupera-o do banco para a troca do código. */
+  readonly codeVerifier: EncryptedValue;
+  /** SHA-256 hex da identidade do operador do START (derivada server-side do
+   * OPERATOR_TOKEN): callback de sessão divergente é rejeitado. */
+  readonly operadorHash: string;
   readonly expiresAt: string;
 }
 
 export interface ConsumeOauthFlowBindingCommand {
   readonly nonceHash: string;
+  /** SHA-256 hex da identidade do operador do callback — deve ser idêntica
+   * à do START, sob pena de SESSION_MISMATCH. */
+  readonly operadorHash: string;
   readonly now: string;
 }
 
-/** Resultado do consumo atômico do binding one-time. */
-export type OauthFlowBindingConsumeResult = "CONSUMED" | "MISSING" | "EXPIRED" | "REPLAY";
+/** Status do consumo atômico do binding one-time. */
+export type OauthFlowBindingConsumeStatus =
+  | "CONSUMED"
+  | "MISSING"
+  | "EXPIRED"
+  | "REPLAY"
+  | "SESSION_MISMATCH";
+
+/** Resultado do consumo: em CONSUMED devolve o envelope cifrado do verifier. */
+export interface OauthFlowBindingConsumeResult {
+  readonly status: OauthFlowBindingConsumeStatus;
+  readonly codeVerifierSealed?: EncryptedValue;
+}
 
 /**
  * Atualização segura do access token renovado (F3): persiste o novo envelope
@@ -181,6 +214,24 @@ export interface RefreshedOauthTokenCommand {
   readonly accountFingerprint: string;
   readonly accessToken: EncryptedValue;
   readonly expiresAt: string;
+}
+
+/**
+ * FINAL CLOSURE GATE item 2 — comando da verificação do GATE 2 (modo
+ * controlado): executada IMEDIATAMENTE antes de users.messages.send,
+ * no caminho LIVE. Estado do lote (ATIVO, exatamente 1 item), liberação
+ * humana auditada e receipt anterior são DERIVADOS NO BANCO; fonte,
+ * destinatário e OAuth chegam do caminho de execução.
+ */
+export interface GmailControlledSendCommand {
+  /** Fonte declarada do registro (sintético vs XLSX institucional). */
+  readonly fonte: CommunicationSource;
+  /** Comunicação a enviar (id). */
+  readonly communicationId: string;
+  /** Destinatário em claro da mensagem a enviar (RFC 5322). */
+  readonly destinatario: string;
+  /** OAuth da conta esperada está pronto (config + conexão). */
+  readonly oauthPronto: boolean;
 }
 
 // ===========================================================================

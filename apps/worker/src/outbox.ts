@@ -6,6 +6,7 @@ import {
   derivarFingerprintContaGmail,
   loadGmailOauthConfig,
   type MailGateway,
+  type MailReceipt,
   type OutboundMail,
 } from "@integra-correios/mail";
 import {
@@ -86,6 +87,8 @@ export function mailFromPayload(payload: any): OutboundMail {
     ].join("\n"),
     htmlBody: `<p>Olá, <strong>${nomeSeguro}</strong>.</p><p>A CRT-BA precisa confirmar seus dados cadastrais antes do envio da sua Carteira Profissional pelos Correios.</p><p>Endereço registrado: ${enderecoSeguro}</p><p>Telefone: ${telefoneSeguro}${payload.whatsapp ? ` | WhatsApp: ${whatsappSeguro}` : ""}</p><p><a href="${confirmUrl}">CONFIRMAR DADOS / ATUALIZAR DADOS</a></p>`,
     templateVersion: "pf-pilot-crtba-v1",
+    // GATE 2 (modo controlado): id da comunicação para a verificação pré-send.
+    communicationId: payload.communicationId,
   };
 }
 
@@ -327,7 +330,16 @@ export function criarAccessTokenProvider(
 export function criarGatewayDoAmbiente(
   env: Readonly<Record<string, string | undefined>> = process.env,
   dryRun: boolean = false,
-  opcoes: { credentials?: GmailOauthCredentialSource; repository?: PostgresOperationalRepository; caixa?: Aes256GcmSecretBox } = {},
+  opcoes: {
+    credentials?: GmailOauthCredentialSource;
+    repository?: PostgresOperationalRepository;
+    caixa?: Aes256GcmSecretBox;
+    /** GATE 2 (modo controlado): verificação por comunicação antes do send. */
+    gateControlado?: (
+      communicationId: string,
+      destinatario: string,
+    ) => Promise<{ ok: true } | { ok: false; motivo: string }>;
+  } = {},
 ): MailGateway {
   const realSendEnabled = env.REAL_SEND_ENABLED === "true";
   if (dryRun || !realSendEnabled) {
@@ -343,9 +355,29 @@ export function criarGatewayDoAmbiente(
       return new DisabledMailGateway("GMAIL");
     }
     const loadAccessToken = criarAccessTokenProvider(env, credentials, caixa, repository);
+    // GATE 2: quando o modo controlado está ativo, cada envio passa pela
+    // verificação (fonte sintética, destinatário controlado, lote ATIVO de
+    // 1 item, liberação auditada, sem receipt) ANTES da chamada ao Gmail.
+    const gate = opcoes.gateControlado;
+    const transporteComGate: (message: OutboundMail, accessToken: string) => Promise<MailReceipt> =
+      gate
+        ? async (message, accessToken) => {
+            const communicationId = message.communicationId ?? "";
+            const veredito = await gate(communicationId, message.to);
+            if (!veredito.ok) {
+              // Zero chamadas ao Gmail: a divergência é recusada ANTES do
+              // transporte. Erro classificado como permanente (sem retry).
+              throw new GmailPermanentPolicyError(`controlled-gate: ${veredito.motivo}`);
+            }
+            return transporte.send(message, accessToken);
+          }
+        : (message, accessToken) => transporte.send(message, accessToken);
     return new GmailMailGateway(
-      (message, accessToken) => transporte.send(message, accessToken),
+      transporteComGate,
       loadAccessToken,
+      () => new Date(),
+      // GATE 1 honra o AMBIENTE INJETADO (não o process.env do processo).
+      env,
     );
   }
   return new DisabledMailGateway("GMAIL");
@@ -457,10 +489,26 @@ async function executarWorkerDoModo(
       env.DATA_ENCRYPTION_KEY_VERSION ?? "v1",
     );
     const repository = new PostgresOperationalRepository(pool);
+    // FINAL CLOSURE GATE item 2 — modo controlado: GATE 2 REAL por
+    // comunicação, imediatamente antes de users.messages.send (somente no
+    // caminho LIVE; o DRY_RUN nunca chama o Gmail de qualquer forma).
+    const controlledMode = env.GMAIL_CONTROLLED_MODE === "true";
+    const controlledRecipient = (env.GMAIL_CONTROLLED_RECIPIENT ?? "").trim();
     const gateway = criarGatewayDoAmbiente(env, !live, {
       credentials: repository,
       repository,
       caixa,
+      ...(live && controlledMode && controlledRecipient
+        ? {
+            gateControlado: (communicationId: string, destinatario: string) =>
+              repository.verificarEnvioControlado({
+                fonte: "CONTROLADO_SINTETICO",
+                communicationId,
+                destinatario,
+                oauthPronto: readiness.gmailOauth.status === "READY",
+              }),
+          }
+        : {}),
     });
     const resultado = await processarOutboxUmaVez(
       opcoes.workerId ?? `worker-${process.pid}`,

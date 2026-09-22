@@ -83,6 +83,7 @@ describe("recovery do lote piloto", () => {
         professionalIds: ["20000000-0000-4000-8000-000000000001"],
         operador: "teste",
         confirmationBaseUrl: "https://preview.example.test",
+        source: "INSTITUCIONAL_XLSX",
       },
       {} as PostgresOperationalRepository,
       pool,

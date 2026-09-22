@@ -377,6 +377,22 @@ export const GMAIL_SEND_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/
 /** Seção 7 — limite de tempo da chamada de envio (sem dependência externa). */
 export const GMAIL_SEND_TIMEOUT_MS = 15_000;
 
+/**
+ * FINAL CLOSURE GATE item 3 — extrai APENAS o `reason` curto (ex.:
+ * "rateLimitExceeded") do corpo de erro do Google. O corpo NUNCA é
+ * propagado, logado ou persistido — apenas esta classificação.
+ */
+export async function extrairReasonGoogle(response: Response): Promise<string> {
+  try {
+    const data = (await response.json()) as {
+      error?: { errors?: readonly { reason?: string }[] };
+    };
+    return data?.error?.errors?.[0]?.reason ?? "";
+  } catch {
+    return "";
+  }
+}
+
 export interface GmailSendResponse {
   readonly id: string;
   readonly threadId?: string;
@@ -468,9 +484,22 @@ export class GmailHttpTransport {
     if (!response.ok) {
       // Erro sanitizado: classe por status + código curto; corpo da resposta
       // NUNCA é propagado (pode conter PII do payload ou detalhes internos).
+      // FINAL CLOSURE GATE item 3 — nem todo 403 é permanente: o `reason`
+      // sanitizado do Google decide entre rate-limit (retryable) e política.
       if (response.status === 401) throw new GmailAuthError("messages.send");
-      if (response.status === 403) throw new GmailPermanentPolicyError("messages.send");
       if (response.status === 429) throw new GmailRateLimitError("messages.send");
+      if (response.status >= 500) {
+        // Piloto: resultado incerto — a requisição pode ter chegado ao Gmail.
+        throw new GmailAmbiguousError("messages.send");
+      }
+      if (response.status === 403) {
+        const reason = (await extrairReasonGoogle(response)).toLowerCase();
+        if (reason === "ratelimitexceeded" || reason === "userratelimitexceeded") {
+          throw new GmailRateLimitError("messages.send");
+        }
+        // domainPolicy, escopo insuficiente, política administrativa etc.
+        throw new GmailPermanentPolicyError("messages.send");
+      }
       throw new MailProviderRequestError("GMAIL", `messages.send (HTTP ${response.status})`);
     }
     const data = (await response.json()) as GmailSendResponse;

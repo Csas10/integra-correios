@@ -128,6 +128,7 @@ describe("repositório PostgreSQL operacional", () => {
       origin: "PF",
       templateVersion: "pf-confirmation-v1",
       mode: "DRY_RUN",
+      source: "INSTITUCIONAL_XLSX",
       createdBy: "teste",
       createdAt: "2026-09-16T00:00:00.000Z",
       auditEvent: audit,

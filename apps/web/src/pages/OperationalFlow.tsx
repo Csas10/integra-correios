@@ -137,6 +137,16 @@ interface ReadinessReport {
   executionMode: string;
 }
 
+interface GmailIntegracao {
+  status: string;
+  escopo: string;
+  contaEsperadaConfigurada: boolean;
+  hdOrganizacionalConfigurado: boolean;
+  realSendEnabled: boolean;
+  controlledMode: boolean;
+  mensagem: string;
+}
+
 interface WorkerRun {
   modo?: string;
   resultado?: {
@@ -227,6 +237,7 @@ export function OperationalFlow() {
   } | null>(null);
   const [outbox, setOutbox] = useState<OutboxItem[]>([]);
   const [readiness, setReadiness] = useState<ReadinessReport | null>(null);
+  const [gmail, setGmail] = useState<GmailIntegracao | null>(null);
   const [workerRun, setWorkerRun] = useState<WorkerRun | null>(null);
   const [ativacao, setAtivacao] = useState<string | null>(null);
   const [sessao, setSessao] = useState<EstadoSessao>({ status: "DESCONHECIDO" });
@@ -489,11 +500,49 @@ export function OperationalFlow() {
     }
   }
 
+  // Painel Integração Gmail: conexão real é gate humano (consent Google);
+  // desconexão é ação explícita e auditada. Nenhum secret atravessa a UI.
+  async function conectarGmail() {
+    setOcupado(true);
+    try {
+      const resposta = (await chamar("/api/oauth/gmail/start")) as { authorizationUrl: string };
+      window.location.assign(resposta.authorizationUrl);
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha ao iniciar o fluxo OAuth.");
+      setOcupado(false);
+    }
+  }
+
+  async function desconectarGmail() {
+    setOcupado(true);
+    try {
+      await chamar("/api/oauth/gmail/connection", { method: "DELETE" });
+      await carregarReadiness();
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha ao desconectar a conta.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  async function verificarGmail() {
+    setOcupado(true);
+    try {
+      setGmail((await chamar("/api/oauth/gmail/status")) as GmailIntegracao);
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha ao verificar a integração.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
   const carregarReadiness = useCallback(async () => {
     try {
       setReadiness((await chamar("/api/readiness")) as ReadinessReport);
+      setGmail((await chamar("/api/oauth/gmail/status")) as GmailIntegracao);
     } catch {
       setReadiness(null);
+      setGmail(null);
     }
   }, []);
 
@@ -897,6 +946,49 @@ export function OperationalFlow() {
             Preparar comunicações ({previews.quantidade}/{previews.maximo})
           </button>
         </section>
+      )}
+
+      {gmail && (
+        <details className="flow-panel flow-diagnostics" open>
+          <summary id="gmail-title">Integração Gmail</summary>
+          <p>
+            Estado do transporte institucional. Nenhum secret, token ou endereço de e-mail é exibido.
+          </p>
+          <ul className="flow-stats">
+            <li>Transporte: <code>{gmail.realSendEnabled ? "READY" : "DISABLED"}</code></li>
+            <li>OAuth: <code>{gmail.status}</code></li>
+            <li>Envio real: <code>{gmail.realSendEnabled ? "ARMED (GATE 1 ativo)" : "DISABLED"}</code></li>
+            <li>Modo controlado: <code>{gmail.controlledMode ? "ACTIVE" : "OFF"}</code></li>
+            <li>Escopo concedido: <code>{gmail.escopo}</code></li>
+            <li>
+              Conta esperada configurada: <code>{gmail.contaEsperadaConfigurada ? "SIM" : "NÃO"}</code>
+              {" · Domínio organizacional: "}
+              <code>{gmail.hdOrganizacionalConfigurado ? "SIM" : "NÃO"}</code>
+            </li>
+          </ul>
+          <p>{gmail.mensagem}</p>
+          <div className="flow-filters">
+            <button type="button" onClick={verificarGmail} disabled={ocupado}>
+              Verificar integração
+            </button>
+            {gmail.status === "CONNECTED" ? (
+              <button type="button" onClick={conectarGmail} disabled={ocupado}>
+                Reconectar Gmail
+              </button>
+            ) : (
+              <button type="button" onClick={conectarGmail} disabled={ocupado}>
+                Conectar Gmail
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={desconectarGmail}
+              disabled={ocupado || gmail.status !== "CONNECTED"}
+            >
+              Desconectar Gmail
+            </button>
+          </div>
+        </details>
       )}
 
       {readiness && (

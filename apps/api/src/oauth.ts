@@ -4,6 +4,7 @@ import {
   derivarFingerprintContaGmail,
   exchangeAuthorizationCode,
   fetchGoogleAccountIdentity,
+  gerarParPkce,
   loadGmailOauthConfig,
   OauthStateSigner,
   OauthIdentityError,
@@ -65,6 +66,16 @@ export function contaGmailEsperada(env: Environment = ambiente()): string {
   return esperada ?? "";
 }
 
+/**
+ * Domínio organizacional esperado (Google Workspace "hd"). Opcional: quando
+ * configurado, contas fora do domínio são rejeitadas mesmo com e-mail
+ * idêntico (defesa em profundidade contra mudança de conta no Google).
+ */
+export function hdOrganizacionalEsperado(env: Environment = ambiente()): string {
+  const hd = env.GMAIL_EXPECTED_HD?.trim().toLowerCase();
+  return hd ?? "";
+}
+
 /** Chave de assinatura do state: exigida do ambiente (fail-closed). */
 function signer(): OauthStateSigner {
   const chaveB64 = process.env.GMAIL_OAUTH_STATE_KEY?.trim();
@@ -87,6 +98,36 @@ function signer(): OauthStateSigner {
 /** SHA-256 hex do nonce de binding — o valor bruto NUNCA é persistido/logado. */
 function hashDeNonce(nonce: string): string {
   return createHash("sha256").update(nonce, "utf8").digest("hex");
+}
+
+/**
+ * Nonce OIDC por fluxo: prova que o authorization response corresponde à
+ * MESMA sessão que iniciou o consentimento (anti replay do código).
+ *server-side: o valor bruto nunca é logado; vai apenas à URL de consentimento.
+ */
+function gerarNonceOidc(): string {
+  return randomBytes(24).toString("base64url");
+}
+
+/**
+ * Payload do binding transportado pelo state assinado (e pelo cookie):
+ *  <bindingNonce>:<codeVerifier> — o code_verifier PKCE da MESMA sessão.
+ * O separador do payload é ":" (base64url não contém dois-pontos; o
+ * delimitador do state permanece "."). O banco recebe apenas o SHA-256 do
+ * bindingNonce; o verificador viaja assinado no state e volta no callback
+ * (nunca em log, nunca ao browser).
+ */
+function montarBindingPayload(bindingNonce: string, codeVerifier: string): string {
+  return `${bindingNonce}:${codeVerifier}`;
+}
+
+function partesDoBinding(bindingPayload: string): { bindingNonce: string; codeVerifier: string } | undefined {
+  const separador = bindingPayload.indexOf(":");
+  if (separador <= 0 || separador === bindingPayload.length - 1) return undefined;
+  return {
+    bindingNonce: bindingPayload.slice(0, separador),
+    codeVerifier: bindingPayload.slice(separador + 1),
+  };
 }
 
 /**
@@ -131,13 +172,18 @@ export async function iniciarFluxoOauth(
   // Nonce de alta entropia; o MESMO valor vai no state assinado e no cookie,
   // e apenas seu HASH é registrado one-time no banco.
   const bindingNonce = randomBytes(32).toString("base64url");
+  // PKCE (S256): verificador permanece server-side e viaja ASSINADO dentro do
+  // state (payload bindingNonce.codeVerifier) — o callback da mesma sessão o
+  // recupera na troca do código. Nunca em log, cookie separado ou browser.
+  const { codeVerifier, codeChallenge } = gerarParPkce();
+  const oidcNonce = gerarNonceOidc();
   const expiraEm = new Date(agora.getTime() + OAUTH_FLOW_TTL_MS);
   await bindingStore.registrarBindingOauthFlow({
     nonceHash: hashDeNonce(bindingNonce),
     expiresAt: expiraEm.toISOString(),
   });
-  const { state, expiresAt } = signer().issue(agora, bindingNonce);
-  const url = buildAuthorizationUrl(config, state);
+  const { state, expiresAt } = signer().issue(agora, montarBindingPayload(bindingNonce, codeVerifier));
+  const url = buildAuthorizationUrl(config, state, { codeChallenge, oidcNonce });
   return { url, expiresAt, bindingNonce };
 }
 
@@ -146,18 +192,19 @@ export async function iniciarFluxoOauth(
  *  1. formato do state;
  *  2. assinatura HMAC (timing-safe);
  *  3. expiração server-side;
- *  4. nonce extraído do state assinado;
+ *  4. binding extraído do state assinado;
  *  5. igualdade timing-safe state↔cookie;
  *  6. SOMENTE DEPOIS o consumo atômico no banco (one-time real entre
  *     instâncias). Nada é consumido antes da validação completa.
  * Cookie ausente/divergente/replay/expirado → FAIL (fail-closed).
+ * Retorna o code_verifier PKCE transportado no state assinado.
  */
 export async function validarBindingState(
   bindingCookie: string | undefined,
   state: string,
   bindingStore: OauthFlowBindingStore,
   agora: Date = new Date(),
-): Promise<void> {
+): Promise<string> {
   if (!bindingCookie?.trim()) {
     throw new OauthFlowError("STATE_BINDING_MISSING", "Binding do fluxo OAuth ausente — inicie o fluxo autenticado.");
   }
@@ -165,8 +212,9 @@ export async function validarBindingState(
   if (partes.length !== 3) {
     throw new OauthFlowError("STATE_INVALID", "State OAuth inválido.");
   }
-  const nonce = partes[0] ?? "";
-  if (!nonce) {
+  const bindingPayload = partes[0] ?? "";
+  const binding = partesDoBinding(bindingPayload);
+  if (!binding) {
     throw new OauthFlowError("STATE_INVALID", "State OAuth inválido.");
   }
   // Assinatura + expiração ANTES de qualquer acesso à persistência: um state
@@ -175,7 +223,7 @@ export async function validarBindingState(
     throw new OauthFlowError("STATE_INVALID", "State OAuth inválido ou expirado.");
   }
   // Igualdade timing-safe entre o nonce do state e o cookie do fluxo.
-  const a = Buffer.from(nonce);
+  const a = Buffer.from(binding.bindingNonce);
   const b = Buffer.from(bindingCookie.trim());
   if (a.length !== b.length || !timingSafeIgual(a, b)) {
     throw new OauthFlowError("STATE_BINDING_MISMATCH", "State não corresponde ao fluxo iniciado.");
@@ -183,7 +231,7 @@ export async function validarBindingState(
   // Último passo: consumo ONE-TIME atômico no banco. Exatamente um callback
   // vence; replay/expiração/nonce desconhecido falham fechados.
   const bindingStatus = await bindingStore.consumirBindingOauthFlow({
-    nonceHash: hashDeNonce(nonce),
+    nonceHash: hashDeNonce(binding.bindingNonce),
     now: agora.toISOString(),
   });
   if (bindingStatus === "REPLAY") {
@@ -195,6 +243,7 @@ export async function validarBindingState(
   if (bindingStatus !== "CONSUMED") {
     throw new OauthFlowError("STATE_BINDING_MISSING", "Binding não originado por um START autorizado.");
   }
+  return binding.codeVerifier;
 }
 
 function timingSafeIgual(a: Buffer, b: Buffer): boolean {
@@ -223,6 +272,14 @@ export async function verificarContaAutorizada(
       "Conta autorizada não é a conta institucional esperada. Conexão rejeitada.",
     );
   }
+  // Defesa em profundidade: domínio organizacional (hd) quando configurado.
+  const hdEsperado = hdOrganizacionalEsperado();
+  if (hdEsperado && (identidade.hd ?? "").trim().toLowerCase() !== hdEsperado) {
+    throw new OauthFlowError(
+      "BLOCKED_HD_MISMATCH",
+      "Conta autorizada fora do domínio organizacional esperado. Conexão rejeitada.",
+    );
+  }
   return { sub: identidade.sub, email: normalizada };
 }
 
@@ -246,9 +303,10 @@ export async function concluirFluxoOauth(
     throw new OauthFlowError("OAUTH_NOT_CONFIGURED", "Credenciais OAuth ausentes.");
   }
   // F18: binding one-time start↔callback persistido em PostgreSQL
-  // (anti login-CSRF / account injection, serverless-safe).
-  await validarBindingState(bindingCookie, state, repository, agora);
-  const tokens = await exchangeAuthorizationCode(config, code, transport);
+  // (anti login-CSRF / account injection, serverless-safe). Retorna o
+  // code_verifier PKCE emitido pelo START da mesma sessão.
+  const codeVerifier = await validarBindingState(bindingCookie, state, repository, agora);
+  const tokens = await exchangeAuthorizationCode(config, code, transport, codeVerifier);
   // F14: identidade verificada ANTES de persistir qualquer token.
   const identidade = await verificarContaAutorizada(tokens.accessToken, identityTransport);
   const expiraEm = new Date(agora.getTime() + tokens.expiresIn * 1000).toISOString();

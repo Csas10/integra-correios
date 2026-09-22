@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   MailProviderNaoConfiguradoError,
   MailProviderRequestError,
@@ -108,6 +108,9 @@ export class OauthStateSigner {
    * start↔callback) pode ser embutido no payload: o MESMO nonce é então
    * exigido no callback via cookie HttpOnly + registro one-time, tornando o
    * state inútil fora do fluxo autenticado que o originou.
+   * O payload pode transportar composição com ":" (ex.: binding:verificador
+   * PKCE) — o delimitador do state permanece "." e o epoch ms mantém-se sem
+   * separadores.
    */
   issue(now: Date = new Date(), nonce?: string): OauthState {
     const expiresAt = new Date(now.getTime() + this.ttlMs).toISOString();
@@ -153,20 +156,50 @@ export type OauthBindingStatus = "BOUND" | "MISSING" | "REPLAY" | "EXPIRED";
  * (OauthFlowBindingStore) e a persistência em packages/persistence.
  */
 
-/** URLs do fluxo OAuth (start/callback) construídas com escopo mínimo. */
+/**
+ * Par PKCE (S256) — verificador de alta entropia e seu challenge SHA-256
+ * base64url. O verificador permanece server-side (nunca vai à URL); o
+ * challenge viaja na authorization URL. Exige que quem troca o código possua
+ * o verificador da MESMA sessão que iniciou o fluxo.
+ */
+export interface PkcePair {
+  readonly codeVerifier: string;
+  readonly codeChallenge: string;
+}
+
+export function gerarParPkce(): PkcePair {
+  // O verificador usa base64url SEM "." (o ":" separa binding:verifier no
+  // payload do state assinado); base64url já não contém ":".
+  const codeVerifier = randomBytes(48).toString("base64url");
+  const codeChallenge = createHash("sha256").update(codeVerifier, "utf8").digest("base64url");
+  return { codeVerifier, codeChallenge };
+}
+
+/**
+ * URLs do fluxo OAuth (start/callback) construídas com escopo mínimo.
+ * PKCE S256 e OpenID (nonce OIDC) são incluídos quando fornecidos — a
+ * fundação usa sempre PKCE + nonce para endurecer o fluxo server-side.
+ */
 export function buildAuthorizationUrl(
   config: GmailOauthConfig,
   state: string,
-  scopes: readonly string[] = GMAIL_OAUTH_SCOPES,
+  opcoes: { scopes?: readonly string[]; codeChallenge?: string; oidcNonce?: string } = {},
 ): string {
   const url = new URL(GMAIL_OAUTH_AUTH_ENDPOINT);
   url.searchParams.set("client_id", config.clientId);
   url.searchParams.set("redirect_uri", config.redirectUri);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", scopes.join(" "));
+  url.searchParams.set("scope", (opcoes.scopes ?? GMAIL_OAUTH_SCOPES).join(" "));
   url.searchParams.set("access_type", "offline");
   url.searchParams.set("prompt", "consent");
   url.searchParams.set("state", state);
+  if (opcoes.codeChallenge) {
+    url.searchParams.set("code_challenge", opcoes.codeChallenge);
+    url.searchParams.set("code_challenge_method", "S256");
+  }
+  if (opcoes.oidcNonce) {
+    url.searchParams.set("nonce", opcoes.oidcNonce);
+  }
   return url.toString();
 }
 
@@ -177,6 +210,8 @@ export interface GoogleAccountIdentity {
   readonly sub: string;
   readonly email: string;
   readonly emailVerified: boolean;
+  /** Domínio organizacional (Google Workspace "hd") quando presente. */
+  readonly hd?: string;
 }
 
 /**
@@ -194,7 +229,7 @@ export async function fetchGoogleAccountIdentity(
       return { status: response.status, json: () => response.json() };
     },
 ): Promise<GoogleAccountIdentity> {
-  let payload: { sub?: string; email?: string; email_verified?: boolean | string };
+  let payload: { sub?: string; email?: string; email_verified?: boolean | string; hd?: string };
   try {
     const resposta = await transport(GOOGLE_OIDC_USERINFO_ENDPOINT, accessToken);
     if (resposta.status !== 200) {
@@ -214,7 +249,12 @@ export async function fetchGoogleAccountIdentity(
   if (payload.email_verified !== true && payload.email_verified !== "true") {
     throw new OauthIdentityError("EMAIL_NOT_VERIFIED", "E-mail Google não verificado.");
   }
-  return { sub: payload.sub, email: payload.email, emailVerified: true };
+  return {
+    sub: payload.sub,
+    email: payload.email,
+    emailVerified: true,
+    ...(payload.hd ? { hd: payload.hd } : {}),
+  };
 }
 
 export class OauthIdentityError extends Error {
@@ -247,11 +287,14 @@ export interface GmailTokenResponse {
 /**
  * Troca do authorization code por tokens (server-side). O transport é
  * injetável para testes — nenhum secret aparece em logs ou erros.
+ * `codeVerifier` (PKCE) é enviado quando presente — obriga correspondência
+ * com o challenge da authorization URL da mesma sessão.
  */
 export async function exchangeAuthorizationCode(
   config: GmailOauthConfig,
   code: string,
   transport: (body: URLSearchParams) => Promise<GmailTokenResponse>,
+  codeVerifier?: string,
 ): Promise<GmailTokenResponse> {
   const body = new URLSearchParams({
     code,
@@ -260,6 +303,9 @@ export async function exchangeAuthorizationCode(
     redirect_uri: config.redirectUri,
     grant_type: "authorization_code",
   });
+  if (codeVerifier) {
+    body.set("code_verifier", codeVerifier);
+  }
   return transport(body);
 }
 

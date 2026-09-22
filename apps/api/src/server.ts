@@ -33,6 +33,8 @@ import {
 import {
   iniciarFluxoOauth,
   concluirFluxoOauth,
+  contaGmailEsperada,
+  hdOrganizacionalEsperado,
   OauthFlowError,
   oauthConfigurado,
 } from "./oauth.js";
@@ -873,6 +875,11 @@ const ROTAS: readonly Rota[] = [
       json(res, 200, {
         status: oauthStatusFromEnvironment(process.env, connected),
         escopo: "https://www.googleapis.com/auth/gmail.send",
+        // Estados do painel: a UI NUNCA recebe segredo, token ou e-mail.
+        contaEsperadaConfigurada: contaGmailEsperada().length > 0,
+        hdOrganizacionalConfigurado: hdOrganizacionalEsperado().length > 0,
+        realSendEnabled: process.env.REAL_SEND_ENABLED === "true",
+        controlledMode: process.env.GMAIL_CONTROLLED_MODE === "true",
         mensagem:
           config === undefined
             ? "Credenciais OAuth ausentes no ambiente. O titular configura GMAIL_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI — nunca via chat."
@@ -880,6 +887,30 @@ const ROTAS: readonly Rota[] = [
               ? "Conta conectada (tokens persistidos cifrados)."
               : "Conexão real é realizada pelo titular no fluxo OAuth (gate humano).",
       });
+    },
+  },
+  {
+    metodo: "DELETE",
+    caminhoExato: "/api/oauth/gmail/connection",
+    handler: async (req, res) => {
+      if (!exigirOperador(req, res)) return;
+      if (!process.env.DATABASE_URL?.trim()) {
+        json(res, 503, { erro: "Persistência não configurada — desconexão indisponível.", codigo: "DB_NOT_CONFIGURED" });
+        return;
+      }
+      try {
+        const { repository } = requireDb();
+        // Ação explícita e auditada (OAUTH_GMAIL_DISCONNECTED). A revogação
+        // EXTERNA no Google NUNCA é executada automaticamente (política do
+        // piloto) — apenas o estado local é marcado como revogado.
+        const revogadas = await repository.revogarConexoesGmail({
+          operador: "operador-sessao",
+          occurredAt: new Date().toISOString(),
+        });
+        json(res, 200, { status: "DISCONNECTED", revogadas });
+      } catch {
+        json(res, 500, { erro: "Falha ao desconectar a conta." });
+      }
     },
   },
   {

@@ -71,8 +71,9 @@ function sha256Hex(valor: string): string {
 }
 
 function estadoValido(): { state: string; nonce: string } {
+  // O payload do state transporta <bindingNonce>:<codeVerifier PKCE>.
   const nonce = `nonce-${Math.random().toString(36).slice(2)}-sintetico`;
-  const { state } = signer.issue(agora, nonce);
+  const { state } = signer.issue(agora, `${nonce}:verificador-pkce-sintetico`);
   return { state, nonce };
 }
 
@@ -139,7 +140,7 @@ describe("F18 — ordem de validação do callback (nada é consumido antes da p
       nonceHash,
       expiresAt: new Date(agora.getTime() + 60_000).toISOString(),
     });
-    await expect(validarBindingState(nonce, state, store, agora)).resolves.toBeUndefined();
+    await expect(validarBindingState(nonce, state, store, agora)).resolves.toBe("verificador-pkce-sintetico");
     expect(store.consumos).toEqual([nonceHash]);
     await expect(validarBindingState(nonce, state, store, agora)).rejects.toThrow(/utilizado/i);
     expect(store.consumos).toEqual([nonceHash, nonceHash]);
@@ -173,7 +174,7 @@ describe("F18 — iniciarFluxoOauth registra binding persistido (hash, nunca non
     const [nonceHash] = store.registros.keys();
     expect(nonceHash).toMatch(/^[0-9a-f]{64}$/);
     // O nonce bruto NUNCA vai para a persistência — só o hash.
-    const hashDoNonce = require("node:crypto").createHash("sha256").update(bindingNonce).digest("hex");
+    const hashDoNonce = createHash("sha256").update(bindingNonce).digest("hex");
     expect(nonceHash).toBe(hashDoNonce);
   });
 });

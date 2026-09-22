@@ -102,6 +102,9 @@ export async function avaliarReadiness(
   const oauthStatus = oauthStatusFromEnvironment(env, await (lerConexaoOauth?.() ?? Promise.resolve(false)));
   const realSendEnabled = env.REAL_SEND_ENABLED === "true";
   const pilotMode = env.PILOT_MODE === "true";
+  // F-GMAIL: modo controlado — transporte real restrito a destinatário
+  // controlado configurado fora do Git (defesa independente do GATE 1).
+  const controlledMode = env.GMAIL_CONTROLLED_MODE === "true";
   const connected = oauthStatus === "CONNECTED"; // F2: leitura da oauth_connection persistida
 
   const cryptoItem = encryptionReady
@@ -184,7 +187,14 @@ export async function avaliarReadiness(
           "PILOT_MODE inativo — processamento da outbox bloqueado.",
           "Definir PILOT_MODE=true para o piloto.",
         ),
-    gmailTransport,
+    gmailTransport: controlledMode && realSendEnabled
+      ? item(
+          "Gmail transport",
+          "BLOCKED_EXTERNAL",
+          "GATE 1 ativo em GMAIL_CONTROLLED_MODE: somente destinatário controlado configurado.",
+          "Titular define o destinatário controlado fora do Git antes de qualquer teste real controlado.",
+        )
+      : gmailTransport,
     gmailOauth,
     realSend,
     ppn: item("PPN", "DISABLED", "Integração PPN/Correios fora do escopo desta fase."),

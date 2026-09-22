@@ -825,6 +825,35 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
   }
 
   /**
+   * Desconexão auditada da conexão Gmail: revogada_em é marcado em TODAS as
+   * conexões ativas do provider (append-only — nenhum registro é apagado) e
+   * um evento OAUTH_GMAIL_DISCONNECTED é gravado na mesma transação.
+   * Retorna a quantidade de conexões revogadas (0 quando nada estava ativo).
+   */
+  async revogarConexoesGmail(command: { operador: string; occurredAt: string }): Promise<number> {
+    return inTransaction(this.pool, async (sql) => {
+      const result = await sql.query(
+        `UPDATE oauth_connection
+         SET revogada_em = $1, atualizada_em = $1
+         WHERE provider = 'GMAIL' AND revogada_em IS NULL`,
+        [command.occurredAt],
+      );
+      const revogadas = result.rowCount ?? 0;
+      const eventId = randomUUID();
+      await insertAudit(sql, {
+        id: eventId,
+        aggregateType: "OAUTH_CONNECTION",
+        aggregateId: eventId,
+        type: "OAUTH_GMAIL_DISCONNECTED",
+        occurredAt: command.occurredAt,
+        metadata: { revogadas, operador: command.operador },
+        eventHash: createHash("sha256").update(eventId).update(command.occurredAt).digest("hex"),
+      });
+      return revogadas;
+    });
+  }
+
+  /**
    * Fechamento transacional da confirmação: snapshot ORIGINAL preservado,
    * snapshot decidido criado (CONFIRMADO), workflow avançado e auditoria —
    * tudo em uma única transação. Falha = ROLLBACK integral.

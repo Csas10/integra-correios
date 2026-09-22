@@ -82,6 +82,9 @@ jobs:
       - name: PostgreSQL OAuth binding migration (F18 — one-time cross-instance)
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0004_oauth_flow.sql
 
+      - name: PostgreSQL OAuth PKCE + communication source migration (closure gate)
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0005_oauth_flow_pkce.sql
+
       - name: PostgreSQL runtime role fail-closed regressions
         shell: bash
         run: |

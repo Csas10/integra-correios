@@ -137,6 +137,25 @@ interface ReadinessReport {
   executionMode: string;
 }
 
+interface EstadoLoteControladoItem {
+  loteId: string;
+  status: "PREPARACAO" | "ATIVO" | "CONCLUIDO" | "CANCELADO";
+  modo: string;
+  totalItens: number;
+  fonteRegistro: string | null;
+  receiptAnterior: boolean;
+  liberacaoHumanaAuditada: boolean;
+  destinatarioCorresponde: boolean | null;
+}
+
+interface EstadoLoteControlado {
+  codigo: string;
+  outboxPendenteForaDoTeste: number;
+  outboxProcessamento: number;
+  lotesAtivosForaDoTeste: number;
+  lote: EstadoLoteControladoItem | null;
+}
+
 interface GmailIntegracao {
   status: string;
   escopo: string;
@@ -238,6 +257,7 @@ export function OperationalFlow() {
   const [outbox, setOutbox] = useState<OutboxItem[]>([]);
   const [readiness, setReadiness] = useState<ReadinessReport | null>(null);
   const [gmail, setGmail] = useState<GmailIntegracao | null>(null);
+  const [estadoControlado, setEstadoControlado] = useState<EstadoLoteControlado | null>(null);
   const [workerRun, setWorkerRun] = useState<WorkerRun | null>(null);
   const [ativacao, setAtivacao] = useState<string | null>(null);
   const [sessao, setSessao] = useState<EstadoSessao>({ status: "DESCONHECIDO" });
@@ -529,8 +549,32 @@ export function OperationalFlow() {
     setOcupado(true);
     try {
       setGmail((await chamar("/api/oauth/gmail/status")) as GmailIntegracao);
+      await carregarEstadoControlado();
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha ao verificar a integração.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  // Prepara o lote sintético CONTROLLED_GMAIL_TEST (idempotente). NÃO ativa
+  // o lote, NÃO executa worker e NÃO envia — ativação/envio permanecem gates
+  // humanos separados, e REAL_SEND_ENABLED=false mantém o envio bloqueado.
+  async function prepararLoteControlado() {
+    setOcupado(true);
+    setErro(undefined);
+    try {
+      const resposta = (await chamar("/api/pilot/controlled/prepare", {
+        method: "POST",
+      })) as { criado: boolean; codigo: string; totalItens: number };
+      await carregarEstadoControlado();
+      setAtivacao(
+        resposta.criado
+          ? `LOTE_CONTROLADO_CRIADO (${resposta.codigo}, ${resposta.totalItens} comunicação)`
+          : `LOTE_CONTROLADO_EXISTENTE (${resposta.codigo})`,
+      );
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha ao preparar o lote controlado.");
     } finally {
       setOcupado(false);
     }
@@ -546,6 +590,15 @@ export function OperationalFlow() {
     }
   }, []);
 
+  // Estado read-only do teste controlado (sem mutação — apenas consulta).
+  const carregarEstadoControlado = useCallback(async () => {
+    try {
+      setEstadoControlado((await chamar("/api/pilot/controlled/state")) as EstadoLoteControlado);
+    } catch {
+      setEstadoControlado(null);
+    }
+  }, []);
+
   // F12/F22: ao restaurar a sessão, também recupera do PostgreSQL qualquer
   // lote PF/DRY_RUN já persistido. Refresh/reabertura não reinicia o fluxo.
   useEffect(() => {
@@ -554,6 +607,7 @@ export function OperationalFlow() {
       return;
     }
     void carregarReadiness();
+    void carregarEstadoControlado();
     void (async () => {
       try {
         const resposta = (await chamar("/api/pilot/recovery")) as {
@@ -578,7 +632,7 @@ export function OperationalFlow() {
         // Readiness continuará visível; recovery é best-effort de UI.
       }
     })();
-  }, [sessao.status, carregarReadiness]);
+  }, [sessao.status, carregarReadiness, carregarEstadoControlado]);
 
   async function liberarLote() {
     if (!lote) return;
@@ -988,6 +1042,70 @@ export function OperationalFlow() {
               Desconectar Gmail
             </button>
           </div>
+          {estadoControlado && (
+            <div className="flow-diagnostics">
+              <h3>Lote de teste controlado ({estadoControlado.codigo})</h3>
+              <p>
+                Pré-voo read-only. A preparação cria o lote sintético em PREPARACAO — não
+                ativa o lote, não executa worker e não envia (REAL_SEND_ENABLED=false).
+              </p>
+              <ul className="flow-stats">
+                <li>
+                  Outbox pendente fora do teste:{" "}
+                  <code>{estadoControlado.outboxPendenteForaDoTeste}</code>
+                </li>
+                <li>
+                  Outbox em processamento: <code>{estadoControlado.outboxProcessamento}</code>
+                </li>
+                <li>
+                  Lotes ATIVOS fora do teste: <code>{estadoControlado.lotesAtivosForaDoTeste}</code>
+                </li>
+                {estadoControlado.lote ? (
+                  <>
+                    <li>
+                      Comunicações no lote: <code>{estadoControlado.lote.totalItens}</code> · Fonte:{" "}
+                      <code>{estadoControlado.lote.fonteRegistro ?? "—"}</code> · Modo:{" "}
+                      <code>{estadoControlado.lote.modo}</code>
+                    </li>
+                    <li>
+                      Destinatário = controlado:{" "}
+                      <code>
+                        {estadoControlado.lote.destinatarioCorresponde === null
+                          ? "INDETERMINADO"
+                          : estadoControlado.lote.destinatarioCorresponde
+                            ? "SIM"
+                            : "NÃO"}
+                      </code>{" "}
+                      · Receipt anterior: <code>{estadoControlado.lote.receiptAnterior ? "SIM" : "NÃO"}</code>
+                    </li>
+                    <li>
+                      Liberação humana auditada:{" "}
+                      <code>{estadoControlado.lote.liberacaoHumanaAuditada ? "SIM" : "NÃO"}</code> · Status:{" "}
+                      <code>{estadoControlado.lote.status}</code>
+                    </li>
+                  </>
+                ) : (
+                  <li>Lote controlado ainda não existe (será criado pela preparação).</li>
+                )}
+                <li>
+                  OAuth: <code>{gmail.status}</code> · Envio real:{" "}
+                  <code>{gmail.realSendEnabled ? "ARMED" : "DISABLED"}</code>
+                </li>
+              </ul>
+              <div className="flow-filters">
+                <button type="button" onClick={carregarEstadoControlado} disabled={ocupado}>
+                  Atualizar estado
+                </button>
+                <button
+                  type="button"
+                  onClick={prepararLoteControlado}
+                  disabled={ocupado || !gmail.controlledMode || !gmail.contaEsperadaConfigurada}
+                >
+                  Preparar lote de teste controlado
+                </button>
+              </div>
+            </div>
+          )}
         </details>
       )}
 

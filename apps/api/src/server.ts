@@ -21,10 +21,15 @@ import {
   type PreflightInput,
 } from "./intake.js";
 import {
+  BloqueioLoteControladoError,
   carregarPilotPolicy,
+  carregarPoliticaControlada,
+  CODIGO_LOTE_TESTE_CONTROLADO,
   gerarPreviewComunicacao,
+  lerEstadoLoteControlado,
   listarProfissionais,
   prepararLotePiloto,
+  prepararLoteTesteControlado,
   recuperarLotePilotoEmAndamento,
   statusOutbox,
   LotePilotoEmAndamentoError,
@@ -397,6 +402,17 @@ function hashEvento(id: string, ocorreuEm: string): string {
   return createHmac("sha256", "audit-chain").update(id).update(ocorreuEm).digest("hex");
 }
 
+/** OAuth Gmail READY = credenciais configuradas + conexão persistida ativa. */
+async function oauthGmailPronto(): Promise<boolean> {
+  if (!loadGmailOauthConfig(process.env)) return false;
+  if (!process.env.DATABASE_URL?.trim() || !process.env.DATA_ENCRYPTION_KEY_BASE64?.trim()) return false;
+  try {
+    return await requireDb().repository.existeConexaoGmailAtiva();
+  } catch {
+    return false;
+  }
+}
+
 const ROTAS: readonly Rota[] = [
   // ------------------------------------------------------------------
   // Health público (uptime simples, sem PII).
@@ -646,6 +662,56 @@ const ROTAS: readonly Rota[] = [
           return;
         }
         json(res, 422, { erro: "Falha na preparação do lote." });
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // TESTE CONTROLADO GMAIL — estado read-only (pré-voo) e preparação
+  // idempotente do lote sintético CONTROLLED_GMAIL_TEST (exatamente 1
+  // comunicação para o destinatário controlado). Nenhum envio aqui:
+  // REAL_SEND_ENABLED=false + lote PREPARACAO mantêm GATE 1/2 fechados.
+  // ------------------------------------------------------------------
+  {
+    metodo: "GET",
+    caminhoExato: "/api/pilot/controlled/state",
+    handler: async (req, res) => {
+      if (!exigirOperador(req, res)) return;
+      const { pool } = requireDb();
+      const estado = await lerEstadoLoteControlado(pool, {
+        caixa: caixa(),
+        controlledRecipient: (process.env.GMAIL_CONTROLLED_RECIPIENT ?? "").trim(),
+      });
+      json(res, 200, estado);
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/pilot/controlled/prepare",
+    handler: async (req, res) => {
+      if (!exigirOperador(req, res)) return;
+      const { pool, repository } = requireDb();
+      try {
+        const resultado = await prepararLoteTesteControlado(
+          {
+            operador: "operador-autenticado",
+            confirmationBaseUrl: process.env.CONFIRMATION_BASE_URL ?? "https://preview.exemplo.test",
+            oauthPronto: await oauthGmailPronto(),
+          },
+          repository,
+          pool,
+          caixa(),
+          fingerprinter(),
+          createWebTokenService(),
+          carregarPoliticaControlada(),
+        );
+        json(res, 200, resultado);
+      } catch (error) {
+        if (error instanceof BloqueioLoteControladoError) {
+          json(res, 409, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 422, { erro: "Falha na preparação do lote controlado." });
       }
     },
   },

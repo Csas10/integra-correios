@@ -496,3 +496,438 @@ export async function statusOutbox(
 }
 
 /** Status da outbox para a UI (sem payload). */
+
+// ---------------------------------------------------------------------------
+// TESTE CONTROLADO GMAIL — lote sintético de EXATAMENTE uma comunicação para
+// o destinatário controlado (GATE 2). Nenhum dado institucional:
+//   - registro profissional totalmente sintético (sem CPF/telefone/endereço);
+//   - fonte persistida CONTROLADO_SINTETICO (nunca INSTITUCIONAL_XLSX);
+//   - destinatário copiado EXATAMENTE de GMAIL_CONTROLLED_RECIPIENT;
+//   - template homologado pf-pilot-crtba-v1 (PF_PILOT_TEMPLATE_VERSION);
+//   - lote nasce PREPARACAO (ativação é ação humana separada e auditada);
+//   - modo LIVE_PILOT: único caminho que o motor LIVE aceita (F7) — e enquanto
+//     REAL_SEND_ENABLED=false o GATE 1 mantém tudo bloqueado (zero chamadas).
+// A preparação é IDEMPOTENTE pelo código canônico do lote (UNIQUE origem+codigo).
+// ---------------------------------------------------------------------------
+
+export const CODIGO_LOTE_TESTE_CONTROLADO = "CONTROLLED_GMAIL_TEST";
+const CODIGO_PROFISSIONAL_SINTETICO = "SINTETICO-CONTROLADO-GMAIL";
+const MARCADOR_DOCUMENTO_SINTETICO = "REGISTRO-SINTETICO-SEM-DOCUMENTO";
+const NOME_SINTETICO = "Pessoa Sintetica (Teste Controlado)";
+
+export interface PoliticaControlada {
+  readonly controlledMode: boolean;
+  readonly controlledRecipient: string;
+  readonly realSendEnabled: boolean;
+}
+
+/** Política do teste controlado lida SOMENTE do ambiente (não do request). */
+export function carregarPoliticaControlada(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): PoliticaControlada {
+  return {
+    controlledMode: env.GMAIL_CONTROLLED_MODE === "true",
+    controlledRecipient: (env.GMAIL_CONTROLLED_RECIPIENT ?? "").trim(),
+    realSendEnabled: env.REAL_SEND_ENABLED === "true",
+  };
+}
+
+export interface EstadoLoteControladoItem {
+  readonly loteId: string;
+  readonly status: "PREPARACAO" | "ATIVO" | "CONCLUIDO" | "CANCELADO";
+  readonly modo: "DRY_RUN" | "LIVE_PILOT";
+  readonly totalItens: number;
+  readonly fonteRegistro: CommunicationSource | null;
+  readonly receiptAnterior: boolean;
+  readonly liberacaoHumanaAuditada: boolean;
+  /** Verificação server-side do payload: destinatário === controlado.
+   * null = indeterminado (payload ilegível/ausente) — exibição fail-closed. */
+  readonly destinatarioCorresponde: boolean | null;
+}
+
+export interface EstadoLoteControlado {
+  readonly codigo: string;
+  readonly outboxPendenteForaDoTeste: number;
+  readonly outboxProcessamento: number;
+  readonly lotesAtivosForaDoTeste: number;
+  readonly lote: EstadoLoteControladoItem | null;
+}
+
+type PoolConsulta = {
+  query: (text: string, values?: readonly unknown[]) => Promise<{ rows: readonly any[]; rowCount: number | null }>;
+};
+
+/**
+ * Consulta READ-ONLY do estado do teste controlado (pré-voo de ativação/envio).
+ * Contagens fora do teste excluem o lote CONTROLLED_GMAIL_TEST por código;
+ * receipt anterior e liberação humana auditada são DERIVADOS do banco.
+ */
+export async function lerEstadoLoteControlado(
+  pool: PoolConsulta,
+  opcoes: {
+    caixa?: { open(value: EncryptedValue, context: string): Uint8Array };
+    controlledRecipient?: string;
+  } = {},
+): Promise<EstadoLoteControlado> {
+  const codigo = CODIGO_LOTE_TESTE_CONTROLADO;
+  const contagens = await pool.query(
+    `SELECT
+      (SELECT count(*) FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE o.status IN ('PENDING', 'FAILED') AND l.codigo <> $1) AS pendente_fora,
+      (SELECT count(*) FROM outbox_email o WHERE o.status = 'PROCESSING') AS processamento,
+      (SELECT count(*) FROM lote_comunicacao l WHERE l.status = 'ATIVO' AND l.codigo <> $1) AS ativos_fora`,
+    [codigo],
+  );
+  const linhas = await pool.query(
+    `SELECT l.id AS lote_id, l.status AS lote_status, l.modo AS lote_modo,
+      (SELECT count(*) FROM item_lote_comunicacao i WHERE i.lote_comunicacao_id = l.id) AS total_itens,
+      (SELECT c.fonte_registro FROM comunicacao c WHERE c.lote_comunicacao_id = l.id LIMIT 1) AS fonte_registro,
+      (SELECT count(*) FROM comunicacao c WHERE c.lote_comunicacao_id = l.id AND c.provider = 'GMAIL') AS receipts,
+      (SELECT count(*) FROM evento_auditoria ea
+        WHERE ea.agregado_tipo = 'LOTE_COMUNICACAO' AND ea.agregado_id = l.id
+          AND ea.tipo = 'PF_LOTE_COMUNICACAO_ATIVADO') AS ativacoes,
+      ob.payload_ciphertext, ob.payload_nonce, ob.payload_auth_tag, ob.chave_versao
+    FROM lote_comunicacao l
+    LEFT JOIN LATERAL (
+      SELECT o.payload_ciphertext, o.payload_nonce, o.payload_auth_tag, o.chave_versao
+      FROM outbox_email o
+      JOIN comunicacao c ON c.id = o.comunicacao_id
+      WHERE c.lote_comunicacao_id = l.id
+      LIMIT 1
+    ) ob ON true
+    WHERE l.origem = 'PF' AND l.codigo = $1`,
+    [codigo],
+  );
+
+  const contagem = contagens.rows[0];
+  const linha = linhas.rows[0];
+  let lote: EstadoLoteControladoItem | null = null;
+  if (linha) {
+    let destinatarioCorresponde: boolean | null = null;
+    if (
+      opcoes.caixa &&
+      opcoes.controlledRecipient &&
+      linha.payload_ciphertext &&
+      linha.payload_nonce &&
+      linha.payload_auth_tag &&
+      linha.chave_versao
+    ) {
+      try {
+        const payload = JSON.parse(
+          new TextDecoder().decode(
+            opcoes.caixa.open(
+              {
+                ciphertext: Buffer.from(linha.payload_ciphertext),
+                nonce: Buffer.from(linha.payload_nonce),
+                authTag: Buffer.from(linha.payload_auth_tag),
+                keyVersion: linha.chave_versao,
+              },
+              "outbox:email",
+            ),
+          ),
+        ) as { destinatario?: string };
+        destinatarioCorresponde =
+          (payload.destinatario ?? "").trim().toLowerCase() ===
+          opcoes.controlledRecipient.trim().toLowerCase();
+      } catch {
+        destinatarioCorresponde = null;
+      }
+    }
+    lote = {
+      loteId: linha.lote_id,
+      status: linha.lote_status as EstadoLoteControladoItem["status"],
+      modo: linha.lote_modo as EstadoLoteControladoItem["modo"],
+      totalItens: Number(linha.total_itens),
+      fonteRegistro: (linha.fonte_registro as CommunicationSource | null) ?? null,
+      receiptAnterior: Number(linha.receipts) > 0,
+      liberacaoHumanaAuditada: Number(linha.ativacoes) > 0,
+      destinatarioCorresponde,
+    };
+  }
+  return {
+    codigo,
+    outboxPendenteForaDoTeste: Number(contagem?.pendente_fora ?? 0),
+    outboxProcessamento: Number(contagem?.processamento ?? 0),
+    lotesAtivosForaDoTeste: Number(contagem?.ativos_fora ?? 0),
+    lote,
+  };
+}
+
+export class BloqueioLoteControladoError extends Error {
+  constructor(
+    readonly codigo: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BloqueioLoteControladoError";
+  }
+}
+
+export interface PrepararLoteControladoCommand {
+  readonly operador: string;
+  readonly confirmationBaseUrl: string;
+  readonly confirmationTtlMs?: number;
+  /** OAuth Gmail READY (configuração + conexão persistida) — exigido pelo
+   * pré-voo desta etapa; o envio em si permanece bloqueado por GATE 1/2. */
+  readonly oauthPronto: boolean;
+}
+
+export interface ResultadoLoteControlado {
+  readonly criado: boolean;
+  readonly loteId: string | null;
+  readonly codigo: string;
+  readonly totalItens: number;
+  readonly estado: EstadoLoteControlado;
+}
+
+/**
+ * Cria (idempotentemente) o lote CONTROLLED_GMAIL_TEST: exatamente UMA
+ * comunicação sintética para o destinatário controlado. Fail-closed: cada
+ * exigência do pré-voo é validada server-side ANTES de qualquer INSERT.
+ */
+export async function prepararLoteTesteControlado(
+  command: PrepararLoteControladoCommand,
+  repository: Pick<PostgresOperationalRepository, "enqueueCommunicationBatch">,
+  pool: PoolConsulta,
+  caixa: { seal(plaintext: string, context: string): EncryptedValue; open(value: EncryptedValue, context: string): Uint8Array },
+  fingerprinter: { fingerprint(namespace: string, valor: string): string },
+  tokens: { issue(): Promise<{ plainToken: string; tokenHash: string }>; hash(plain: string): Promise<string> },
+  politica: PoliticaControlada,
+  agora: Date = new Date(),
+): Promise<ResultadoLoteControlado> {
+  if (!politica.controlledMode) {
+    throw new BloqueioLoteControladoError(
+      "CONTROLLED_MODE_REQUIRED",
+      "GMAIL_CONTROLLED_MODE deve estar ativo para preparar o teste controlado.",
+    );
+  }
+  if (!politica.controlledRecipient) {
+    throw new BloqueioLoteControladoError(
+      "CONTROLLED_RECIPIENT_REQUIRED",
+      "GMAIL_CONTROLLED_RECIPIENT não configurado — destinatário controlado ausente.",
+    );
+  }
+  if (!politica.controlledRecipient.includes("@")) {
+    throw new BloqueioLoteControladoError(
+      "CONTROLLED_RECIPIENT_INVALID",
+      "Destinatário controlado configurado não é um endereço de e-mail válido.",
+    );
+  }
+  if (politica.realSendEnabled) {
+    throw new BloqueioLoteControladoError(
+      "REAL_SEND_ARMED",
+      "REAL_SEND_ENABLED=true — esta etapa exige false. Desarme o envio real antes de preparar o lote.",
+    );
+  }
+  if (!command.oauthPronto) {
+    throw new BloqueioLoteControladoError(
+      "OAUTH_NOT_READY",
+      "OAuth Gmail não está READY (configuração ou conexão ausente).",
+    );
+  }
+
+  const estado = await lerEstadoLoteControlado(pool, {
+    caixa,
+    controlledRecipient: politica.controlledRecipient,
+  });
+  if (estado.outboxPendenteForaDoTeste > 0) {
+    throw new BloqueioLoteControladoError(
+      "OUTBOX_PENDING_OUTSIDE_TEST",
+      `Outbox pendente fora do teste: ${estado.outboxPendenteForaDoTeste}. Zere a fila antes do teste controlado.`,
+    );
+  }
+  if (estado.outboxProcessamento > 0) {
+    throw new BloqueioLoteControladoError(
+      "OUTBOX_PROCESSING",
+      `Outbox em processamento: ${estado.outboxProcessamento}. Aguarde a conclusão antes do teste controlado.`,
+    );
+  }
+  if (estado.lotesAtivosForaDoTeste > 0) {
+    throw new BloqueioLoteControladoError(
+      "ACTIVE_BATCHES_OUTSIDE_TEST",
+      `Lotes ATIVOS fora do teste: ${estado.lotesAtivosForaDoTeste}. Conclua ou cancele antes do teste controlado.`,
+    );
+  }
+  // Idempotência canônica: lote com o código já existe → nada é criado.
+  if (estado.lote) {
+    return {
+      criado: false,
+      loteId: estado.lote.loteId,
+      codigo: estado.codigo,
+      totalItens: estado.lote.totalItens,
+      estado,
+    };
+  }
+
+  const professionalId = await garantirProfissionalSintetico(
+    pool,
+    caixa,
+    fingerprinter,
+    command.operador,
+    agora.toISOString(),
+  );
+
+  const loteId = randomUUID();
+  const confirmationId = randomUUID();
+  const communicationId = randomUUID();
+  const outboxId = randomUUID();
+  const token = await tokens.issue();
+  const expiraEm = new Date(agora.getTime() + (command.confirmationTtlMs ?? 7 * 24 * 3_600_000)).toISOString();
+  const createdAt = agora.toISOString();
+
+  // Payload do outbox: destinatário EXATAMENTE o controlado configurado;
+  // nenhum CPF, telefone ou endereço real (registro 100% sintético).
+  const payload = {
+    professionalId,
+    codigo: CODIGO_PROFISSIONAL_SINTETICO,
+    nome: NOME_SINTETICO,
+    destinatario: politica.controlledRecipient,
+    enderecoApresentado: "Registro sintético do teste controlado — sem endereço",
+    telefone: "",
+    plainToken: token.plainToken,
+    confirmationId,
+    communicationId,
+    confirmationBaseUrl: command.confirmationBaseUrl,
+  };
+
+  const item: CommunicationBatchItem = {
+    professionalId,
+    confirmationId,
+    communicationId,
+    outboxId,
+    tokenHash: token.tokenHash,
+    expiresAt: expiraEm,
+    recipientFingerprint: fingerprinter.fingerprint("email-piloto", politica.controlledRecipient),
+    idempotencyKey: `pf-pilot:${confirmationId}:${PF_PILOT_TEMPLATE_VERSION}`,
+    encryptedPayload: caixa.seal(JSON.stringify(payload), "outbox:email"),
+    auditEvent: {
+      id: randomUUID(),
+      aggregateType: "PROFISSIONAL",
+      aggregateId: professionalId,
+      type: "PF_CONFIRMACAO_EMITIDA",
+      actorId: command.operador,
+      occurredAt: createdAt,
+      metadata: { loteComunicacaoId: loteId, templateVersion: PF_PILOT_TEMPLATE_VERSION },
+      eventHash: hashEvento(confirmationId, createdAt),
+    },
+  };
+
+  await repository.enqueueCommunicationBatch({
+    id: loteId,
+    code: CODIGO_LOTE_TESTE_CONTROLADO,
+    origin: "PF",
+    templateVersion: PF_PILOT_TEMPLATE_VERSION,
+    // Modo LIVE_PILOT: único modo que o motor LIVE aceita (F7). Nada é enviado
+    // nesta etapa: lote nasce PREPARACAO e REAL_SEND_ENABLED=false mantém o
+    // GATE 1 fechado (zero chamadas Gmail).
+    mode: "LIVE_PILOT",
+    source: "CONTROLADO_SINTETICO",
+    createdBy: command.operador,
+    createdAt,
+    auditEvent: {
+      id: randomUUID(),
+      aggregateType: "LOTE_COMUNICACAO",
+      aggregateId: loteId,
+      type: "PF_LOTE_COMUNICACAO_CRIADO",
+      actorId: command.operador,
+      occurredAt: createdAt,
+      metadata: { totalItens: 1, modo: "LIVE_PILOT", finalidade: "teste-controlado-gmail" },
+      eventHash: hashEvento(loteId, createdAt),
+    },
+    items: [item],
+  });
+
+  return {
+    criado: true,
+    loteId,
+    codigo: CODIGO_LOTE_TESTE_CONTROLADO,
+    totalItens: 1,
+    estado,
+  };
+}
+
+const MARCADOR_SNAPSHOT_SINTETICO = JSON.stringify({
+  documento: MARCADOR_DOCUMENTO_SINTETICO,
+  nome: NOME_SINTETICO,
+  // Sem e-mail/telefone/endereço: o registro sintético fica visivelmente
+  // inerte no cockpit institucional ("E-mail inválido") e fora dos fluxos de
+  // contato — o destinatário do teste vem EXCLUSIVAMENTE do ambiente controlado.
+  email: "",
+  telefone: "",
+  endereco: {},
+  enderecoOrigem: "",
+  enderecoInformado: false,
+});
+
+/**
+ * Garante o profissional sintético do teste (idempotente por fingerprint do
+ * marcador). Status PENDENCIA_TRIAGEM: NUNCA elegível a contato institucional —
+ * somente o lote controlado o referencia.
+ */
+async function garantirProfissionalSintetico(
+  pool: PoolConsulta,
+  caixa: { seal(plaintext: string, context: string): EncryptedValue },
+  fingerprinter: { fingerprint(namespace: string, valor: string): string },
+  operador: string,
+  agora: string,
+): Promise<string> {
+  const documentoFingerprint = fingerprinter.fingerprint("documento-sintetico", MARCADOR_DOCUMENTO_SINTETICO);
+  const existente = await pool.query(
+    `SELECT id FROM profissional WHERE origem = 'PF' AND documento_fingerprint = $1 LIMIT 1`,
+    [documentoFingerprint],
+  );
+  const existenteId = existente.rows[0]?.id;
+  if (existenteId) return existenteId;
+
+  const profissionalId = randomUUID();
+  const documento = caixa.seal(MARCADOR_DOCUMENTO_SINTETICO, "documento:cpf");
+  const snapshot = caixa.seal(MARCADOR_SNAPSHOT_SINTETICO, "snapshot:original");
+  await pool.query(
+    `INSERT INTO profissional (
+      id, origem, codigo_operacional, tipo_documento,
+      documento_ciphertext, documento_nonce, documento_auth_tag, documento_chave_versao,
+      documento_fingerprint, status
+    ) VALUES ($1, 'PF', $2, 'CPF', $3, $4, $5, $6, $7, 'PENDENCIA_TRIAGEM')`,
+    [
+      profissionalId,
+      CODIGO_PROFISSIONAL_SINTETICO,
+      Buffer.from(documento.ciphertext),
+      Buffer.from(documento.nonce),
+      Buffer.from(documento.authTag),
+      documento.keyVersion,
+      documentoFingerprint,
+    ],
+  );
+  await pool.query(
+    `INSERT INTO snapshot_cadastral (
+      profissional_id, tipo, conteudo_ciphertext, conteudo_nonce,
+      conteudo_auth_tag, chave_versao, fonte
+    ) VALUES ($1, 'ORIGINAL', $2, $3, $4, $5, 'IMPORTACAO')`,
+    [
+      profissionalId,
+      Buffer.from(snapshot.ciphertext),
+      Buffer.from(snapshot.nonce),
+      Buffer.from(snapshot.authTag),
+      snapshot.keyVersion,
+    ],
+  );
+  await pool.query(
+    `INSERT INTO evento_auditoria (
+      id, agregado_tipo, agregado_id, tipo, ator_id, ocorreu_em,
+      metadados, hash_anterior, hash_evento
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NULL, $8)`,
+    [
+      randomUUID(),
+      "PROFISSIONAL",
+      profissionalId,
+      "PF_PROFISSIONAL_SINTETICO_CRIADO",
+      operador,
+      agora,
+      JSON.stringify({ codigoOperacional: CODIGO_PROFISSIONAL_SINTETICO, finalidade: "teste-controlado-gmail" }),
+      hashEvento(profissionalId, agora),
+    ],
+  );
+  return profissionalId;
+}

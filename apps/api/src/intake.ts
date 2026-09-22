@@ -13,7 +13,7 @@ import {
   type OpcoesLeituraXlsx,
   type ResultadoLeituraXlsx,
 } from "@integra-correios/importers";
-import { cpfValido, emailValido } from "@integra-correios/validation";
+import { cpfValido, emailValido, telefoneValido } from "@integra-correios/validation";
 import {
   Aes256GcmSecretBox,
   HmacSha256Fingerprinter,
@@ -88,6 +88,7 @@ export interface RegistroPreflight {
   readonly nome: string;
   readonly emailValido: boolean;
   readonly cpfValido: boolean;
+  readonly telefoneValido: boolean;
   readonly endereco: StatusEndereco;
   readonly issues: readonly string[];
   readonly aptoContato: boolean;
@@ -197,10 +198,17 @@ export function executarPreflight(input: PreflightInput): ResumoPreflight {
     if (!emailOk) issues.push("E-mail inválido ou ausente.");
     const cpfOk = cpfValido(documento);
     if (!cpfOk) issues.push("CPF inválido.");
+    // Requisito real de contato homologado: TELEFONE presente e válido.
+    const telefoneOk = telefoneValido(telefone);
+    if (!telefoneOk) issues.push("Telefone inválido ou ausente.");
     for (const alerta of linha.alertasNumericos) {
       issues.push(`Bloqueio: ${alerta}`);
     }
 
+    // Contrato PF: endereço é condição NÃO bloqueante para APTO_CONTATO —
+    // permanece como alerta/contador para revisão do operador e bloqueia
+    // somente a progressão postal posterior (APTO_PREPOSTAGEM, via
+    // validarCadastroPf). Ausência vira NOT_PROVIDED sem pendência.
     if (endereco.parsing?.classificacao === "REVIEW_REQUIRED") {
       issues.push("Endereço requer revisão (decomposição assistida incompleta).");
     } else if (endereco.parsing?.classificacao === "INVALID") {
@@ -220,13 +228,15 @@ export function executarPreflight(input: PreflightInput): ResumoPreflight {
       }
     }
 
-    const aptoContato = issues.length === 0;
+    const aptoContato =
+      nome.length > 0 && emailOk && cpfOk && telefoneOk && linha.alertasNumericos.length === 0 && !duplicada;
     registros.push({
       numeroLinha: linha.numero,
       codigo,
       nome,
       emailValido: emailOk,
       cpfValido: cpfOk,
+      telefoneValido: telefoneOk,
       endereco: {
         classificacao: endereco.parsing?.classificacao ?? "NOT_PROVIDED",
         enderecoOrigem: endereco.enderecoOrigem,
@@ -351,10 +361,15 @@ export async function confirmarImportacao(
       statusLinha = statusLinha === "INVALIDA" ? "INVALIDA" : "PENDENTE";
       issues.push("E-mail inválido.");
     }
-    if (parsing && parsing.classificacao !== "PARSED") {
+    // Requisito real de contato homologado: TELEFONE presente e válido.
+    if (!telefoneValido(telefone)) {
       statusLinha = statusLinha === "INVALIDA" ? "INVALIDA" : "PENDENTE";
-      issues.push(`Endereço ${parsing.classificacao}.`);
+      issues.push("Telefone inválido ou ausente.");
     }
+    // Contrato PF: endereço NÃO bloqueia APTO_CONTATO. Ausência → NOT_PROVIDED
+    // (sem pendência); REVIEW_REQUIRED/INVALID permanecem apenas como
+    // inconsistência informativa (revisão assistida) e bloqueiam somente a
+    // progressão postal posterior (validarCadastroPf → APTO_PREPOSTAGEM).
     if (linha.alertasNumericos.length > 0) {
       statusLinha = "INVALIDA";
       issues.push("Célula numérica em campo sensível a zeros.");
@@ -369,8 +384,9 @@ export async function confirmarImportacao(
             id: profissionalId,
             codigoOperacional,
             // O preflight + confirmação da importação constituem a triagem
-            // operacional desta vertical slice: linha íntegra entra apta ao
-            // contato; linha com pendência fica bloqueada para revisão.
+            // operacional desta vertical slice: linha com requisitos de
+            // CONTATO íntegros entra APTO_CONTATO (endereço é não bloqueante);
+            // linha com pendência fica bloqueada para revisão.
             status: statusLinha === "VALIDA" ? "APTO_CONTATO" : "PENDENCIA_TRIAGEM",
             documento: caixa.seal(documento, "documento:cpf"),
             originalSnapshot: caixa.seal(
@@ -381,13 +397,13 @@ export async function confirmarImportacao(
                 telefone,
                 whatsapp: celular || undefined,
                 endereco: {
-                  logradouro: parsing?.sugerido.logradouro ?? "",
-                  numero: parsing?.sugerido.numero ?? "",
-                  complemento: parsing?.sugerido.complemento ?? "",
-                  bairro: parsing?.sugerido.bairro ?? "",
-                  cidade: parsing?.sugerido.cidade ?? "",
-                  uf: parsing?.sugerido.uf ?? "",
-                  cep: parsing?.sugerido.cep ?? "",
+                  logradouro: parsing?.classificacao === "PARSED" ? parsing.sugerido.logradouro : "",
+                  numero: parsing?.classificacao === "PARSED" ? parsing.sugerido.numero : "",
+                  complemento: parsing?.classificacao === "PARSED" ? parsing.sugerido.complemento : "",
+                  bairro: parsing?.classificacao === "PARSED" ? parsing.sugerido.bairro : "",
+                  cidade: parsing?.classificacao === "PARSED" ? parsing.sugerido.cidade : "",
+                  uf: parsing?.classificacao === "PARSED" ? parsing.sugerido.uf : "",
+                  cep: parsing?.classificacao === "PARSED" ? parsing.sugerido.cep : "",
                 },
                 enderecoOrigem: endereco.enderecoOrigem,
                 enderecoInformado: endereco.informado,

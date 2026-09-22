@@ -107,6 +107,38 @@ export interface BatchActivationState {
 }
 
 /**
+ * Cancelamento auditado de lote DRY_RUN histórico (isolamento operacional).
+ * Fail-closed: somente o lote EXATO ATIVO/DRY_RUN pode ser cancelado, com
+ * outbox totalmente resolvida e REAL_SEND_ENABLED=false no ambiente.
+ */
+export interface CancelCommunicationBatchCommand {
+  readonly batchId: string;
+  readonly origin: "PF";
+  /** Código canônico exigido — rejeita qualquer outro lote. */
+  readonly expectedCode: string;
+  /** REAL_SEND_ENABLED lido do ambiente pelo chamador (nunca do request). */
+  readonly realSendEnabled: boolean;
+  readonly actorId: string;
+  readonly cancelledAt: string;
+  /** Motivo auditado fixo: HISTORICAL_DRY_RUN_ISOLATION. */
+  readonly auditEvent: AuditEventInput;
+}
+
+export interface BatchCancellationState {
+  readonly status: "PREPARACAO" | "ATIVO" | "CONCLUIDO" | "CANCELADO";
+  readonly totalItems: number;
+  readonly templateVersion: string;
+  readonly createdAt: string;
+  readonly resultCode:
+    | "CANCELLED"
+    | "ALREADY_CANCELLED"
+    | "NOT_HISTORICAL_BATCH"
+    | "INVALID_STATE"
+    | "MODE_NOT_DRY_RUN"
+    | "OUTBOX_NOT_SETTLED";
+}
+
+/**
  * FINAL CLOSURE GATE item 2 — origem persistida do registro da comunicação:
  *  - CONTROLADO_SINTETICO: registro sintético do modo controlado;
  *  - INSTITUCIONAL_XLSX: proveniente do upload do XLSX institucional.

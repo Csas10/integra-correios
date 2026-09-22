@@ -511,6 +511,49 @@ export async function statusOutbox(
 // ---------------------------------------------------------------------------
 
 export const CODIGO_LOTE_TESTE_CONTROLADO = "CONTROLLED_GMAIL_TEST";
+
+/**
+ * Código canônico do lote DRY_RUN histórico validado diretamente no Neon:
+ * registros sintéticos SINT-PF-001..003, fonte PF_DRY_RUN_SINTETICO_HARD_GATE_B,
+ * outbox SENT=3 em DRY_RUN, confirmações PENDING=3, zero chamadas Gmail.
+ * O cancelamento auditado aceita SOMENTE este código.
+ */
+export const CODIGO_LOTE_HISTORICO_DRY_RUN = "PF-MAIL-PILOTO-MUB37G1H";
+
+export interface ValidaçãoCancelamento {
+  readonly codigo: string;
+  readonly status: string;
+  readonly modo: string;
+  readonly totalItens: number;
+}
+
+/**
+ * Pré-voo do cancelamento do lote histórico (server-side, fail-closed):
+ * o cancelamento só vale para o lote EXATO, ATIVO e DRY_RUN. Qualquer outro
+ * lote — inclusive LIVE_PILOT/CONTROLLED_GMAIL_TEST — é rejeitado aqui.
+ */
+export function validarCancelamentoLoteHistorico(
+  lote: {
+    codigo?: string | null;
+    status?: string | null;
+    modo?: string | null;
+  } | null | undefined,
+): void {
+  if (!lote || !lote.codigo) {
+    throw new Error("NOT_HISTORICAL_BATCH: lote inexistente");
+  }
+  if (lote.codigo !== CODIGO_LOTE_HISTORICO_DRY_RUN) {
+    throw new Error(
+      `NOT_HISTORICAL_BATCH: somente o lote histórico ${CODIGO_LOTE_HISTORICO_DRY_RUN} pode ser cancelado`,
+    );
+  }
+  if (lote.modo !== "DRY_RUN") {
+    throw new Error(`MODE_NOT_DRY_RUN: lote em modo ${lote.modo ?? "desconhecido"}`);
+  }
+  if (lote.status !== "ATIVO" && lote.status !== "CANCELADO") {
+    throw new Error(`INVALID_STATE: lote em status ${lote.status ?? "desconhecido"}`);
+  }
+}
 const CODIGO_PROFISSIONAL_SINTETICO = "SINTETICO-CONTROLADO-GMAIL";
 const MARCADOR_DOCUMENTO_SINTETICO = "REGISTRO-SINTETICO-SEM-DOCUMENTO";
 const NOME_SINTETICO = "Pessoa Sintetica (Teste Controlado)";

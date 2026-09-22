@@ -252,8 +252,13 @@ export function OperationalFlow() {
     loteId: string;
     codigo: string;
     totalItens: number;
-    status: "PREPARACAO" | "ATIVO";
+    status: "PREPARACAO" | "ATIVO" | "CANCELADO";
   } | null>(null);
+  const [cancelamentoHistorico, setCancelamentoHistorico] = useState<{
+    aberto: boolean;
+    confirmacao: string;
+    resultado: string | null;
+  }>({ aberto: false, confirmacao: "", resultado: null });
   const [outbox, setOutbox] = useState<OutboxItem[]>([]);
   const [readiness, setReadiness] = useState<ReadinessReport | null>(null);
   const [gmail, setGmail] = useState<GmailIntegracao | null>(null);
@@ -649,6 +654,39 @@ export function OperationalFlow() {
       await carregarOutboxDoLote(lote.loteId);
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha na liberação do lote.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  // Cancelamento auditado do lote DRY_RUN histórico — somente para o lote
+  // canônico PF-MAIL-PILOTO-MUB37G1H. Exige confirmação textual humana exata.
+  // Nenhum dado é apagado: apenas o status do lote muda para CANCELADO.
+  const CODIGO_LOTE_HISTORICO_UI = "PF-MAIL-PILOTO-MUB37G1H";
+  const CONFIRMACAO_CANCELAMENTO_UI =
+    "AUTORIZO CANCELAR DE FORMA AUDITADA O LOTE DRY_RUN HISTÓRICO " +
+    "PF-MAIL-PILOTO-MUB37G1H, PRESERVANDO TODOS OS DADOS E SEM EXECUTAR O WORKER";
+  async function cancelarLoteHistorico() {
+    if (!lote || lote.codigo !== CODIGO_LOTE_HISTORICO_UI) return;
+    if (cancelamentoHistorico.confirmacao.trim() !== CONFIRMACAO_CANCELAMENTO_UI) return;
+    setOcupado(true);
+    setErro(undefined);
+    try {
+      const resposta = (await chamar("/api/pilot/batch/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          loteId: lote.loteId,
+          confirmacao: cancelamentoHistorico.confirmacao.trim(),
+        }),
+      })) as { estado?: { status: string; resultCode: string }; aviso?: string };
+      setCancelamentoHistorico({ aberto: false, confirmacao: "", resultado: resposta.aviso ?? null });
+      setLote((atual) =>
+        atual ? { ...atual, status: (resposta.estado?.status as "CANCELADO") ?? "CANCELADO" } : atual,
+      );
+      await carregarEstadoControlado();
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha no cancelamento do lote histórico.");
     } finally {
       setOcupado(false);
     }
@@ -1195,7 +1233,60 @@ export function OperationalFlow() {
             <button type="button" onClick={iniciarNovaValidacao}>
               Iniciar nova validação de arquivo
             </button>
+            {lote.codigo === CODIGO_LOTE_HISTORICO_UI && lote.status === "ATIVO" && (
+              <button
+                type="button"
+                onClick={() =>
+                  setCancelamentoHistorico((atual) => ({ ...atual, aberto: !atual.aberto }))
+                }
+                disabled={ocupado}
+              >
+                Cancelar lote DRY_RUN histórico
+              </button>
+            )}
           </div>
+          {lote.codigo === CODIGO_LOTE_HISTORICO_UI && lote.status === "ATIVO" &&
+            cancelamentoHistorico.aberto && (
+              <div className="flow-stats">
+                <p>
+                  <strong>Cancelar lote DRY_RUN histórico</strong> — altera APENAS o status do lote
+                  para CANCELADO. Itens, comunicações, outbox, confirmações, importações e TODA a
+                  trilha de auditoria permanecem preservados. Nada é apagado. O worker não é
+                  executado e nenhum envio é realizado.
+                </p>
+                <p>
+                  Para confirmar, cole exatamente a frase:
+                  <br />
+                  <code>
+                    {CONFIRMACAO_CANCELAMENTO_UI}
+                  </code>
+                </p>
+                <input
+                  value={cancelamentoHistorico.confirmacao}
+                  onChange={(e) =>
+                    setCancelamentoHistorico((atual) => ({ ...atual, confirmacao: e.target.value }))
+                  }
+                  placeholder="Cole a frase de autorização aqui"
+                  disabled={ocupado}
+                  style={{ width: "100%" }}
+                />
+                <div className="flow-filters">
+                  <button
+                    type="button"
+                    onClick={cancelarLoteHistorico}
+                    disabled={
+                      ocupado ||
+                      cancelamentoHistorico.confirmacao.trim() !== CONFIRMACAO_CANCELAMENTO_UI
+                    }
+                  >
+                    Confirmar cancelamento auditado
+                  </button>
+                </div>
+              </div>
+            )}
+          {cancelamentoHistorico.resultado && (
+            <p className="flow-stats">{cancelamentoHistorico.resultado}</p>
+          )}
           {ativacao && (
             <p className="flow-stats">
               Autorização registrada. O ambiente continua em modo de validação, sem envio real.

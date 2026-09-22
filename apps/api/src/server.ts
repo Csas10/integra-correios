@@ -21,6 +21,10 @@ import {
   type PreflightInput,
 } from "./intake.js";
 import {
+  CODIGO_LOTE_HISTORICO_DRY_RUN,
+  validarCancelamentoLoteHistorico,
+} from "./pilot.js";
+import {
   BloqueioLoteControladoError,
   carregarPilotPolicy,
   carregarPoliticaControlada,
@@ -814,6 +818,101 @@ const ROTAS: readonly Rota[] = [
             : mensagem.includes("ALREADY_SENT")
               ? "BLOCKED_ALREADY_SENT"
               : "BLOCKED_ACTIVATION";
+        json(res, 409, { erro: mensagem, codigo });
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // CANCELAMENTO AUDITADO do lote DRY_RUN histórico — OPERATOR_ROUTE,
+  // ação humana deliberada com confirmação específica. Fail-closed:
+  //   - somente o lote EXATO PF-MAIL-PILOTO-MUB37G1H (código + ATIVO/DRY_RUN);
+  //   - REAL_SEND_ENABLED=false obrigatório (lido do ambiente);
+  //   - confirmação textual humana obrigatória;
+  //   - idempotente: já CANCELADO → estado atual sem nova mutação;
+  //   - preserva itens, comunicações, outbox, confirmações e imports;
+  //   - único evento PF_LOTE_COMUNICACAO_CANCELADO, motivo
+  //     HISTORICAL_DRY_RUN_ISOLATION, sem PII.
+  // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/pilot/batch/cancel",
+    handler: async (req, res, _url, corpo) => {
+      if (!exigirOperador(req, res)) return;
+      const { pool, repository } = requireDb();
+      const body = JSON.parse(corpo.toString("utf8") || "{}") as {
+        loteId?: string;
+        confirmacao?: string;
+      };
+      if (!body.loteId || !body.confirmacao) {
+        json(res, 422, {
+          erro: "loteId e confirmação humana obrigatórios.",
+          codigo: "BLOCKED_CANCEL_INPUT",
+        });
+        return;
+      }
+      // Confirmação humana específica: texto exato, sem espécie de variável.
+      const confirmacaoEsperada =
+        "AUTORIZO CANCELAR DE FORMA AUDITADA O LOTE DRY_RUN HISTÓRICO " +
+        "PF-MAIL-PILOTO-MUB37G1H, PRESERVANDO TODOS OS DADOS E SEM EXECUTAR O WORKER";
+      if (body.confirmacao.trim() !== confirmacaoEsperada) {
+        json(res, 422, {
+          erro: "Confirmação humana não corresponde ao texto obrigatório.",
+          codigo: "BLOCKED_CANCEL_CONFIRMATION",
+        });
+        return;
+      }
+      if (process.env.REAL_SEND_ENABLED === "true") {
+        json(res, 409, {
+          erro: "REAL_SEND_ENABLED=true — cancelamento bloqueado.",
+          codigo: "REAL_SEND_ARMED",
+        });
+        return;
+      }
+      try {
+        const contexto = await pool.query<{ codigo: string; status: string; modo: string }>(
+          `SELECT codigo, status, modo FROM lote_comunicacao WHERE id = $1 AND origem = 'PF'`,
+          [body.loteId],
+        );
+        validarCancelamentoLoteHistorico(contexto.rows[0]);
+        const agora = new Date().toISOString();
+        const operador = "operador-autenticado";
+        const estado = await repository.cancelarLoteComunicacao({
+          batchId: body.loteId,
+          origin: "PF",
+          expectedCode: CODIGO_LOTE_HISTORICO_DRY_RUN,
+          realSendEnabled: process.env.REAL_SEND_ENABLED === "true",
+          actorId: operador,
+          cancelledAt: agora,
+          auditEvent: {
+            id: randomUUID(),
+            aggregateType: "LOTE_COMUNICACAO",
+            aggregateId: body.loteId,
+            type: "PF_LOTE_COMUNICACAO_CANCELADO",
+            actorId: operador,
+            occurredAt: agora,
+            metadata: { motivo: "HISTORICAL_DRY_RUN_ISOLATION", modo: "DRY_RUN" },
+            eventHash: hashEvento(body.loteId, agora),
+          },
+        });
+        json(res, 200, {
+          estado,
+          aviso:
+            estado.resultCode === "ALREADY_CANCELLED"
+              ? "Lote histórico já estava CANCELADO — nenhum dado alterado."
+              : "Lote histórico CANCELADO. Dados, outbox e auditoria integralmente preservados.",
+        });
+      } catch (error) {
+        const mensagem = error instanceof Error ? error.message : "Falha no cancelamento.";
+        const codigo = mensagem.includes("NOT_HISTORICAL_BATCH")
+          ? "NOT_HISTORICAL_BATCH"
+          : mensagem.includes("MODE_NOT_DRY_RUN")
+            ? "MODE_NOT_DRY_RUN"
+            : mensagem.includes("OUTBOX_NOT_SETTLED")
+              ? "OUTBOX_NOT_SETTLED"
+              : mensagem.includes("INVALID_STATE")
+                ? "BLOCKED_INVALID_STATE"
+                : "BLOCKED_CANCELLATION";
         json(res, 409, { erro: mensagem, codigo });
       }
     },

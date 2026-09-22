@@ -9,7 +9,9 @@ import type {
   AcceptOutboxCommand,
   ActivateCommunicationBatchCommand,
   BatchActivationState,
+  BatchCancellationState,
   BatchMode,
+  CancelCommunicationBatchCommand,
   ClaimedOutboxItem,
   CommunicationSource,
   ConsumeOauthFlowBindingCommand,
@@ -492,6 +494,90 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         createdAt: row.criado_em.toISOString(),
         activatedAt: command.activatedAt,
         resultCode: "ACTIVATED",
+      };
+    });
+  }
+
+  /**
+   * Cancelamento auditado de lote DRY_RUN histórico (isolamento operacional):
+   * CAS ATIVO → CANCELADO, restrito ao código canônico do lote histórico,
+   * somente em modo DRY_RUN, com outbox totalmente resolvida e
+   * REAL_SEND_ENABLED=false. Nenhum DELETE e nenhuma alteração em itens,
+   * comunicações, outbox, confirmações ou importações — apenas lote.status.
+   * Idempotente-determinístico: já CANCELADO → ALREADY_CANCELLED (sem INSERT
+   * de novo evento).
+   */
+  async cancelarLoteComunicacao(
+    command: CancelCommunicationBatchCommand,
+  ): Promise<BatchCancellationState> {
+    if (command.realSendEnabled) {
+      throw new Error("REAL_SEND_ARMED: cancelamento exige REAL_SEND_ENABLED=false");
+    }
+    return inTransaction(this.pool, async (sql) => {
+      const lote = await sql.query<{
+        codigo: string;
+        status: string;
+        modo: string;
+        criado_em: Date;
+        template_versao: string;
+        total: string;
+      }>(
+        `SELECT l.codigo, l.status, l.modo, l.criado_em, l.template_versao,
+          (SELECT count(*) FROM item_lote_comunicacao i WHERE i.lote_comunicacao_id = l.id) AS total
+        FROM lote_comunicacao l
+        WHERE l.id = $1 AND l.origem = $2
+        FOR UPDATE`,
+        [command.batchId, command.origin],
+      );
+      const row = lote.rows[0];
+      if (!row) {
+        throw new Error("NOT_HISTORICAL_BATCH: lote inexistente ou origem incompatível");
+      }
+      if (row.codigo !== command.expectedCode) {
+        throw new Error(`NOT_HISTORICAL_BATCH: código ${row.codigo} não é o lote histórico autorizado`);
+      }
+      const totalItems = Number(row.total);
+      const estado = (): BatchCancellationState => ({
+        status: row.status as BatchCancellationState["status"],
+        totalItems,
+        templateVersion: row.template_versao,
+        createdAt: row.criado_em.toISOString(),
+        resultCode: "INVALID_STATE",
+      });
+      if (row.status === "CANCELADO") {
+        return { ...estado(), resultCode: "ALREADY_CANCELLED" };
+      }
+      if (row.status !== "ATIVO") {
+        throw new Error(`INVALID_STATE: lote em status ${row.status} não pode ser cancelado`);
+      }
+      if (row.modo !== "DRY_RUN") {
+        throw new Error(`MODE_NOT_DRY_RUN: lote em modo ${row.modo} não é cancelável`);
+      }
+      const outbox = await sql.query<{ total: string }>(
+        `SELECT count(*) AS total
+        FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        WHERE c.lote_comunicacao_id = $1 AND o.status IN ('PENDING', 'PROCESSING')`,
+        [command.batchId],
+      );
+      if (Number(outbox.rows[0]?.total ?? 0) > 0) {
+        throw new Error("OUTBOX_NOT_SETTLED: outbox pendente ou em processamento");
+      }
+      // CAS: só atualiza se ainda ATIVO (protegido pelo FOR UPDATE acima).
+      const cancelado = await sql.query(
+        `UPDATE lote_comunicacao
+        SET status = 'CANCELADO'
+        WHERE id = $1 AND origem = $2 AND status = 'ATIVO'`,
+        [command.batchId, command.origin],
+      );
+      if (cancelado.rowCount !== 1) throw new Error("INVALID_STATE: CAS de cancelamento falhou");
+      await insertAudit(sql, command.auditEvent);
+      return {
+        status: "CANCELADO",
+        totalItems,
+        templateVersion: row.template_versao,
+        createdAt: row.criado_em.toISOString(),
+        resultCode: "CANCELLED",
       };
     });
   }

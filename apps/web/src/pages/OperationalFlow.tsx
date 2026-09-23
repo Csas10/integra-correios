@@ -163,7 +163,29 @@ interface GmailIntegracao {
   hdOrganizacionalConfigurado: boolean;
   realSendEnabled: boolean;
   controlledMode: boolean;
+  /** CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — Provider Gmail configurado: SIM/NÃO. */
+  providerGmailConfigurado?: boolean;
   mensagem: string;
+}
+
+/**
+ * CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — resultado sanitizado da execução
+ * run-once. A UI nunca exibe destinatário, token ou payload; apenas estados,
+ * contagens e códigos.
+ */
+interface ResultadoExecucao {
+  executionMode: string;
+  communicationId: string;
+  estadoComunicacao: string;
+  sentItems: number;
+  falhas: number;
+  executado: boolean;
+  motivoBloqueio: string | null;
+  statusOutbox: string;
+  tentativas: number;
+  erroCodigo: string | null;
+  messageIdPresente: boolean;
+  threadIdPresente: boolean;
 }
 
 interface WorkerRun {
@@ -260,6 +282,10 @@ export function OperationalFlow() {
     resultado: string | null;
   }>({ aberto: false, confirmacao: "", resultado: null });
   const [ativacaoControlada, setAtivacaoControlada] = useState<{
+    confirmacao: string;
+    resultado: string | null;
+  }>({ confirmacao: "", resultado: null });
+  const [retryControlado, setRetryControlado] = useState<{
     confirmacao: string;
     resultado: string | null;
   }>({ confirmacao: "", resultado: null });
@@ -723,29 +749,61 @@ export function OperationalFlow() {
     }
   }
 
+  // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — nova tentativa exclusiva para a
+  // falha comprovadamente pré-rede. Nada é enviado aqui: apenas o evento
+  // auditado de autorização é registrado (REAL_SEND_ENABLED precisa estar false).
+  const CONFIRMACAO_RETRY_CONTROLADO_UI =
+    "AUTORIZO NOVA TENTATIVA CONTROLADA DO LOTE CONTROLLED_GMAIL_TEST APÓS FALHA PRÉ-REDE " +
+    "PROVIDER_NOT_CONFIGURED, PRESERVANDO A TENTATIVA FALHA E SEM REPETIR OUTRAS FALHAS";
+  async function autorizarRetryControlado() {
+    if (gmail?.realSendEnabled) return;
+    if (retryControlado.confirmacao.trim() !== CONFIRMACAO_RETRY_CONTROLADO_UI) return;
+    setOcupado(true);
+    setErro(undefined);
+    try {
+      const resposta = (await chamar("/api/pilot/controlled/retry", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmacao: retryControlado.confirmacao.trim() }),
+      })) as { aviso?: string };
+      setRetryControlado({ confirmacao: "", resultado: resposta.aviso ?? "Nova tentativa autorizada e auditada." });
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha ao registrar a nova tentativa.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
   // Execução LIVE run-once: exatamente UMA tentativa de envio controlado.
+  // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED: a resposta NUNCA é apresentada
+  // como “concluída” quando sentItems=0 ou falhas>0; provider efetivo, outbox,
+  // tentativas e código de falha são exibidos.
+  const [resultadoExecucao, setResultadoExecucao] = useState<ResultadoExecucao | null>(null);
   async function executarEnvioControlado() {
     setOcupado(true);
     setErro(undefined);
     try {
       const resposta = (await chamar("/api/pilot/controlled/execute", {
         method: "POST",
-      })) as {
-        resultado?: { communicationId: string; estadoComunicacao: string; sentItems: number };
-        aviso?: string;
-      };
-      const r = resposta.resultado;
+      })) as { resultado?: ResultadoExecucao; aviso?: string };
+      const r = resposta.resultado ?? null;
+      setResultadoExecucao(r);
+      const ok = Boolean(r && r.executado && r.sentItems > 0 && r.falhas === 0);
       setAtivacaoControlada((atual) => ({
         ...atual,
-        resultado:
-          resposta.aviso ??
-          (r
-            ? `Execução concluída: comunicação ${r.estadoComunicacao} (enviadas: ${r.sentItems}).`
-            : "Execução concluída."),
+        resultado: resposta.aviso
+          ? resposta.aviso
+          : r
+            ? ok
+              ? `Envio real registrado: comunicação ${r.estadoComunicacao} (enviadas: ${r.sentItems}).`
+              : `Execução NÃO concluída — motivo: ${r.motivoBloqueio ?? "—"}; outbox: ${r.statusOutbox}; tentativas: ${r.tentativas}; erro: ${r.erroCodigo ?? "—"}; enviadas: ${r.sentItems}.`
+            : "Execução sem resultado.",
       }));
       await carregarEstadoControlado();
     } catch (e) {
+      setResultadoExecucao(null);
       setErro(e instanceof Error ? e.message : "Falha na execução controlada.");
+      await carregarEstadoControlado().catch(() => undefined);
     } finally {
       setOcupado(false);
     }
@@ -1116,6 +1174,13 @@ export function OperationalFlow() {
               {" · Domínio organizacional: "}
               <code>{gmail.hdOrganizacionalConfigurado ? "SIM" : "NÃO"}</code>
             </li>
+            <li>
+              Provider Gmail configurado:{" "}
+              <code>{gmail.providerGmailConfigurado ? "SIM" : "NÃO"}</code>
+              {gmail.providerGmailConfigurado
+                ? ""
+                : " — envio real permanece bloqueado até MAIL_PROVIDER=Gmail no ambiente."}
+            </li>
           </ul>
           <p>{gmail.mensagem}</p>
           <div className="flow-filters">
@@ -1249,6 +1314,7 @@ export function OperationalFlow() {
                       disabled={
                         ocupado ||
                         !gmail.realSendEnabled ||
+                        gmail.providerGmailConfigurado === false ||
                         estadoControlado.lote.receiptAnterior ||
                         estadoControlado.outboxPendenteForaDoTeste > 0 ||
                         estadoControlado.outboxProcessamento > 0 ||
@@ -1258,9 +1324,71 @@ export function OperationalFlow() {
                       Executar envio controlado (uma única vez)
                     </button>
                   </div>
+                  {resultadoExecucao && (
+                    <div className="flow-stats">
+                      <p>Última execução run-once (sanitizado):</p>
+                      <ul>
+                        <li>
+                          communication_id: <code>{resultadoExecucao.communicationId.slice(0, 8)}…</code> ·{" "}
+                          Estado: <code>{resultadoExecucao.estadoComunicacao}</code> · Outbox:{" "}
+                          <code>{resultadoExecucao.statusOutbox}</code>
+                        </li>
+                        <li>
+                          Tentativas: <code>{resultadoExecucao.tentativas}</code> · Enviadas:{" "}
+                          <code>{resultadoExecucao.sentItems}</code> · Falhas: <code>{resultadoExecucao.falhas}</code>
+                        </li>
+                        <li>
+                          Código de falha: <code>{resultadoExecucao.erroCodigo ?? "—"}</code> · Motivo do motor:{" "}
+                          <code>{resultadoExecucao.motivoBloqueio ?? "—"}</code> · Message-ID:{" "}
+                          <code>{resultadoExecucao.messageIdPresente ? "PRESENT" : "AUSENTE"}</code> · Thread-ID:{" "}
+                          <code>{resultadoExecucao.threadIdPresente ? "PRESENT" : "AUSENTE"}</code>
+                        </li>
+                      </ul>
+                    </div>
+                  )}
                 </div>
               )}
               {ativacaoControlada.resultado && <p>{ativacaoControlada.resultado}</p>}
+              {estadoControlado.lote && estadoControlado.lote.status === "ATIVO" && (
+                <div className="flow-stats">
+                  <p>
+                    <strong>Nova tentativa após falha pré-rede</strong> — exclusiva para
+                    outbox FAILED com PROVIDER_NOT_CONFIGURED (tentativas=1, receipt=0, sem
+                    Message-ID/Thread-ID). DELIVERY_UNKNOWN, AUTH_REQUIRED, FAILED_PERMANENT
+                    ou PROCESSING jamais são reexecutáveis. Registra evento auditado
+                    PF_CONTROLLED_RETRY_AUTORIZADO; a execução em si continua exigindo
+                    MAIL_PROVIDER=Gmail e REAL_SEND_ENABLED=true em etapa separada.
+                  </p>
+                  <p>
+                    Cole exatamente a frase:
+                    <br />
+                    <code>{CONFIRMACAO_RETRY_CONTROLADO_UI}</code>
+                  </p>
+                  <input
+                    value={retryControlado.confirmacao}
+                    onChange={(e) =>
+                      setRetryControlado((atual) => ({ ...atual, confirmacao: e.target.value }))
+                    }
+                    placeholder="Cole a frase de autorização aqui"
+                    disabled={ocupado}
+                    style={{ width: "100%" }}
+                  />
+                  <div className="flow-filters">
+                    <button
+                      type="button"
+                      onClick={autorizarRetryControlado}
+                      disabled={
+                        ocupado ||
+                        gmail.realSendEnabled ||
+                        retryControlado.confirmacao.trim() !== CONFIRMACAO_RETRY_CONTROLADO_UI
+                      }
+                    >
+                      Autorizar nova tentativa (auditado)
+                    </button>
+                  </div>
+                  {retryControlado.resultado && <p>{retryControlado.resultado}</p>}
+                </div>
+              )}
             </div>
           )}
         </details>

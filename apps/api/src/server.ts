@@ -24,6 +24,7 @@ import {
   BloqueioExecucaoControladaError,
   CODIGO_LOTE_HISTORICO_DRY_RUN,
   ativarLoteControlado,
+  autorizarRetryPreRede,
   executarWorkerControladoUmaVez,
   validarCancelamentoLoteHistorico,
 } from "./pilot.js";
@@ -31,6 +32,7 @@ import {
   BloqueioLoteControladoError,
   carregarPilotPolicy,
   carregarPoliticaControlada,
+  carregarPoliticaProvider,
   CODIGO_LOTE_TESTE_CONTROLADO,
   gerarPreviewComunicacao,
   lerEstadoLoteControlado,
@@ -69,7 +71,34 @@ import {
   workerPodeExecutar,
   sondarDatabase,
   executarWorkerUmaVez,
+  executarWorkerUmaVezLive,
 } from "@integra-correios/worker";
+
+/**
+ * CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — a execução controlada somente
+ * prossegue após evento auditado PF_CONTROLLED_RETRY_AUTORIZADO quando a
+ * outbox do teste está FAILED (falha pré-rede liberada). Primeira execução
+ * (outbox PENDING) não exige o evento.
+ */
+async function retryPreRedeAutorizado(pool: {
+  query: (text: string, values?: readonly unknown[]) => Promise<{ rows: readonly any[]; rowCount: number | null }>;
+}): Promise<boolean> {
+  if (process.env.REAL_SEND_ENABLED !== "true") return false;
+  const resultado = await pool.query(
+    `SELECT count(*)::int AS total
+    FROM evento_auditoria ea
+    JOIN lote_comunicacao l ON l.id = ea.agregado_id AND ea.agregado_tipo = 'LOTE_COMUNICACAO'
+    WHERE ea.tipo = 'PF_CONTROLLED_RETRY_AUTORIZADO'
+      AND l.codigo = $1
+      AND ea.ocorreu_em > COALESCE((
+        SELECT max(o.atualizada_em) FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l2 ON l2.id = c.lote_comunicacao_id
+        WHERE l2.codigo = $1 AND o.status = 'FAILED'), 'epoch')`,
+    [CODIGO_LOTE_TESTE_CONTROLADO],
+  );
+  return (resultado.rows[0]?.total ?? 0) > 0;
+}
 
 const PORT = Number(process.env.PORT ?? 8787);
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
@@ -902,14 +931,85 @@ const ROTAS: readonly Rota[] = [
         const resultado = await executarWorkerControladoUmaVez(
           pool,
           carregarPoliticaControlada(),
+          executarWorkerUmaVezLive,
+          {
+            // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED: bloqueio ANTES do claim —
+            // sem MAIL_PROVIDER=Gmail a rota responde SEM mutação.
+            providerGmailConfigurado: carregarPoliticaProvider().providerGmailConfigurado,
+            retryAutorizado: await retryPreRedeAutorizado(pool),
+          },
         );
-        json(res, 200, { resultado, aviso: "Execução run-once concluída; desarmar REAL_SEND_ENABLED imediatamente." });
+        // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — a resposta nunca anuncia
+        // execução concluída quando sentItems=0 ou falhas>0; motivo do motor é
+        // propagado sanitizado. Nenhum destinatário, token ou payload.
+        const ok = resultado.executado && resultado.sentItems > 0 && resultado.falhas === 0;
+        json(res, ok ? 200 : 409, {
+          resultado,
+          ...(ok
+            ? { aviso: "Envio real controlado registrado (1 mensagem). Desarmar REAL_SEND_ENABLED imediatamente." }
+            : {
+                erro:
+                  resultado.motivoBloqueio
+                    ? `Execução interrompida pelo motor: ${resultado.motivoBloqueio}.`
+                    : `Nenhuma comunicação enviada (outbox: ${resultado.statusOutbox}, tentativas: ${resultado.tentativas}, erro: ${resultado.erroCodigo ?? "—"}).`,
+                codigo: resultado.motivoBloqueio ?? "EXECUTION_NOT_COMPLETED",
+              }),
+        });
       } catch (error) {
         if (error instanceof BloqueioExecucaoControladaError) {
           json(res, 409, { erro: error.message, codigo: error.codigo });
           return;
         }
         json(res, 500, { erro: "Falha na execução controlada." });
+        return;
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — nova tentativa controlada
+  // EXCLUSIVA para o erro comprovadamente pré-rede (FAILED +
+  // PROVIDER_NOT_CONFIGURED + tentativas=1 + receipt=0 + sem provider ids).
+  // Exige confirmação humana textual específica e registra o evento auditado
+  // PF_CONTROLLED_RETRY_AUTORIZADO. DELIVERY_UNKNOWN, AUTH_REQUIRED,
+  // FAILED_PERMANENT, PROCESSING ou falha pós-rede NUNCA são elegíveis.
+  // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/pilot/controlled/retry",
+    handler: async (req, res, _url, corpo) => {
+      if (!exigirOperador(req, res)) return;
+      const { pool } = requireDb();
+      const body = JSON.parse(corpo.toString("utf8") || "{}") as { confirmacao?: string };
+      const confirmacaoEsperada =
+        "AUTORIZO NOVA TENTATIVA CONTROLADA DO LOTE CONTROLLED_GMAIL_TEST APÓS FALHA PRÉ-REDE " +
+        "PROVIDER_NOT_CONFIGURED, PRESERVANDO A TENTATIVA FALHA E SEM REPETIR OUTRAS FALHAS";
+      if (!body.confirmacao || body.confirmacao.trim() !== confirmacaoEsperada) {
+        json(res, 422, {
+          erro: "Confirmação humana não corresponde ao texto obrigatório.",
+          codigo: "BLOCKED_RETRY_CONFIRMATION",
+        });
+        return;
+      }
+      if (process.env.REAL_SEND_ENABLED === "true") {
+        json(res, 409, {
+          erro: "REAL_SEND_ENABLED=true — autorização de retry exige envio desarmado.",
+          codigo: "REAL_SEND_ARMED",
+        });
+        return;
+      }
+      try {
+        const resultado = await autorizarRetryPreRede(pool, "operador-autenticado");
+        json(res, 200, {
+          ...resultado,
+          aviso: "Nova tentativa auditada e registrada. A execução só ocorre com MAIL_PROVIDER=Gmail e REAL_SEND_ENABLED=true em etapa separada.",
+        });
+      } catch (error) {
+        if (error instanceof BloqueioExecucaoControladaError) {
+          json(res, 409, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 500, { erro: "Falha ao registrar a nova tentativa." });
       }
     },
   },
@@ -1140,6 +1240,8 @@ const ROTAS: readonly Rota[] = [
         hdOrganizacionalConfigurado: hdOrganizacionalEsperado().length > 0,
         realSendEnabled: process.env.REAL_SEND_ENABLED === "true",
         controlledMode: process.env.GMAIL_CONTROLLED_MODE === "true",
+        // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — SIM/NÃO, sem valor sensível.
+        providerGmailConfigurado: carregarPoliticaProvider().providerGmailConfigurado,
         mensagem:
           config === undefined
             ? "Credenciais OAuth ausentes no ambiente. O titular configura GMAIL_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI — nunca via chat."

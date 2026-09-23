@@ -23,7 +23,7 @@ import {
   GmailPermanentPolicyError,
   GmailRateLimitError,
 } from "@integra-correios/mail";
-import { avaliarReadiness, workerPodeExecutar, type ReadinessReport } from "./readiness.js";
+import { avaliarReadiness, providerGmailConfigurado, workerPodeExecutar, type ReadinessReport } from "./readiness.js";
 
 /**
  * Worker da outbox — MOTOR ÚNICO para DRY_RUN e LIVE_PILOT.
@@ -462,6 +462,9 @@ export async function executarWorkerUmaVez(
  * F6 — Motor LIVE separado: NÃO é acessível pela rota do Preview. Exige
  * chamador explicitamente autorizado (CLI com REAL_SEND_ENABLED=true + lote
  * ATIVO). O browser jamais alcança este caminho.
+ *
+ * CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — propagar {readiness, motivo}:
+ * o chamador NUNCA pode interpretar "nada enviado" como execução concluída.
  */
 export async function executarWorkerUmaVezLive(
   opcoes: { workerId?: string; env?: Readonly<Record<string, string | undefined>> } = {},
@@ -474,13 +477,19 @@ async function executarWorkerDoModo(
 ): Promise<{ readiness: ReadinessReport; resultado?: WorkerResult; motivo?: string }> {
   const env = opcoes.env ?? process.env;
   const readiness = await avaliarReadiness(env, () => sondarDatabase(env));
-  const veredito = workerPodeExecutar(readiness);
+  const veredito = workerPodeExecutar(readiness, env, { live: !opcoes.dryRun });
   if (!veredito.ok) {
     return { readiness, motivo: veredito.motivo };
   }
   const live = !opcoes.dryRun;
   if (live && readiness.realSend.status !== "BLOCKED_EXTERNAL" && readiness.realSend.status !== "READY") {
     return { readiness, motivo: "REAL_SEND_DISABLED" };
+  }
+  // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — defesa em profundidade: mesmo que
+  // outro caminho chegue aqui em LIVE, sem MAIL_PROVIDER=Gmail o gateway real
+  // seria o desabilitado. Recusa ANTES do pool/claim, sem consumir tentativa.
+  if (live && !providerGmailConfigurado(env)) {
+    return { readiness, motivo: "PROVIDER_NOT_CONFIGURED" };
   }
   const pool = new NodePostgresPool({ connectionString: env.DATABASE_URL, max: 4 });
   try {

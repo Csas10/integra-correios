@@ -36,6 +36,8 @@ export interface ReadinessReport {
   readonly outbox: ReadinessItem;
   readonly worker: ReadinessItem;
   readonly gmailTransport: ReadinessItem;
+  /** CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — Provider Gmail configurado: SIM/NÃO. */
+  readonly gmailProvider: ReadinessItem;
   readonly gmailOauth: ReadinessItem;
   readonly realSend: ReadinessItem;
   readonly ppn: ReadinessItem;
@@ -44,6 +46,18 @@ export interface ReadinessReport {
 }
 
 type Environment = Readonly<Record<string, string | undefined>>;
+
+/**
+ * CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — provider efetivo do transporte.
+ * SOMENTE MAIL_PROVIDER === "GMAIL" (normalizado) habilita o gateway Gmail no
+ * worker (criarGatewayDoAmbiente); qualquer outro valor — inclusive ausente —
+ * seleciona DisabledMailGateway e o envio falha ANTES da rede com
+ * PROVIDER_NOT_CONFIGURED. O readiness NUNCA pode anunciar transporte
+ * READY/ARMED quando o provider efetivo não é Gmail.
+ */
+export function providerGmailConfigurado(env: Environment): boolean {
+  return (env.MAIL_PROVIDER ?? "").trim().toUpperCase() === "GMAIL";
+}
 
 function item(
   name: string,
@@ -143,16 +157,35 @@ export async function avaliarReadiness(
             : "Titular conecta a conta institucional no fluxo OAuth (gate humano).",
         );
 
-  const gmailTransport = realSendEnabled
-    ? oauthConfig
-      ? item("Gmail transport", "READY", "Transporte messages.send habilitado (GATE 1 ativo).")
-      : item(
+  // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED: sem MAIL_PROVIDER=Gmail o worker
+  // escolhe o gateway desabilitado — o transporte nunca pode aparecer READY/ARMED.
+  const providerOk = providerGmailConfigurado(env);
+  const gmailTransport = !realSendEnabled
+    ? item("Gmail transport", "DISABLED", "Transporte real bloqueado (REAL_SEND_ENABLED=false).")
+    : !providerOk
+      ? item(
           "Gmail transport",
           "CONFIGURATION_REQUIRED",
-          "REAL_SEND_ENABLED=true mas credenciais OAuth ausentes.",
-          "Configurar credenciais Google OAuth antes do envio real.",
+          "Provider de e-mail não é Gmail — envio real selecionaria gateway desabilitado.",
+          "Definir MAIL_PROVIDER=Gmail no ambiente antes de armar o envio real.",
         )
-    : item("Gmail transport", "DISABLED", "Transporte real bloqueado (REAL_SEND_ENABLED=false).");
+      : oauthConfig
+        ? item("Gmail transport", "READY", "Transporte messages.send habilitado (GATE 1 ativo).")
+        : item(
+            "Gmail transport",
+            "CONFIGURATION_REQUIRED",
+            "REAL_SEND_ENABLED=true mas credenciais OAuth ausentes.",
+            "Configurar credenciais Google OAuth antes do envio real.",
+          );
+  // Painel read-only: somente SIM/NÃO — o valor da variável nunca é exposto.
+  const gmailProviderItem = providerOk
+    ? item("Gmail provider configurado", "READY", "Provider Gmail configurado: SIM.")
+    : item(
+        "Gmail provider configurado",
+        "CONFIGURATION_REQUIRED",
+        "Provider Gmail configurado: NÃO.",
+        "Definir MAIL_PROVIDER=Gmail no ambiente.",
+      );
 
   const realSend = realSendEnabled
     ? realSendExecuted
@@ -201,16 +234,26 @@ export async function avaliarReadiness(
           "PILOT_MODE inativo — processamento da outbox bloqueado.",
           "Definir PILOT_MODE=true para o piloto.",
         ),
-    gmailTransport: controlledMode && realSendEnabled
-      ? item(
-          "Gmail transport",
-          "BLOCKED_EXTERNAL",
-          "GATE 1 ativo em GMAIL_CONTROLLED_MODE: somente destinatário controlado configurado.",
-          "Titular define o destinatário controlado fora do Git antes de qualquer teste real controlado.",
-        )
-      : gmailTransport,
+    gmailTransport: !providerOk
+      ? gmailTransport // provider ausente/divergente permanece bloqueado mesmo em modo controlado
+      : controlledMode && realSendEnabled
+        ? item(
+            "Gmail transport",
+            "BLOCKED_EXTERNAL",
+            "GATE 1 ativo em GMAIL_CONTROLLED_MODE: somente destinatário controlado configurado.",
+            "Titular define o destinatário controlado fora do Git antes de qualquer teste real controlado.",
+          )
+        : gmailTransport,
+    gmailProvider: gmailProviderItem,
     gmailOauth,
-    realSend,
+    realSend: realSendEnabled && !providerOk
+      ? item(
+          "Real send",
+          "CONFIGURATION_REQUIRED",
+          "GATE 1 armado, porém o provider efetivo não é Gmail — execução real permanece bloqueada.",
+          "Definir MAIL_PROVIDER=Gmail no ambiente.",
+        )
+      : realSend,
     ppn: item("PPN", "DISABLED", "Integração PPN/Correios fora do escopo desta fase."),
     executionMode,
   };
@@ -219,8 +262,17 @@ export async function avaliarReadiness(
 /**
  * Invariante de execução do worker: recusa processar quando requisitos
  * internos não estão READY (fail-closed).
+ *
+ * CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED: quando o AMBIENTE é injetado,
+ * o modo LIVE exige MAIL_PROVIDER=Gmail — sem isso o gateway real seria o
+ * desabilitado e cada tentativa consumiria claim+tentativa para falhar
+ * antes da rede (PROVIDER_NOT_CONFIGURED). A recusa acontece ANTES do claim.
  */
-export function workerPodeExecutar(report: ReadinessReport): { ok: boolean; motivo: string } {
+export function workerPodeExecutar(
+  report: ReadinessReport,
+  env?: Environment,
+  opcoes?: { live?: boolean },
+): { ok: boolean; motivo: string } {
   if (report.database.status !== "READY") {
     return { ok: false, motivo: `DATABASE_${report.database.status}` };
   }
@@ -229,6 +281,11 @@ export function workerPodeExecutar(report: ReadinessReport): { ok: boolean; moti
   }
   if (report.worker.status !== "READY") {
     return { ok: false, motivo: "WORKER_DISABLED" };
+  }
+  // Somente o caminho LIVE exige provider Gmail (a execução DRY_RUN usa
+  // gateway sintético e nunca toca o provider real).
+  if (env !== undefined && opcoes?.live === true && !providerGmailConfigurado(env)) {
+    return { ok: false, motivo: "PROVIDER_NOT_CONFIGURED" };
   }
   return { ok: true, motivo: report.executionMode };
 }

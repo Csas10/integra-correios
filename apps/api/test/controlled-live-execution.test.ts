@@ -16,7 +16,9 @@ import {
   BloqueioExecucaoControladaError,
   BloqueioLoteControladoError,
   ativarLoteControlado,
+  autorizarRetryPreRede,
   executarWorkerControladoUmaVez,
+  validarRetryPreRede,
 } from "../src/pilot.js";
 
 const RECIPIENTE = "controlado@example.test";
@@ -46,6 +48,11 @@ const PREVOO_OK = {
       processamento: "0",
       modo: "LIVE_PILOT",
       status_lote: "ATIVO",
+      teste_pendente: "1",
+      outbox_status_teste: "PENDING",
+      outbox_tentativas_teste: "0",
+      outbox_erro_teste: null,
+      provider_ids_teste: "0",
     },
   ],
   rowCount: 1,
@@ -57,6 +64,11 @@ const POSFLIGHT_ENVIADO = {
       communication_id: "50000000-0000-4000-8000-000000000001",
       estado: "ACCEPTED",
       receipts_globais: "1",
+      outbox_status: "SENT",
+      outbox_tentativas: "1",
+      outbox_erro: null,
+      message_id_presente: true,
+      thread_id_presente: true,
     },
   ],
   rowCount: 1,
@@ -120,13 +132,117 @@ describe("executarWorkerControladoUmaVez — pré-voo fail-closed", () => {
     expect(executarLive).not.toHaveBeenCalled();
   });
 
+  it("bloqueia provider não-Gmail ANTES do claim — zero consultas e zero chamadas", async () => {
+    const pool = poolSequencial([]);
+    const executarLive = vi.fn();
+    await expect(
+      executarWorkerControladoUmaVez(
+        pool,
+        politica({ REAL_SEND_ENABLED: "true" }),
+        executarLive,
+        { providerGmailConfigurado: false },
+      ),
+    ).rejects.toMatchObject({ codigo: "PROVIDER_NOT_CONFIGURED" });
+    expect(executarLive).not.toHaveBeenCalled();
+    expect(pool.consultas).toHaveLength(0); // nada consumido, nada mutado
+  });
+
+  it("recusa execução quando a outbox do teste não está PENDING (nenhuma repetição)", async () => {
+    const executarLive = vi.fn();
+    const pool = poolSequencial([
+      { rows: [{ ...PREVOO_OK.rows[0], outbox_status_teste: "FAILED", outbox_erro_teste: "DELIVERY_UNKNOWN" }], rowCount: 1 },
+    ]);
+    await expect(
+      executarWorkerControladoUmaVez(pool, politica({ REAL_SEND_ENABLED: "true" }), executarLive),
+    ).rejects.toMatchObject({ codigo: "OUTBOX_NOT_PENDING" });
+    expect(executarLive).not.toHaveBeenCalled();
+  });
+
+  it("falha pré-rede FAILED exige liberação auditada (RETRY_NOT_AUTHORIZED)", async () => {
+    const executarLive = vi.fn();
+    const pool = poolSequencial([
+      {
+        rows: [
+          {
+            ...PREVOO_OK.rows[0],
+            outbox_status_teste: "FAILED",
+            outbox_erro_teste: "PROVIDER_NOT_CONFIGURED",
+            outbox_tentativas_teste: "1",
+            provider_ids_teste: "0",
+          },
+        ],
+        rowCount: 1,
+      },
+    ]);
+    await expect(
+      executarWorkerControladoUmaVez(pool, politica({ REAL_SEND_ENABLED: "true" }), executarLive),
+    ).rejects.toMatchObject({ codigo: "RETRY_NOT_AUTHORIZED" });
+    expect(executarLive).not.toHaveBeenCalled();
+  });
+
+  it("retry pré-rede liberado executa exatamente uma vez e propaga motivo do motor", async () => {
+    const pool = poolSequencial([
+      {
+        rows: [
+          {
+            ...PREVOO_OK.rows[0],
+            outbox_status_teste: "FAILED",
+            outbox_erro_teste: "PROVIDER_NOT_CONFIGURED",
+            outbox_tentativas_teste: "1",
+          },
+        ],
+        rowCount: 1,
+      },
+      // Pós-voo: motor bloqueado antes do claim → nada enviado.
+      {
+        rows: [
+          {
+            communication_id: "50000000-0000-4000-8000-000000000001",
+            estado: "FAILED",
+            receipts_globais: "0",
+            outbox_status: "FAILED",
+            outbox_tentativas: "1",
+            outbox_erro: "PROVIDER_NOT_CONFIGURED",
+            message_id_presente: false,
+            thread_id_presente: false,
+          },
+        ],
+        rowCount: 1,
+      },
+    ]);
+    const executarLive = vi.fn().mockResolvedValue({ motivo: "PROVIDER_NOT_CONFIGURED" });
+    const resultado = await executarWorkerControladoUmaVez(
+      pool,
+      politica({ REAL_SEND_ENABLED: "true" }),
+      executarLive,
+      { retryAutorizado: true },
+    );
+    expect(executarLive).toHaveBeenCalledTimes(1); // run-once, sem loop
+    expect(resultado.sentItems).toBe(0);
+    expect(resultado.falhas).toBe(1);
+    expect(resultado.executado).toBe(false);
+    expect(resultado.motivoBloqueio).toBe("PROVIDER_NOT_CONFIGURED");
+    expect(resultado.statusOutbox).toBe("FAILED");
+    expect(resultado.tentativas).toBe(1);
+    expect(resultado.erroCodigo).toBe("PROVIDER_NOT_CONFIGURED");
+    expect(resultado.messageIdPresente).toBe(false);
+  });
+
   it("executa exatamente UMA iteração e deriva o estado pós-envio do banco", async () => {
     const pool = poolSequencial([PREVOO_OK, POSFLIGHT_ENVIADO]);
     const executarLive = vi.fn().mockResolvedValue({ resultado: { enviados: 1 } });
-    const resultado = await executarWorkerControladoUmaVez(pool, politica({ REAL_SEND_ENABLED: "true" }), executarLive);
+    const resultado = await executarWorkerControladoUmaVez(
+      pool,
+      politica({ REAL_SEND_ENABLED: "true" }),
+      executarLive,
+      { providerGmailConfigurado: true },
+    );
     expect(executarLive).toHaveBeenCalledTimes(1); // run-once, sem loop
     expect(resultado.executionMode).toBe("CONTROLLED_GMAIL_TEST");
     expect(resultado.sentItems).toBe(1);
+    expect(resultado.falhas).toBe(0);
+    expect(resultado.executado).toBe(true);
+    expect(resultado.motivoBloqueio).toBeNull();
     expect(resultado.estadoComunicacao).toBe("ACCEPTED");
   });
 

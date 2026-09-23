@@ -13,6 +13,24 @@ import {
   type EncryptedValue,
 } from "@integra-correios/persistence";
 import { executarWorkerUmaVezLive } from "@integra-correios/worker";
+import { providerGmailConfigurado } from "@integra-correios/worker";
+
+/**
+ * CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — política do provider para a API:
+ * o valor efetivo é lido do AMBIENTE (nunca do request); exposto como
+ * SIM/NÃO. Sem Gmail, a rota de execução responde sem mutação (o worker
+ * também recusa ANTES do claim) e o diagnóstico marca o transporte como
+ * bloqueado.
+ */
+export interface PoliticaProvider {
+  readonly providerGmailConfigurado: boolean;
+}
+
+export function carregarPoliticaProvider(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): PoliticaProvider {
+  return { providerGmailConfigurado: providerGmailConfigurado(env) };
+}
 
 /**
  * Piloto PF — seleção com hard cap SERVER-SIDE, preview e criação
@@ -1002,19 +1020,45 @@ export interface ResultadoExecucaoControlada {
   readonly estadoComunicacao: string;
   readonly sentItems: number;
   readonly falhas: number;
+  /** True somente quando a iteração run-once realmente processou itens. */
+  readonly executado: boolean;
+  /** Motivo de bloqueio propagado pelo motor (nunca “sucesso sem envio”). */
+  readonly motivoBloqueio: string | null;
+  /** Estado da outbox após a iteração (SENT/FAILED/…). */
+  readonly statusOutbox: string;
+  readonly tentativas: number;
+  readonly erroCodigo: string | null;
+  /** Provider message/thread id presentes (SIM/NÃO — nunca o valor). */
+  readonly messageIdPresente: boolean;
+  readonly threadIdPresente: boolean;
 }
 
 export type ExecucaoLiveControlada = typeof executarWorkerUmaVezLive;
+
+/** Falha pré-rede comprovada que habilita o retry controlado exclusivo. */
+export const CODIGO_RETRY_PRE_REDE = "PROVIDER_NOT_CONFIGURED";
 
 /**
  * Executa o worker LIVE run-once com pré-voo fail-closed. Nunca chama o Gmail
  * quando qualquer condição diverge; executa exatamente UMA iteração (sem loop,
  * sem retry — o motor classifica DELIVERY_UNKNOWN/AUTH_REQUIRED e para).
+ *
+ * CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED:
+ *  - exige MAIL_PROVIDER=Gmail ANTES do claim — caso contrário responde sem
+ *    mutação com PROVIDER_NOT_CONFIGURED (a tentativa falha anterior é
+ *    integralmente preservada);
+ *  - quando a outbox do teste já está FAILED, a execução só prossegue no
+ *    cenário de retry exclusivo (FAILED + PROVIDER_NOT_CONFIGURED +
+ *    tentativas=1 + zero receipts + ausência de provider message/thread id)
+ *    após liberação auditada específica;
+ *  - propaga {readiness, motivo} do motor e NUNCA reporta execução concluída
+ *    quando sentItems=0 ou falhas>0.
  */
 export async function executarWorkerControladoUmaVez(
   pool: PoolConsulta,
   politica: PoliticaControlada,
   executarLive: ExecucaoLiveControlada = executarWorkerUmaVezLive,
+  opcoes: { providerGmailConfigurado?: boolean; retryAutorizado?: boolean } = {},
 ): Promise<ResultadoExecucaoControlada> {
   if (!politica.controlledMode) {
     throw new BloqueioExecucaoControladaError(
@@ -1034,6 +1078,15 @@ export async function executarWorkerControladoUmaVez(
       "GMAIL_CONTROLLED_RECIPIENT ausente — executar apenas com REAL_SEND_ENABLED=false.",
     );
   }
+  // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — bloqueio ANTES do claim: sem
+  // Gmail o gateway real seria o desabilitado e a tentativa seria consumida
+  // por uma falha pré-rede. Resposta sem mutação, com código sanitizado.
+  if (opcoes.providerGmailConfigurado === false) {
+    throw new BloqueioExecucaoControladaError(
+      "PROVIDER_NOT_CONFIGURED",
+      "MAIL_PROVIDER não é Gmail — execução real recusada antes de qualquer tentativa.",
+    );
+  }
   const preflight = await pool.query(
     `SELECT
       (SELECT count(*) FROM comunicacao c JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
@@ -1048,7 +1101,26 @@ export async function executarWorkerControladoUmaVez(
         WHERE o.status IN ('PENDING', 'FAILED') AND l.codigo <> $1) AS pendente_fora,
       (SELECT count(*) FROM outbox_email o WHERE o.status = 'PROCESSING') AS processamento,
       (SELECT modo FROM lote_comunicacao WHERE codigo = $1) AS modo,
-      (SELECT status FROM lote_comunicacao WHERE codigo = $1) AS status_lote`,
+      (SELECT status FROM lote_comunicacao WHERE codigo = $1) AS status_lote,
+      (SELECT count(*) FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1 AND o.status IN ('PENDING', 'FAILED')) AS teste_pendente,
+      (SELECT o.status FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1 ORDER BY o.criada_em DESC LIMIT 1) AS outbox_status_teste,
+      (SELECT o.tentativas FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1 ORDER BY o.criada_em DESC LIMIT 1) AS outbox_tentativas_teste,
+      (SELECT o.ultimo_erro_codigo FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1 ORDER BY o.criada_em DESC LIMIT 1) AS outbox_erro_teste,
+      (SELECT count(*) FROM comunicacao c
+        WHERE c.lote_comunicacao_id = (SELECT id FROM lote_comunicacao WHERE codigo = $1)
+          AND (c.provider_message_id IS NOT NULL OR c.provider_thread_id IS NOT NULL)) AS provider_ids_teste`,
     [CODIGO_LOTE_TESTE_CONTROLADO],
   );
   const p = preflight.rows[0] ?? {};
@@ -1082,15 +1154,56 @@ export async function executarWorkerControladoUmaVez(
       `Lote controlado deve estar ATIVO em LIVE_PILOT (atual: ${p.status_lote ?? "—"}/${p.modo ?? "—"}).`,
     );
   }
+  // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — a outbox do teste precisa estar
+  // PENDING (primeira execução) OU no cenário EXATO de retry pré-rede liberado
+  // por autorização auditada. Qualquer outro estado (PROCESSING, outra falha,
+  // mais de uma tentativa, provider ids presentes) é recusado sem mutação.
+  const testePendente = Number(p.teste_pendente ?? 0);
+  const retryCenario =
+    String(p.outbox_status_teste ?? "") === "FAILED" &&
+    String(p.outbox_erro_teste ?? "") === CODIGO_RETRY_PRE_REDE &&
+    Number(p.outbox_tentativas_teste ?? 0) === 1 &&
+    Number(p.provider_ids_teste ?? 0) === 0;
+  if (testePendente === 1 && retryCenario) {
+    if (opcoes.retryAutorizado !== true) {
+      throw new BloqueioExecucaoControladaError(
+        "RETRY_NOT_AUTHORIZED",
+        "Outbox do teste está FAILED por PROVIDER_NOT_CONFIGURED — nova tentativa exige liberação auditada específica.",
+      );
+    }
+    // Retry liberado: segue para o claim.
+  } else if (testePendente === 1) {
+    if (String(p.outbox_status_teste ?? "") !== "PENDING") {
+      throw new BloqueioExecucaoControladaError(
+        "OUTBOX_NOT_PENDING",
+        `Outbox do teste em estado não reexecutável (${String(p.outbox_status_teste ?? "?")}/${String(p.outbox_erro_teste ?? "—")}) — nenhuma repetição é permitida.`,
+      );
+    }
+    // Primeira execução: outbox PENDING, segue para o claim.
+  } else {
+    throw new BloqueioExecucaoControladaError(
+      "OUTBOX_NOT_PENDING",
+      "Outbox do teste não está elegível — nenhuma reexecução é permitida.",
+    );
+  }
 
   // EXATAMENTE UMA execução run-once. O motor LIVE aplica GATE 1/2 e o gate
   // controlado por comunicação (fonte + destinatário) imediatamente antes de
   // users.messages.send; nenhum retry automático acontece.
-  await executarLive({ env: process.env });
+  const live = await executarLive({ env: process.env });
+  const motivoBloqueio = live.motivo ?? null;
 
   const posflight = await pool.query(
     `SELECT c.id AS communication_id, c.status AS estado,
-      (SELECT count(*) FROM comunicacao c2 WHERE c2.provider = 'GMAIL') AS receipts_globais
+      (SELECT count(*) FROM comunicacao c2 WHERE c2.provider = 'GMAIL') AS receipts_globais,
+      (SELECT o.status FROM outbox_email o WHERE o.comunicacao_id = c.id
+        ORDER BY o.criada_em DESC LIMIT 1) AS outbox_status,
+      (SELECT o.tentativas FROM outbox_email o WHERE o.comunicacao_id = c.id
+        ORDER BY o.criada_em DESC LIMIT 1) AS outbox_tentativas,
+      (SELECT o.ultimo_erro_codigo FROM outbox_email o WHERE o.comunicacao_id = c.id
+        ORDER BY o.criada_em DESC LIMIT 1) AS outbox_erro,
+      (c.provider_message_id IS NOT NULL) AS message_id_presente,
+      (c.provider_thread_id IS NOT NULL) AS thread_id_presente
     FROM comunicacao c
     JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
     WHERE l.codigo = $1
@@ -1098,13 +1211,112 @@ export async function executarWorkerControladoUmaVez(
     [CODIGO_LOTE_TESTE_CONTROLADO],
   );
   const s = posflight.rows[0] ?? {};
+  const recebidas = Number(s.receipts_globais ?? 0);
+  const enviados = recebidas > 0 ? 1 : 0;
+  const statusOutbox = String(s.outbox_status ?? "UNKNOWN");
+  const estadoComunicacao = String(s.estado ?? "UNKNOWN");
   return {
     executionMode: "CONTROLLED_GMAIL_TEST",
     communicationId: String(s.communication_id ?? ""),
-    estadoComunicacao: String(s.estado ?? "UNKNOWN"),
-    sentItems: Number(s.receipts_globais ?? 0) > 0 ? 1 : 0,
-    falhas: Number(s.receipts_globais ?? 0) > 0 || s.estado === "FAILED" ? 0 : 1,
+    estadoComunicacao,
+    sentItems: enviados,
+    falhas: enviados === 0 ? 1 : 0,
+    // CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — "executado" é verdadeiro
+    // SOMENTE quando o motor rodou sem bloqueio; o chamador NUNCA deve
+    // anunciar "execução concluída" quando sentItems=0 ou falhas>0.
+    executado: motivoBloqueio === null && enviados > 0,
+    motivoBloqueio,
+    statusOutbox,
+    tentativas: Number(s.outbox_tentativas ?? 0),
+    erroCodigo: s.outbox_erro === null || s.outbox_erro === undefined ? null : String(s.outbox_erro),
+    messageIdPresente: s.message_id_presente === true,
+    threadIdPresente: s.thread_id_presente === true,
   };
+}
+
+/**
+ * CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — liberação de NOVA TENTATIVA
+ * exclusiva para o erro comprovadamente pré-rede. O estado é lido do banco:
+ * só passa quando a outbox do teste está FAILED com PROVIDER_NOT_CONFIGURED,
+ * tentativas=1, zero receipts Gmail e ausência de provider message/thread id.
+ * DELIVERY_UNKNOWN, AUTH_REQUIRED, FAILED_PERMANENT, PROCESSING ou qualquer
+ * falha pós-rede NUNCA são elegíveis.
+ */
+export function validarRetryPreRede(p: {
+  outbox_status_teste?: string | null;
+  outbox_erro_teste?: string | null;
+  outbox_tentativas_teste?: number | string | null;
+  receipts_globais?: number | string | null;
+  provider_ids_teste?: number | string | null;
+  status_lote?: string | null;
+}): void {
+  const elegivel =
+    String(p.status_lote ?? "") === "ATIVO" &&
+    String(p.outbox_status_teste ?? "") === "FAILED" &&
+    String(p.outbox_erro_teste ?? "") === CODIGO_RETRY_PRE_REDE &&
+    Number(p.outbox_tentativas_teste ?? 0) === 1 &&
+    Number(p.receipts_globais ?? 0) === 0 &&
+    Number(p.provider_ids_teste ?? 0) === 0;
+  if (!elegivel) {
+    throw new BloqueioExecucaoControladaError(
+      "RETRY_NOT_ELIGIBLE",
+      "Nova tentativa permitida exclusivamente para FAILED+PROVIDER_NOT_CONFIGURED+tentativas=1+receipt=0+sem provider ids.",
+    );
+  }
+}
+
+/**
+ * Registra o evento auditado da nova autorização humana (PF_CONTROLLED_RETRY_AUTORIZADO)
+ * e devolve o estado atualizado. Nenhum UPDATE de status, nenhum DELETE.
+ */
+export async function autorizarRetryPreRede(
+  pool: PoolConsulta,
+  operador: string,
+): Promise<{ autorizado: boolean }> {
+  const preflight = await pool.query(
+    `SELECT
+      (SELECT count(*) FROM comunicacao c WHERE c.provider = 'GMAIL') AS receipts_globais,
+      (SELECT status FROM lote_comunicacao WHERE codigo = $1) AS status_lote,
+      (SELECT o.status FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1 ORDER BY o.criada_em DESC LIMIT 1) AS outbox_status_teste,
+      (SELECT o.tentativas FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1 ORDER BY o.criada_em DESC LIMIT 1) AS outbox_tentativas_teste,
+      (SELECT o.ultimo_erro_codigo FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1 ORDER BY o.criada_em DESC LIMIT 1) AS outbox_erro_teste,
+      (SELECT count(*) FROM comunicacao c
+        WHERE c.lote_comunicacao_id = (SELECT id FROM lote_comunicacao WHERE codigo = $1)
+          AND (c.provider_message_id IS NOT NULL OR c.provider_thread_id IS NOT NULL)) AS provider_ids_teste`,
+    [CODIGO_LOTE_TESTE_CONTROLADO],
+  );
+  validarRetryPreRede(preflight.rows[0] ?? {});
+  const agora = new Date().toISOString();
+  const loteId = await pool.query(
+    `SELECT id FROM lote_comunicacao WHERE codigo = $1 LIMIT 1`,
+    [CODIGO_LOTE_TESTE_CONTROLADO],
+  );
+  await pool.query(
+    `INSERT INTO evento_auditoria (
+      id, agregado_tipo, agregado_id, tipo, ator_id, ocorreu_em,
+      metadados, hash_anterior, hash_evento
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NULL, $8)`,
+    [
+      randomUUID(),
+      "LOTE_COMUNICACAO",
+      String(loteId.rows[0]?.id ?? ""),
+      "PF_CONTROLLED_RETRY_AUTORIZADO",
+      operador,
+      agora,
+      JSON.stringify({ motivo: CODIGO_RETRY_PRE_REDE, finalidade: "nova-tentativa-controlada-pre-rede" }),
+      hashEvento(CODIGO_LOTE_TESTE_CONTROLADO, agora),
+    ],
+  );
+  return { autorizado: true };
 }
 
 const MARCADOR_SNAPSHOT_SINTETICO = JSON.stringify({

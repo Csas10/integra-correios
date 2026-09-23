@@ -112,6 +112,7 @@ describe("GMAIL_CONTROLLED_MODE — reflexo na readiness", () => {
         PILOT_MODE: "true",
         REAL_SEND_ENABLED: "true",
         GMAIL_CONTROLLED_MODE: "true",
+        MAIL_PROVIDER: "GMAIL",
         GMAIL_OAUTH_CLIENT_ID: "id-sintetico",
         GMAIL_OAUTH_CLIENT_SECRET: "secret-sintetico",
         GMAIL_OAUTH_REDIRECT_URI: "https://preview.exemplo.test/api/oauth/gmail/callback",
@@ -120,5 +121,26 @@ describe("GMAIL_CONTROLLED_MODE — reflexo na readiness", () => {
     );
     expect(report.gmailTransport.status).toBe("BLOCKED_EXTERNAL");
     expect(report.gmailTransport.detail).toContain("GMAIL_CONTROLLED_MODE");
+    expect(report.gmailProvider.status).toBe("READY");
+    expect(report.gmailProvider.detail).toContain("SIM");
+  });
+
+  it("REAL_SEND_ENABLED=true sem MAIL_PROVIDER=Gmail nunca anuncia transporte pronto", async () => {
+    const { avaliarReadiness } = await import("../../worker/src/readiness.js");
+    const report = await avaliarReadiness(
+      {
+        PILOT_MODE: "true",
+        REAL_SEND_ENABLED: "true",
+        GMAIL_CONTROLLED_MODE: "true",
+        // MAIL_PROVIDER ausente — reproução do incidente ZERO_GMAIL_CALL:
+        // o gateway real seria o desabilitado, então a readiness não pode
+        // anunciar READY/ARMED/BLOCKED_EXTERNAL.
+      },
+      async () => true,
+    );
+    expect(report.gmailProvider.status).toBe("CONFIGURATION_REQUIRED");
+    expect(report.gmailProvider.detail).toContain("NÃO");
+    expect(report.gmailTransport.status).toBe("CONFIGURATION_REQUIRED");
+    expect(report.realSend.status).toBe("CONFIGURATION_REQUIRED");
   });
 });

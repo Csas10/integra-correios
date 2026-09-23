@@ -1086,6 +1086,22 @@ const ROTAS: readonly Rota[] = [
           json(res, 409, { erro: error.message, codigo: error.codigo });
           return;
         }
+        // CORRECTIVE_RECOVERY_SQL_SYNTAX — log estruturado SANITIZADO: fase,
+        // SQLSTATE (código do driver, sem mensagem) e classe do erro. A
+        // mensagem bruta pode conter fragmento de SQL/DSN e nunca é ecoada
+        // no log nem na resposta.
+        const sqlstate =
+          typeof error === "object" && error !== null && "code" in error &&
+          typeof (error as { code?: unknown }).code === "string"
+            ? (error as { code: string }).code
+            : null;
+        console.error(
+          JSON.stringify({
+            fase: "controlled.oauth-recovery",
+            classeErro: error instanceof Error ? error.name : "Unknown",
+            ...(sqlstate && /^[0-9A-Z]{5}$/.test(sqlstate) ? { sqlstate } : {}),
+          }),
+        );
         json(res, 500, { erro: "Falha ao registrar a recuperação." });
       }
     },

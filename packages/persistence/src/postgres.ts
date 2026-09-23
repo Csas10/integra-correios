@@ -604,12 +604,14 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
       // FAILED_PERMANENT a recuperação fica vinculada à comunicação EXATA do
       // incidente (definida server-side, nunca recebida do navegador) e exige
       // o evento prévio PF_CONTROLLED_RETRY_AUTORIZADO do lote.
+      // CORRECTIVE_RECOVERY_SQL_SYNTAX — cláusula montada com espaço inicial
+      // (interpolada logo após `$1`; sem isso o SQL virava `$1AND`).
       const vinculoLegado = command.expectedCommunicationId !== undefined;
       const parametros: unknown[] = [command.expectedCode];
       let filtroComunicacao = "";
       if (vinculoLegado) {
         parametros.push(command.expectedCommunicationId);
-        filtroComunicacao = `AND o.comunicacao_id = $2`;
+        filtroComunicacao = ` AND o.comunicacao_id = $2`;
       }
       const estado = await sql.query<{
         outbox_id: string;
@@ -681,11 +683,12 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
       if (linha.outbox_status === "PENDING") {
         // Idempotência: já recuperado — estado atual, sem nova mutação. O
         // evento de recuperação é procurado pelo comunicacao_id REAL.
+        // CORRECTIVE_RECOVERY_SQL_SYNTAX — um único placeholder ($1).
         const jaRecuperado = await sql.query<{ total: string }>(
           `SELECT count(*) AS total FROM evento_auditoria ea
-          WHERE ea.agregado_tipo = 'COMUNICACAO' AND ea.agregado_id = $2
+          WHERE ea.agregado_tipo = 'COMUNICACAO' AND ea.agregado_id = $1
             AND ea.tipo = 'PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO'`,
-          [linha.outbox_id, linha.comunicacao_id],
+          [linha.comunicacao_id],
         );
         if (Number(jaRecuperado.rows[0]?.total ?? 0) > 0) {
           return { resultCode: "ALREADY_RECOVERED", outboxId: linha.outbox_id, status: linha.outbox_status };

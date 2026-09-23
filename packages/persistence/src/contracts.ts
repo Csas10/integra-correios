@@ -136,6 +136,15 @@ export interface RecoverControlledOutboxCommand {
   readonly expectedErrorCode: string;
   /** Tentativas exigidas (2: PROVIDER_NOT_CONFIGURED + gate OAuth). */
   readonly expectedAttempts: number;
+  /**
+   * CORRECTIVE_LEGACY_INCIDENT_BINDING — vínculo obrigatório SOMENTE para a
+   * classificação legada FAILED_PERMANENT: a recuperação é recusada se a
+   * outbox não pertencer a esta comunicação EXATA (definida server-side;
+   * nunca recebida do navegador) e exige o evento prévio
+   * PF_CONTROLLED_RETRY_AUTORIZADO do lote. O fluxo específico
+   * CONTROLLED_GATE_OAUTH_NOT_READY segue sem este vínculo.
+   */
+  readonly expectedCommunicationId?: string;
   /** REAL_SEND_ENABLED lido do ambiente pelo chamador (nunca do request). */
   readonly realSendEnabled: boolean;
   readonly availableAt: string;

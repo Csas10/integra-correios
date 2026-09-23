@@ -1144,6 +1144,16 @@ export const CODIGO_GATE_OAUTH_NOT_READY = "CONTROLLED_GATE_OAUTH_NOT_READY";
 export const CODIGOS_INCIDENTE_GATE = [CODIGO_GATE_OAUTH_NOT_READY, "FAILED_PERMANENT"] as const;
 
 /**
+ * CORRECTIVE_LEGACY_INCIDENT_BINDING — comunicação EXATA do incidente legado,
+ * definida server-side (NUNCA recebida do navegador). O vínculo obrigatório
+ * aplica-se SOMENTE à classificação legada FAILED_PERMANENT: o código genérico
+ * também representa outras falhas permanentes (ex.: divergência de
+ * destinatário), então sem o vínculo qualquer FAILED_PERMANENT do lote
+ * controlado seria tratado como o incidente OAuth.
+ */
+export const COMUNICACAO_INCIDENTE_LEGADO = "b76a1e9b-a59d-4777-8777-c2e61536613c";
+
+/**
  * OUTBOX_GATE_CHAIN_FIX — RECUPERAÇÃO AUDITADA EXCLUSIVA do incidente
  * CONTROLLED_GATE_OAUTH_NOT_READY: bloqueio de gate comprovadamente PRÉ-
  * messages.send (zero chamada Gmail, refresh sem envio, OAuth persistido
@@ -1158,12 +1168,21 @@ export async function autorizarRecuperacaoOauthGate(
   realSendEnabled: boolean,
 ): Promise<{ autorizado: boolean; resultCode: string; outboxId: string; status: string }> {
   const agora = new Date().toISOString();
+  // CORRECTIVE_LEGACY_INCIDENT_BINDING — operador sanitizado (sem e-mail/PII)
+  // para o metadata do evento de auditoria.
+  const operadorSanitizado = /^[A-Za-z0-9_.:-]{1,80}$/.test(operador.trim())
+    ? operador.trim()
+    : "operador-nao-identificado";
   for (const codigo of CODIGOS_INCIDENTE_GATE) {
+    // Vínculo à comunicação EXATA somente na classificação LEGADA: o código
+    // genérico FAILED_PERMANENT também cobre outras falhas permanentes.
+    const legado = codigo === "FAILED_PERMANENT";
     try {
       const resultado = await repository.recuperarOutboxControlada({
         expectedCode: CODIGO_LOTE_TESTE_CONTROLADO,
         expectedErrorCode: codigo,
         expectedAttempts: 2,
+        ...(legado ? { expectedCommunicationId: COMUNICACAO_INCIDENTE_LEGADO } : {}),
         realSendEnabled,
         availableAt: agora,
         auditEvent: {
@@ -1172,7 +1191,12 @@ export async function autorizarRecuperacaoOauthGate(
           aggregateId: "",
           type: "PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO",
           occurredAt: agora,
-          metadata: { motivo: codigo, finalidade: "recuperacao-gate-pre-send" },
+          actorId: operadorSanitizado,
+          metadata: {
+            motivo: codigo,
+            finalidade: "recuperacao-gate-pre-send",
+            operador: operadorSanitizado,
+          },
           eventHash: hashEvento(CODIGO_LOTE_TESTE_CONTROLADO, agora),
         },
       });

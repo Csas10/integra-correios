@@ -600,6 +600,17 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
       throw new Error("REAL_SEND_ARMED: recuperação exige REAL_SEND_ENABLED=false");
     }
     return inTransaction(this.pool, async (sql) => {
+      // CORRECTIVE_LEGACY_INCIDENT_BINDING — na classificação LEGADA
+      // FAILED_PERMANENT a recuperação fica vinculada à comunicação EXATA do
+      // incidente (definida server-side, nunca recebida do navegador) e exige
+      // o evento prévio PF_CONTROLLED_RETRY_AUTORIZADO do lote.
+      const vinculoLegado = command.expectedCommunicationId !== undefined;
+      const parametros: unknown[] = [command.expectedCode];
+      let filtroComunicacao = "";
+      if (vinculoLegado) {
+        parametros.push(command.expectedCommunicationId);
+        filtroComunicacao = `AND o.comunicacao_id = $2`;
+      }
       const estado = await sql.query<{
         outbox_id: string;
         comunicacao_id: string;
@@ -611,6 +622,7 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         receipts_comunicacao: string;
         provider_ids: string;
         recuperacoes: string;
+        retry_autorizado: string;
         pendente_fora: string;
         processamento: string;
         ativos_fora: string;
@@ -631,6 +643,11 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
           (SELECT count(*) FROM evento_auditoria ea
             WHERE ea.agregado_tipo = 'COMUNICACAO' AND ea.agregado_id = o.comunicacao_id
               AND ea.tipo = 'PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO') AS recuperacoes,
+          (SELECT count(*) FROM evento_auditoria ea2
+            JOIN lote_comunicacao l6 ON l6.id = ea2.agregado_id
+            WHERE ea2.agregado_tipo = 'LOTE_COMUNICACAO'
+              AND ea2.tipo = 'PF_CONTROLLED_RETRY_AUTORIZADO'
+              AND l6.codigo = $1) AS retry_autorizado,
           (SELECT count(*) FROM outbox_email o4
             JOIN comunicacao c4 ON c4.id = o4.comunicacao_id
             JOIN lote_comunicacao l4 ON l4.id = c4.lote_comunicacao_id
@@ -640,15 +657,23 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         FROM outbox_email o
         JOIN comunicacao c ON c.id = o.comunicacao_id
         JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
-        WHERE l.codigo = $1
+        WHERE l.codigo = $1${filtroComunicacao}
         ORDER BY o.criada_em DESC
         LIMIT 1
         FOR UPDATE OF o`,
-        [command.expectedCode],
+        parametros,
       );
       const linha = estado.rows[0];
       if (!linha) {
-        throw new Error("OUTBOX_MISSING: outbox do lote controlado inexistente");
+        // CORRECTIVE_LEGACY_INCIDENT_BINDING — comunicação divergente ou
+        // inexistente: recusa SEM mutação e SEM auditoria.
+        throw new Error("COMMUNICATION_MISMATCH: outbox não corresponde à comunicação do incidente legado");
+      }
+      if (vinculoLegado && linha.comunicacao_id !== command.expectedCommunicationId) {
+        throw new Error("COMMUNICATION_MISMATCH: outbox não corresponde à comunicação do incidente legado");
+      }
+      if (vinculoLegado && Number(linha.retry_autorizado ?? 0) < 1) {
+        throw new Error("RETRY_AUTHORIZATION_MISSING: incidente legado exige PF_CONTROLLED_RETRY_AUTORIZADO prévio");
       }
       if (linha.lote_status !== "ATIVO" || linha.lote_modo !== "LIVE_PILOT") {
         throw new Error(`INVALID_STATE: lote em ${linha.lote_status}/${linha.lote_modo} não é recuperável`);

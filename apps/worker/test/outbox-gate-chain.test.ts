@@ -520,3 +520,130 @@ describe("OUTBOX_GATE_CHAIN_FIX — recuperação do estado persistido exato do 
     ).rejects.toThrow(/ERROR_CODE_MISMATCH/);
   });
 });
+
+/**
+ * CORRECTIVE_LEGACY_INCIDENT_BINDING — o vínculo legado FAILED_PERMANENT fica
+ * preso à comunicação EXATA do incidente (server-side): qualquer outra
+ * comunicação do lote controlado com o mesmo status/código/tentativas é
+ * RECUSADA sem mutação e sem auditoria; e exige o evento prévio
+ * PF_CONTROLLED_RETRY_AUTORIZADO do lote.
+ */
+describe("CORRECTIVE_LEGACY_INCIDENT_BINDING — vínculo da recuperação legado", () => {
+  function poolComComunicacao(
+    comunicacaoId: string,
+    opcoes: { retryAutorizado: number; codigoErro?: string } = { retryAutorizado: 1 },
+  ) {
+    const mutacoes: string[] = [];
+    const eventos: LinhaOutbox[] = [];
+    const pool = {
+      async connect() {
+        return {
+          async query(text: string, values: readonly unknown[] = []) {
+            if (text.includes("BEGIN") || text.includes("COMMIT") || text.includes("ROLLBACK")) {
+              return { rows: [], rowCount: 0 };
+            }
+            if (text.includes("FROM outbox_email o") && text.includes("FOR UPDATE")) {
+              return {
+                rows: [
+                  {
+                    outbox_id: OUTBOX_INCIDENTE,
+                    comunicacao_id: comunicacaoId,
+                    outbox_status: "FAILED",
+                    tentativas: 2,
+                    erro: opcoes.codigoErro ?? "FAILED_PERMANENT",
+                    lote_status: "ATIVO",
+                    lote_modo: "LIVE_PILOT",
+                    receipts_comunicacao: "0",
+                    provider_ids: "0",
+                    recuperacoes: "0",
+                    retry_autorizado: String(opcoes.retryAutorizado),
+                    pendente_fora: "0",
+                    processamento: "0",
+                    ativos_fora: "0",
+                  },
+                ],
+                rowCount: 1,
+              };
+            }
+            if (text.includes("INSERT INTO evento_auditoria")) {
+              eventos.push({ tipo: values[3], agregado_id: values[2] });
+              return { rows: [], rowCount: 1 };
+            }
+            if (text.includes("UPDATE outbox_email")) mutacoes.push("outbox->PENDING");
+            return { rows: [], rowCount: 1 };
+          },
+          release() {},
+        };
+      },
+    };
+    return { pool, mutacoes, eventos };
+  }
+
+  function comandoLegado() {
+    const comando = comandoRecuperacao("operador-legado") as {
+      expectedCode: string;
+      expectedErrorCode: string;
+      expectedAttempts: number;
+      expectedCommunicationId?: string;
+      realSendEnabled: boolean;
+      availableAt: string;
+      auditEvent: Record<string, unknown>;
+    };
+    comando.expectedErrorCode = "FAILED_PERMANENT";
+    // CORRECTIVE_LEGACY_INCIDENT_BINDING: server-side — o navegador nunca
+    // fornece esse id.
+    comando.expectedCommunicationId = COMUNICACAO_INCIDENTE;
+    return comando;
+  }
+
+  it("a comunicação EXATA do incidente é recuperada", async () => {
+    const { pool, mutacoes, eventos } = poolComComunicacao(COMUNICACAO_INCIDENTE);
+    const PostgresOperationalRepository = await importarRepositorio();
+    const repositorio = new PostgresOperationalRepository(pool as never);
+    const resultado = await repositorio.recuperarOutboxControlada(comandoLegado() as never);
+    expect(resultado.resultCode).toBe("RECOVERED");
+    expect(resultado.outboxId).toBe(OUTBOX_INCIDENTE);
+    expect(mutacoes).toEqual(["outbox->PENDING"]);
+    expect(eventos).toHaveLength(1);
+  });
+
+  it("OUTRA comunicação com o mesmo status/código/tentativas é RECUSADA — sem mutação e sem auditoria", async () => {
+    const { pool, mutacoes, eventos } = poolComComunicacao("99999999-9999-4999-8999-999999999999");
+    const PostgresOperationalRepository = await importarRepositorio();
+    const repositorio = new PostgresOperationalRepository(pool as never);
+    await expect(
+      repositorio.recuperarOutboxControlada(comandoLegado() as never),
+    ).rejects.toThrow(/COMMUNICATION_MISMATCH/);
+    expect(mutacoes).toEqual([]); // NENHUMA mutação na recusa
+    expect(eventos).toEqual([]); // NENHUM evento de auditoria na recusa
+  });
+
+  it("sem PF_CONTROLLED_RETRY_AUTORIZADO prévio, a recuperação legado é RECUSADA", async () => {
+    const { pool, mutacoes, eventos } = poolComComunicacao(COMUNICACAO_INCIDENTE, { retryAutorizado: 0 });
+    const PostgresOperationalRepository = await importarRepositorio();
+    const repositorio = new PostgresOperationalRepository(pool as never);
+    await expect(
+      repositorio.recuperarOutboxControlada(comandoLegado() as never),
+    ).rejects.toThrow(/RETRY_AUTHORIZATION_MISSING/);
+    expect(mutacoes).toEqual([]);
+    expect(eventos).toEqual([]);
+  });
+
+  it("classificação específica CONTROLLED_GATE_OAUTH_NOT_READY segue SEM vínculo de comunicação", async () => {
+    const { pool, mutacoes } = poolComComunicacao("99999999-9999-4999-8999-999999999999", {
+      retryAutorizado: 1,
+      codigoErro: "CONTROLLED_GATE_OAUTH_NOT_READY",
+    });
+    const PostgresOperationalRepository = await importarRepositorio();
+    const repositorio = new PostgresOperationalRepository(pool as never);
+    const comando = comandoRecuperacao("operador-especifico") as {
+      expectedErrorCode: string;
+      expectedCommunicationId?: string;
+    };
+    comando.expectedErrorCode = "CONTROLLED_GATE_OAUTH_NOT_READY";
+    expect(comando.expectedCommunicationId).toBeUndefined(); // fluxo normal
+    const resultado = await repositorio.recuperarOutboxControlada(comando as never);
+    expect(resultado.resultCode).toBe("RECOVERED");
+    expect(mutacoes).toEqual(["outbox->PENDING"]);
+  });
+});

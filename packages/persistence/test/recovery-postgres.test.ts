@@ -23,6 +23,7 @@ import {
   HmacSha256Fingerprinter,
   NodePostgresPool,
   PostgresOperationalRepository,
+  type CommunicationBatchItem,
 } from "../src/index.js";
 
 const temBanco = Boolean(process.env.DATABASE_URL);
@@ -36,6 +37,35 @@ function hash64(seed: string): string {
     { length: 64 },
     (_, i) => ((seed.charCodeAt(i % seed.length) + i) % 16).toString(16),
   ).join("");
+}
+
+/** Item do incidente: comunicação com id fixo server-side + outbox nova. */
+function itemIncidente(
+  profissionalId: string,
+  confirmationId: string,
+  communicationId: string,
+  outboxId: string,
+): CommunicationBatchItem {
+  return {
+    professionalId: profissionalId,
+    confirmationId,
+    communicationId,
+    outboxId,
+    tokenHash: hash64(`token-${confirmationId}`),
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    recipientFingerprint: fingerprinter.fingerprint("email-rec", randomUUID()),
+    idempotencyKey: `pf-confirmation:rec:${confirmationId}`,
+    encryptedPayload: caixa.seal("payload-sintetico-rec", "outbox:email"),
+    auditEvent: {
+      id: randomUUID(),
+      aggregateType: "PROFISSIONAL",
+      aggregateId: profissionalId,
+      type: "PF_CONFIRMACAO_EMITIDA_REC",
+      occurredAt: new Date().toISOString(),
+      metadata: { sintetico: true },
+      eventHash: hash64(confirmationId),
+    },
+  };
 }
 
 /** Comunicação do incidente legado — definida server-side (id sintético). */
@@ -104,7 +134,10 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
   });
 
   // Lote com código UNIQUE compartilhado entre os testes: busca o existente
-  // (com ativação e retry autorizado prévios) ou cria um novo.
+  // (com ativação e retry autorizado prévios) ou cria um novo. O repositório
+  // exige ≥1 item por enqueue, então o item do incidente acompanha a criação;
+  // nos testes seguintes, nova chamada com o MESMO id do lote insere apenas
+  // os itens (a comunicação do incidente tem id fixo server-side).
   const loteExistente = await pool.query<{ id: string }>(
     `SELECT id FROM lote_comunicacao WHERE codigo = $1 AND origem = 'PF' LIMIT 1`,
     [CODIGO_LOTE],
@@ -112,6 +145,29 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
   let loteId: string;
   if (loteExistente.rows[0]) {
     loteId = loteExistente.rows[0].id;
+    await repository.enqueueCommunicationBatch({
+      id: loteId,
+      code: CODIGO_LOTE,
+      origin: "PF",
+      templateVersion: "pf-confirmation-v1",
+      mode: "LIVE_PILOT",
+      source: "CONTROLADO_SINTETICO",
+      createdBy: "teste-recuperacao",
+      createdAt: new Date().toISOString(),
+      auditEvent: {
+        id: randomUUID(),
+        aggregateType: "PROFISSIONAL",
+        aggregateId: profissionalId,
+        type: "PF_CONFIRMACAO_EMITIDA_REC",
+        occurredAt: new Date().toISOString(),
+        metadata: { loteComunicacaoId: loteId },
+        eventHash: hash64(confirmationId),
+      },
+      items: [itemIncidente(profissionalId, confirmationId, communicationId, outboxId)],
+    });
+    // Reativa o lote (o afterAll do run anterior pode tê-lo deixado CANCELADO —
+    // sem evento novo: a recuperação não exige reativação).
+    await pool.query(`UPDATE lote_comunicacao SET status = 'ATIVO' WHERE id = $1`, [loteId]);
   } else {
     loteId = randomUUID();
     await repository.enqueueCommunicationBatch({
@@ -132,7 +188,7 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
         metadata: { totalItens: 1 },
         eventHash: hash64(loteId),
       },
-      items: [],
+      items: [itemIncidente(profissionalId, confirmationId, communicationId, outboxId)],
     });
     // Ativa o lote (PREPARACAO → ATIVO, com evento auditado).
     await repository.ativarLoteComunicacao({
@@ -160,48 +216,6 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
     );
   }
 
-  // Comunicação + outbox próprios deste teste (ids únicos), vinculados ao lote.
-  await repository.enqueueCommunicationBatch({
-    id: loteId,
-    code: CODIGO_LOTE,
-    origin: "PF",
-    templateVersion: "pf-confirmation-v1",
-    mode: "LIVE_PILOT",
-    source: "CONTROLADO_SINTETICO",
-    createdBy: "teste-recuperacao",
-    createdAt: new Date().toISOString(),
-    auditEvent: {
-      id: randomUUID(),
-      aggregateType: "PROFISSIONAL",
-      aggregateId: profissionalId,
-      type: "PF_CONFIRMACAO_EMITIDA_REC",
-      occurredAt: new Date().toISOString(),
-      metadata: { loteComunicacaoId: loteId },
-      eventHash: hash64(confirmationId),
-    },
-    items: [
-      {
-        professionalId: profissionalId,
-        confirmationId,
-        communicationId,
-        outboxId,
-        tokenHash: hash64(`token-${confirmationId}`),
-        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-        recipientFingerprint: fingerprinter.fingerprint("email-rec", randomUUID()),
-        idempotencyKey: `pf-confirmation:rec:${confirmationId}`,
-        encryptedPayload: caixa.seal("payload-sintetico-rec", "outbox:email"),
-        auditEvent: {
-          id: randomUUID(),
-          aggregateType: "PROFISSIONAL",
-          aggregateId: profissionalId,
-          type: "PF_CONFIRMACAO_EMITIDA_REC",
-          occurredAt: new Date().toISOString(),
-          metadata: { loteComunicacaoId: loteId },
-          eventHash: hash64(confirmationId),
-        },
-      },
-    ],
-  });
 
   // Reconstrói o estado do incidente: tentativas=2 (PROVIDER_NOT_CONFIGURED
   // pré-rede + a falha final do gate) e FAILED com o código sob teste.

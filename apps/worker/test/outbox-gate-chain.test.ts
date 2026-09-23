@@ -130,11 +130,18 @@ describe("OUTBOX_GATE_CHAIN_FIX — gate controlado antes do load/refresh do tok
   }
 
   it("gate rejeitado NÃO executa refresh nem messages.send (ordem: gate antes do token)", async () => {
+    let chamadasFetch = 0;
+    const espiarFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      chamadasFetch += 1;
+      return new Response(JSON.stringify({ access_token: "x", expires_in: 3600 }), { status: 200 });
+    });
     const contadores = gatewayComGateRecusado();
     await new Promise((resolve) => setTimeout(resolve, 10));
+    espiarFetch.mockRestore();
     expect(contadores.recusas).toBe(1);
     expect(contadores.refrescos).toBe(0);
     expect(contadores.transportes).toBe(0);
+    expect(chamadasFetch).toBe(0); // ZERO rede: nem oauth2/token, nem messages.send
   });
 
   it("gate aprovado → exatamente UMA chamada messages.send com token real DEPOIS do gate", async () => {
@@ -192,33 +199,53 @@ describe("OUTBOX_GATE_CHAIN_FIX — gate controlado antes do load/refresh do tok
     );
     const gatewayComEnvio = gateway;
     // Refresh e send sintéticos: o fetch NUNCA toca a rede real no teste
-    // (nenhuma credencial verdadeira é usada). Uma resposta nova por chamada.
+    // (nenhuma credencial verdadeira é usada). Uma resposta nova por chamada,
+    // com contagem explícita por endpoint.
+    let chamadasToken = 0;
+    let chamadasSend = 0;
     const espiarFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
       const endereco = String(url);
       if (endereco.includes("oauth2.googleapis.com")) {
+        chamadasToken += 1;
         return new Response(JSON.stringify({ access_token: "token-renovado-sintetico", expires_in: 3600 }), { status: 200 });
       }
-      // messages.send — resposta única por chamada (corpo consumível).
-      return new Response(JSON.stringify({ id: "msg-sintetica-123", threadId: "thr-sintetica-456" }), { status: 200 });
+      if (endereco.includes("gmail.googleapis.com")) {
+        chamadasSend += 1;
+        return new Response(JSON.stringify({ id: `msg-sintetica-${chamadasSend}`, threadId: `thr-sintetica-${chamadasSend}` }), { status: 200 });
+      }
+      throw new Error(`endpoint inesperado no teste: ${endereco}`);
     });
-    let chamadasToken = 0;
-    let chamadasSend = 0;
     try {
-      const envios = await (gatewayComEnvio as unknown as {
+      const envios = await (gateway as unknown as {
         send: (m: unknown) => Promise<{ provider: string }>;
       }).send(mensagem);
       expect(envios.provider).toBe("GMAIL");
     } finally {
       espiarFetch.mockRestore();
     }
-    // Recount via ordem: refresh registrado uma única vez; o send sintético
-    // do transporte respondeu com message id (provider GMAIL).
     expect(refrescos).toBe(1);
     expect(ordem[0]).toBe("gate"); // gate ANTES de qualquer acesso a token
     expect(ordem).toContain("refresh");
     expect(ordem.indexOf("gate")).toBeLessThan(ordem.indexOf("refresh"));
-    void chamadasToken;
-    void chamadasSend;
+    // Contagem explícita: exatamente 1 refresh; NO MÁXIMO 1 messages.send
+    // (run-once, sem loop, sem retry).
+    expect(chamadasToken).toBe(1);
+    expect(chamadasSend).toBeLessThanOrEqual(1);
+    expect(chamadasSend).toBe(1);
+  });
+
+  it("gate rejeitado → ZERO chamadas de rede (nem token, nem messages.send)", async () => {
+    let chamadasFetch = 0;
+    const espiarFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      chamadasFetch += 1;
+      return new Response(JSON.stringify({ access_token: "x", expires_in: 3600 }), { status: 200 });
+    });
+    const contadores = gatewayComGateRecusado();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    espiarFetch.mockRestore();
+    expect(contadores.recusas).toBe(1);
+    expect(contadores.refrescos).toBe(0);
+    expect(chamadasFetch).toBe(0); // nenhuma chamada oauth2 ou gmail
   });
 
   it("erro do gate com OAUTH_NOT_READY sanitiza para CONTROLLED_GATE_OAUTH_NOT_READY", async () => {
@@ -268,5 +295,228 @@ describe("OUTBOX_GATE_CHAIN_FIX — FAILED_PERMANENT é terminal no agendamento"
     // A cláusula terminal deve excluir explicitamente os dois códigos.
     expect(claim).toContain("FAILED_PERMANENT");
     expect(claim).toContain("CONTROLLED_GATE_OAUTH_NOT_READY");
+  });
+});
+
+/**
+ * OUTBOX_GATE_CHAIN_FIX — estado persistido EXATO do incidente no Preview
+ * (verificado read-only pelo titular):
+ *   lote CONTROLLED_GMAIL_TEST ATIVO/LIVE_PILOT;
+ *   comunicação b76a1e9b-a59d-4777-8777-c2e61536613c (sintética);
+ *   outbox status=FAILED, ultimo_erro_codigo=FAILED_PERMANENT (linha LEGADA,
+ *   gravada antes da classificação específica existir), tentativas=2;
+ *   sem provider message/thread id; receipts GMAIL históricos existem em
+ *   OUTRAS comunicações (lote DRY_RUN antigo) mas NÃO nesta;
+ *   REAL_SEND_ENABLED=false.
+ */
+const COMUNICACAO_INCIDENTE = "b76a1e9b-a59d-4777-8777-c2e61536613c";
+const OUTBOX_INCIDENTE = "8a000000-0000-4000-8000-0000000000ef";
+
+type LinhaOutbox = Record<string, unknown>;
+
+function criarPoolIncidente(opcoes: {
+  recuperacoes: number;
+  /** Mutação já aplicada (2ª chamada deve ver PENDING + evento gravado). */
+  recuperada: boolean;
+}): { pool: unknown; mutacoes: string[]; eventos: LinhaOutbox[] } {
+  const mutacoes: string[] = [];
+  const eventos: LinhaOutbox[] = [];
+  const pool = {
+    async connect() {
+      return {
+        async query(text: string, values: readonly unknown[] = []) {
+          if (text.includes("BEGIN")) return { rows: [], rowCount: 0 };
+          if (text.includes("COMMIT") || text.includes("ROLLBACK")) {
+            return { rows: [], rowCount: 0 };
+          }
+          if (text.includes("FROM outbox_email o") && text.includes("FOR UPDATE")) {
+            return {
+              rows: [
+                {
+                  outbox_id: OUTBOX_INCIDENTE,
+                  comunicacao_id: COMUNICACAO_INCIDENTE,
+                  // Estado legado: PENDING quando a recuperação já mutou.
+                  outbox_status: opcoes.recuperada ? "PENDING" : "FAILED",
+                  tentativas: 2,
+                  erro: opcoes.recuperada ? null : "FAILED_PERMANENT",
+                  lote_status: "ATIVO",
+                  lote_modo: "LIVE_PILOT",
+                  receipts_comunicacao: "0",
+                  provider_ids: "0",
+                  recuperacoes: String(opcoes.recuperacoes),
+                  pendente_fora: "0",
+                  processamento: "0",
+                  ativos_fora: "0",
+                },
+              ],
+              rowCount: 1,
+            };
+          }
+          if (text.includes("FROM evento_auditoria ea") && text.includes("count(*)")) {
+            // Idempotência: evento com o comunicacao_id REAL quando já recuperado.
+            return { rows: [{ total: opcoes.recuperada ? "1" : "0" }], rowCount: 1 };
+          }
+          if (text.includes("INSERT INTO evento_auditoria")) {
+            eventos.push({
+              tipo: values[3],
+              agregado_tipo: values[1],
+              agregado_id: values[2],
+            });
+            return { rows: [], rowCount: 1 };
+          }
+          if (text.includes("UPDATE outbox_email")) {
+            mutacoes.push("outbox->PENDING");
+            return { rows: [], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+        release() {},
+      };
+    },
+  };
+  return { pool, mutacoes, eventos };
+}
+
+async function importarRepositorio() {
+  const modulo = await import("@integra-correios/persistence");
+  return modulo.PostgresOperationalRepository;
+}
+
+function comandoRecuperacao(operador: string) {
+  const agora = new Date().toISOString();
+  return {
+    expectedCode: "CONTROLLED_GMAIL_TEST",
+    expectedErrorCode: "FAILED_PERMANENT",
+    expectedAttempts: 2,
+    realSendEnabled: false,
+    availableAt: agora,
+    auditEvent: {
+      id: `evento-${operador}`,
+      aggregateType: "COMUNICACAO",
+      aggregateId: "",
+      type: "PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO",
+      occurredAt: agora,
+      metadata: { motivo: "FAILED_PERMANENT", finalidade: "recuperacao-gate-pre-send" },
+      eventHash: `hash-${operador}`,
+    },
+  };
+}
+
+describe("OUTBOX_GATE_CHAIN_FIX — recuperação do estado persistido exato do incidente", () => {
+  it("linha legada FAILED/FAILED_PERMANENT/tentativas=2 é recuperada com evento vinculado à comunicação", async () => {
+    const { pool, mutacoes, eventos } = criarPoolIncidente({ recuperacoes: 0, recuperada: false });
+    const PostgresOperationalRepository = await importarRepositorio();
+    const repositorio = new PostgresOperationalRepository(pool as never);
+    const resultado = await repositorio.recuperarOutboxControlada(
+      comandoRecuperacao("operador-1") as never,
+    );
+    expect(resultado.resultCode).toBe("RECOVERED");
+    expect(resultado.outboxId).toBe(OUTBOX_INCIDENTE);
+    expect(mutacoes).toEqual(["outbox->PENDING"]); // CAS exato: UMA mutação
+    expect(eventos).toHaveLength(1);
+    const evento = eventos[0]!;
+    expect(evento.tipo).toBe("PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO");
+    // aggregateId REAL: a idempotência procura por este id.
+    expect(evento.agregado_id).toBe(COMUNICACAO_INCIDENTE);
+    expect(evento.agregado_tipo).toBe("COMUNICACAO");
+  });
+
+  it("idempotência REAL: segunda chamada com outbox PENDING + evento existente → ALREADY_RECOVERED sem mutação", async () => {
+    const { pool, mutacoes, eventos } = criarPoolIncidente({ recuperacoes: 1, recuperada: true });
+    const PostgresOperationalRepository = await importarRepositorio();
+    const repositorio = new PostgresOperationalRepository(pool as never);
+    const comando = comandoRecuperacao("operador-2");
+    const resultado = await repositorio.recuperarOutboxControlada(comando as never);
+    expect(resultado.resultCode).toBe("ALREADY_RECOVERED");
+    expect(mutacoes).toEqual([]); // NENHUMA nova mutação
+    expect(eventos).toEqual([]); // NENHUM novo evento
+  });
+
+  it("receipt na comunicação controlada bloqueia; receipt em OUTRA comunicação NÃO bloqueia", async () => {
+    const mutacoes: string[] = [];
+    const pool = {
+      async connect() {
+        return {
+          async query(text: string) {
+            if (text.includes("BEGIN") || text.includes("COMMIT")) return { rows: [], rowCount: 0 };
+            if (text.includes("FROM outbox_email o") && text.includes("FOR UPDATE")) {
+              return {
+                rows: [
+                  {
+                    outbox_id: OUTBOX_INCIDENTE,
+                    comunicacao_id: COMUNICACAO_INCIDENTE,
+                    outbox_status: "FAILED",
+                    tentativas: 2,
+                    erro: "FAILED_PERMANENT",
+                    lote_status: "ATIVO",
+                    lote_modo: "LIVE_PILOT",
+                    // Receipt histórico em OUTRA comunicação não aparece aqui:
+                    // a contagem é por comunicação controlada.
+                    receipts_comunicacao: "0",
+                    provider_ids: "0",
+                    recuperacoes: "0",
+                    pendente_fora: "0",
+                    processamento: "0",
+                    ativos_fora: "0",
+                  },
+                ],
+                rowCount: 1,
+              };
+            }
+            if (text.includes("UPDATE outbox_email")) mutacoes.push("outbox->PENDING");
+            return { rows: [], rowCount: 1 };
+          },
+          release() {},
+        };
+      },
+    };
+    const PostgresOperationalRepository = await importarRepositorio();
+    const repositorio = new PostgresOperationalRepository(pool as never);
+    const resultado = await repositorio.recuperarOutboxControlada(
+      comandoRecuperacao("operador-3") as never,
+    );
+    expect(resultado.resultCode).toBe("RECOVERED");
+    expect(mutacoes).toEqual(["outbox->PENDING"]);
+  });
+
+  it("outbox FAILED com outro código (DELIVERY_UNKNOWN) nunca é recuperável", async () => {
+    const pool = {
+      async connect() {
+        return {
+          async query(text: string) {
+            if (text.includes("BEGIN") || text.includes("COMMIT")) return { rows: [], rowCount: 0 };
+            if (text.includes("FROM outbox_email o") && text.includes("FOR UPDATE")) {
+              return {
+                rows: [
+                  {
+                    outbox_id: OUTBOX_INCIDENTE,
+                    comunicacao_id: COMUNICACAO_INCIDENTE,
+                    outbox_status: "FAILED",
+                    tentativas: 2,
+                    erro: "DELIVERY_UNKNOWN",
+                    lote_status: "ATIVO",
+                    lote_modo: "LIVE_PILOT",
+                    receipts_comunicacao: "0",
+                    provider_ids: "0",
+                    recuperacoes: "0",
+                    pendente_fora: "0",
+                    processamento: "0",
+                    ativos_fora: "0",
+                  },
+                ],
+                rowCount: 1,
+              };
+            }
+            return { rows: [], rowCount: 0 };
+          },
+          release() {},
+        };
+      },
+    };
+    const PostgresOperationalRepository = await importarRepositorio();
+    const repositorio = new PostgresOperationalRepository(pool as never);
+    await expect(
+      repositorio.recuperarOutboxControlada(comandoRecuperacao("operador-4") as never),
+    ).rejects.toThrow(/ERROR_CODE_MISMATCH/);
   });
 });

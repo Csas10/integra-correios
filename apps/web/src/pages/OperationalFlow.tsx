@@ -1444,15 +1444,22 @@ export function OperationalFlow() {
               {estadoControlado.lote &&
                 estadoControlado.lote.status === "ATIVO" &&
                 estadoControlado.lote.outbox &&
-                estadoControlado.lote.outbox.status === "FAILED_PERMANENT" && (
+                estadoControlado.lote.outbox.status === "FAILED" &&
+                estadoControlado.lote.outbox.tentativas === 2 &&
+                estadoControlado.lote.outbox.codigoErro !== null &&
+                ["CONTROLLED_GATE_OAUTH_NOT_READY", "FAILED_PERMANENT"].includes(
+                  estadoControlado.lote.outbox.codigoErro,
+                ) && (
                 <div className="flow-stats">
                   <p>
-                    <strong>Recuperação auditada exclusiva</strong> — incidente
-                    CONTROLLED_GATE_OAUTH_NOT_READY (bloqueio de gate pré-`messages.send` com
-                    OAuth persistido ativo). Exige outbox FAILED_PERMANENT com código de erro
-                    exatamente CONTROLLED_GATE_OAUTH_NOT_READY, tentativas=2, receipt=0 e
-                    ausência de Message-ID/Thread-ID; recupera o outbox para PENDING e registra
-                    evento auditado. DELIVERY_UNKNOWN, AUTH_REQUIRED e demais falhas nunca
+                    <strong>Recuperação auditada exclusiva</strong> — incidente de gate
+                    pré-`messages.send` (bloqueio com OAuth persistido ativo; a linha legada
+                    foi gravada como FAILED_PERMANENT antes da classificação específica
+                    existir). Exige outbox FAILED com tentativas=2, código de erro
+                    CONTROLLED_GATE_OAUTH_NOT_READY ou FAILED_PERMANENT (mesmo incidente),
+                    receipt=0 na comunicação controlada e ausência de Message-ID/Thread-ID;
+                    recupera o outbox para PENDING e registra evento auditado vinculado à
+                    comunicação. DELIVERY_UNKNOWN, AUTH_REQUIRED e demais falhas nunca
                     são recuperáveis. O envio em si continua exigindo REAL_SEND_ENABLED=true
                     em etapa separada.
                   </p>

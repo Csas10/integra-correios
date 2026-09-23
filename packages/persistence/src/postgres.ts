@@ -602,12 +602,13 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
     return inTransaction(this.pool, async (sql) => {
       const estado = await sql.query<{
         outbox_id: string;
+        comunicacao_id: string;
         outbox_status: string;
         tentativas: number;
         erro: string | null;
         lote_status: string;
         lote_modo: string;
-        receipts_globais: string;
+        receipts_comunicacao: string;
         provider_ids: string;
         recuperacoes: string;
         pendente_fora: string;
@@ -616,12 +617,14 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
       }>(
         `SELECT
           o.id AS outbox_id,
+          o.comunicacao_id,
           o.status AS outbox_status,
           o.tentativas,
           o.ultimo_erro_codigo AS erro,
           l.status AS lote_status,
           l.modo AS lote_modo,
-          (SELECT count(*) FROM comunicacao c2 WHERE c2.provider = 'GMAIL') AS receipts_globais,
+          (SELECT count(*) FROM comunicacao c2
+            WHERE c2.id = o.comunicacao_id AND c2.provider = 'GMAIL') AS receipts_comunicacao,
           (SELECT count(*) FROM comunicacao c3
             WHERE c3.lote_comunicacao_id = l.id
               AND (c3.provider_message_id IS NOT NULL OR c3.provider_thread_id IS NOT NULL)) AS provider_ids,
@@ -651,12 +654,13 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
         throw new Error(`INVALID_STATE: lote em ${linha.lote_status}/${linha.lote_modo} não é recuperável`);
       }
       if (linha.outbox_status === "PENDING") {
-        // Idempotência: já recuperado — estado atual, sem nova mutação.
+        // Idempotência: já recuperado — estado atual, sem nova mutação. O
+        // evento de recuperação é procurado pelo comunicacao_id REAL.
         const jaRecuperado = await sql.query<{ total: string }>(
           `SELECT count(*) AS total FROM evento_auditoria ea
-          WHERE ea.agregado_tipo = 'COMUNICACAO' AND ea.agregado_id = (SELECT comunicacao_id FROM outbox_email WHERE id = $1)
+          WHERE ea.agregado_tipo = 'COMUNICACAO' AND ea.agregado_id = $2
             AND ea.tipo = 'PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO'`,
-          [linha.outbox_id],
+          [linha.outbox_id, linha.comunicacao_id],
         );
         if (Number(jaRecuperado.rows[0]?.total ?? 0) > 0) {
           return { resultCode: "ALREADY_RECOVERED", outboxId: linha.outbox_id, status: linha.outbox_status };
@@ -672,11 +676,14 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
       if (Number(linha.tentativas) !== command.expectedAttempts) {
         throw new Error(`ATTEMPTS_MISMATCH: recuperação exige tentativas=${command.expectedAttempts} (atual: ${linha.tentativas})`);
       }
-      if (Number(linha.receipts_globais) > 0) {
-        throw new Error("RECEIPT_ALREADY_EXISTS: existe receipt Gmail — recuperação proibida");
+      // OUTBOX_GATE_CHAIN_FIX — receipts e provider ids contados SOMENTE na
+      // comunicação controlada: envios históricos de outros lotes (SENT)
+      // jamais bloqueiam a recuperação deste incidente.
+      if (Number(linha.receipts_comunicacao) > 0) {
+        throw new Error("RECEIPT_ALREADY_EXISTS: existe receipt na comunicação controlada — recuperação proibida");
       }
       if (Number(linha.provider_ids) > 0) {
-        throw new Error("PROVIDER_IDS_PRESENT: existe Gmail Message-ID/Thread-ID — recuperação proibida");
+        throw new Error("PROVIDER_IDS_PRESENT: existe Gmail Message-ID/Thread-ID no lote — recuperação proibida");
       }
       if (Number(linha.recuperacoes) > 0) {
         throw new Error("RECOVERY_ALREADY_AUTHORIZED: recuperação não reexecutável");
@@ -696,7 +703,12 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
       if (recuperado.rowCount !== 1) {
         throw new Error("INVALID_STATE: CAS da recuperação falhou");
       }
-      await insertAudit(sql, command.auditEvent);
+      // Evento auditado com o comunicacao_id REAL (a idempotência procura
+      // por ele) — nunca vazio.
+      await insertAudit(sql, {
+        ...command.auditEvent,
+        aggregateId: linha.comunicacao_id,
+      });
       return { resultCode: "RECOVERED", outboxId: linha.outbox_id, status: "PENDING" };
     });
   }

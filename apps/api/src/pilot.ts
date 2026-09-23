@@ -1137,6 +1137,13 @@ export const CODIGO_RETRY_PRE_REDE = "PROVIDER_NOT_CONFIGURED";
 export const CODIGO_GATE_OAUTH_NOT_READY = "CONTROLLED_GATE_OAUTH_NOT_READY";
 
 /**
+ * OUTBOX_GATE_CHAIN_FIX — códigos que representam o MESMO incidente de gate
+ * pré-messages.send: a linha legada foi gravada como FAILED_PERMANENT antes
+ * da classificação específica existir; a nova grava CONTROLLED_GATE_OAUTH_NOT_READY.
+ */
+export const CODIGOS_INCIDENTE_GATE = [CODIGO_GATE_OAUTH_NOT_READY, "FAILED_PERMANENT"] as const;
+
+/**
  * OUTBOX_GATE_CHAIN_FIX — RECUPERAÇÃO AUDITADA EXCLUSIVA do incidente
  * CONTROLLED_GATE_OAUTH_NOT_READY: bloqueio de gate comprovadamente PRÉ-
  * messages.send (zero chamada Gmail, refresh sem envio, OAuth persistido
@@ -1151,32 +1158,40 @@ export async function autorizarRecuperacaoOauthGate(
   realSendEnabled: boolean,
 ): Promise<{ autorizado: boolean; resultCode: string; outboxId: string; status: string }> {
   const agora = new Date().toISOString();
-  try {
-    const resultado = await repository.recuperarOutboxControlada({
-      expectedCode: CODIGO_LOTE_TESTE_CONTROLADO,
-      expectedErrorCode: CODIGO_GATE_OAUTH_NOT_READY,
-      expectedAttempts: 2,
-      realSendEnabled,
-      availableAt: agora,
-      auditEvent: {
-        id: randomUUID(),
-        aggregateType: "COMUNICACAO",
-        aggregateId: "",
-        type: "PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO",
-        occurredAt: agora,
-        metadata: { motivo: CODIGO_GATE_OAUTH_NOT_READY, finalidade: "recuperacao-gate-pre-send" },
-        eventHash: hashEvento(CODIGO_LOTE_TESTE_CONTROLADO, agora),
-      },
-    });
-    return { autorizado: true, ...resultado };
-  } catch (error) {
-    const mensagem = error instanceof Error ? error.message : String(error);
-    const codigo = mensagem.split(":")[0] ?? "RECOVERY_FAILED";
-    if (/^[A-Z0-9_]{3,60}$/.test(codigo)) {
-      throw new BloqueioExecucaoControladaError(codigo, "Recuperação recusada — estado não elegível.");
+  for (const codigo of CODIGOS_INCIDENTE_GATE) {
+    try {
+      const resultado = await repository.recuperarOutboxControlada({
+        expectedCode: CODIGO_LOTE_TESTE_CONTROLADO,
+        expectedErrorCode: codigo,
+        expectedAttempts: 2,
+        realSendEnabled,
+        availableAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "COMUNICACAO",
+          aggregateId: "",
+          type: "PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO",
+          occurredAt: agora,
+          metadata: { motivo: codigo, finalidade: "recuperacao-gate-pre-send" },
+          eventHash: hashEvento(CODIGO_LOTE_TESTE_CONTROLADO, agora),
+        },
+      });
+      return { autorizado: true, ...resultado };
+    } catch (error) {
+      const mensagem = error instanceof Error ? error.message : String(error);
+      const classe = mensagem.split(":")[0] ?? "RECOVERY_FAILED";
+      // ERROR_CODE_MISMATCH com um código do MESMO incidente → tenta o próximo
+      // (a linha LEGADA foi gravada antes da classificação específica existir).
+      if (classe === "ERROR_CODE_MISMATCH" && codigo !== CODIGOS_INCIDENTE_GATE[CODIGOS_INCIDENTE_GATE.length - 1]) {
+        continue;
+      }
+      if (/^[A-Z0-9_]{3,60}$/.test(classe)) {
+        throw new BloqueioExecucaoControladaError(classe, "Recuperação recusada — estado não elegível.");
+      }
+      throw error;
     }
-    throw error;
   }
+  throw new BloqueioExecucaoControladaError("ERROR_CODE_MISMATCH", "Recuperação recusada — estado não elegível.");
 }
 
 /**

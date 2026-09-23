@@ -602,6 +602,10 @@ export interface EstadoLoteControladoItem {
   readonly fonteRegistro: CommunicationSource | null;
   readonly receiptAnterior: boolean;
   readonly liberacaoHumanaAuditada: boolean;
+  /** PRE_CLAIM_500_DIAGNOSIS — evento PF_CONTROLLED_RETRY_AUTORIZADO posterior
+   * à última mutação FAILED da outbox do teste (correlação via bloqueada_em).
+   * null = não aplicável (outbox não está FAILED) ou lote inexistente. */
+  readonly retryAuditadoVigente: boolean | null;
   /** Verificação server-side do payload: destinatário === controlado.
    * null = indeterminado (payload ilegível/ausente) — exibição fail-closed. */
   readonly destinatarioCorresponde: boolean | null;
@@ -650,6 +654,13 @@ export async function lerEstadoLoteControlado(
       (SELECT count(*) FROM evento_auditoria ea
         WHERE ea.agregado_tipo = 'LOTE_COMUNICACAO' AND ea.agregado_id = l.id
           AND ea.tipo = 'PF_LOTE_COMUNICACAO_ATIVADO') AS ativacoes,
+      (SELECT count(*) FROM evento_auditoria ea
+        WHERE ea.agregado_tipo = 'LOTE_COMUNICACAO' AND ea.agregado_id = l.id
+          AND ea.tipo = 'PF_CONTROLLED_RETRY_AUTORIZADO'
+          AND ea.ocorreu_em > COALESCE((
+            SELECT max(ob2.bloqueada_em) FROM outbox_email ob2
+            JOIN comunicacao c2 ON c2.id = ob2.comunicacao_id
+            WHERE c2.lote_comunicacao_id = l.id AND ob2.status = 'FAILED'), 'epoch')) AS retry_vigente,
       ob.payload_ciphertext, ob.payload_nonce, ob.payload_auth_tag, ob.chave_versao
     FROM lote_comunicacao l
     LEFT JOIN LATERAL (
@@ -705,6 +716,9 @@ export async function lerEstadoLoteControlado(
       fonteRegistro: (linha.fonte_registro as CommunicationSource | null) ?? null,
       receiptAnterior: Number(linha.receipts) > 0,
       liberacaoHumanaAuditada: Number(linha.ativacoes) > 0,
+      // PRE_CLAIM_500_DIAGNOSIS — visível no painel: a autorização de retry
+      // auditada está vigente (posterior à última mutação FAILED) ou não.
+      retryAuditadoVigente: Number(linha.receipts) === 0 && Number(linha.retry_vigente ?? 0) > 0,
       destinatarioCorresponde,
     };
   }
@@ -931,6 +945,55 @@ export class BloqueioExecucaoControladaError extends Error {
     super(message);
     this.name = "BloqueioExecucaoControladaError";
   }
+}
+
+/**
+ * PRE_CLAIM_500_DIAGNOSIS — falhas esperadas do caminho da execução controlada
+ * NUNCA respondem o 500 opaco "Falha na execução controlada.": bloqueio de
+ * domínio → 409 + codigo; infraestrutura (banco/provider) → 503 + codigo.
+ * O motivo estrutural de log é um código curto determinístico — nunca a
+ * mensagem bruta do erro (pode conter DSN, token ou PII).
+ */
+export function mapearFalhaExecucao(error: unknown): {
+  status: 409 | 503;
+  codigo: string;
+  motivo: string;
+  classeErro: string;
+} {
+  if (error instanceof BloqueioExecucaoControladaError) {
+    return {
+      status: 409,
+      codigo: error.codigo,
+      motivo: error.codigo,
+      classeErro: "BloqueioExecucaoControladaError",
+    };
+  }
+  const classeErro = error instanceof Error ? error.name : "Unknown";
+  return {
+    status: 503,
+    codigo: "EXECUTION_UNAVAILABLE",
+    motivo: `EXECUTION_UNAVAILABLE:${classeErro.slice(0, 60)}`,
+    classeErro,
+  };
+}
+
+/** Log estruturado sanitizado do catch externo (sem mensagem bruta/PII). */
+export function registrarFalhaExecucao(
+  fase: string,
+  mapeado: ReturnType<typeof mapearFalhaExecucao>,
+  contexto: { requestId: string; runId?: string } = { requestId: "desconhecido" },
+): void {
+  console.error(
+    JSON.stringify({
+      fase,
+      requestId: contexto.requestId,
+      ...(contexto.runId ? { runId: contexto.runId } : {}),
+      classeErro: mapeado.classeErro,
+      motivo: mapeado.motivo,
+      status: mapeado.status,
+      codigo: mapeado.codigo,
+    }),
+  );
 }
 
 /**

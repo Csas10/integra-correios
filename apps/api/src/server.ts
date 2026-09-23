@@ -26,6 +26,8 @@ import {
   ativarLoteControlado,
   autorizarRetryPreRede,
   executarWorkerControladoUmaVez,
+  mapearFalhaExecucao,
+  registrarFalhaExecucao,
   validarCancelamentoLoteHistorico,
 } from "./pilot.js";
 import {
@@ -77,8 +79,11 @@ import {
 /**
  * CORRECTIVE_GATE_PROVIDER_NOT_CONFIGURED — a execução controlada somente
  * prossegue após evento auditado PF_CONTROLLED_RETRY_AUTORIZADO quando a
- * outbox do teste está FAILED (falha pré-rede liberada). Primeira execução
- * (outbox PENDING) não exige o evento.
+ * PRE_CLAIM_500_DIAGNOSIS — a correlação compara o evento com a última
+ * mutação FAILED da outbox do teste usando a coluna REAL da mutação
+ * (bloqueada_em, gravada por markOutboxFailed). A versão anterior lia
+ * outbox_email.atualizada_em — coluna inexistente (42703 undefined column
+ * em produção), o que derrubava o POST /execute em HTTP 500 ANTES do claim.
  */
 async function retryPreRedeAutorizado(pool: {
   query: (text: string, values?: readonly unknown[]) => Promise<{ rows: readonly any[]; rowCount: number | null }>;
@@ -91,7 +96,7 @@ async function retryPreRedeAutorizado(pool: {
     WHERE ea.tipo = 'PF_CONTROLLED_RETRY_AUTORIZADO'
       AND l.codigo = $1
       AND ea.ocorreu_em > COALESCE((
-        SELECT max(o.atualizada_em) FROM outbox_email o
+        SELECT max(o.bloqueada_em) FROM outbox_email o
         JOIN comunicacao c ON c.id = o.comunicacao_id
         JOIN lote_comunicacao l2 ON l2.id = c.lote_comunicacao_id
         WHERE l2.codigo = $1 AND o.status = 'FAILED'), 'epoch')`,
@@ -956,11 +961,23 @@ const ROTAS: readonly Rota[] = [
               }),
         });
       } catch (error) {
+        // PRE_CLAIM_500_DIAGNOSIS — falhas esperadas mapeadas para 409/503 com
+        // codigo sanitizado; log estruturado sem mensagem bruta/PII. O erro
+        // original (ex.: 42703) nunca ecoa na resposta.
+        const fase = "controlled.execute";
+        const requestId = randomUUID();
         if (error instanceof BloqueioExecucaoControladaError) {
-          json(res, 409, { erro: error.message, codigo: error.codigo });
+          const mapeado = mapearFalhaExecucao(error);
+          registrarFalhaExecucao(fase, mapeado, { requestId });
+          json(res, mapeado.status, { erro: error.message, codigo: mapeado.codigo });
           return;
         }
-        json(res, 500, { erro: "Falha na execução controlada." });
+        const mapeado = mapearFalhaExecucao(error);
+        registrarFalhaExecucao(fase, mapeado, { requestId });
+        json(res, mapeado.status, {
+          erro: "Execução controlada temporariamente indisponível — tente novamente; nada foi enviado nem mutado.",
+          codigo: mapeado.codigo,
+        });
         return;
       }
     },

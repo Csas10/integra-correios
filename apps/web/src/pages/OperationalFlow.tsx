@@ -145,6 +145,8 @@ interface EstadoLoteControladoItem {
   fonteRegistro: string | null;
   receiptAnterior: boolean;
   liberacaoHumanaAuditada: boolean;
+  /** PRE_CLAIM_500_DIAGNOSIS — autorização PF_CONTROLLED_RETRY_AUTORIZADO vigente. */
+  retryAuditadoVigente?: boolean | null;
   destinatarioCorresponde: boolean | null;
 }
 
@@ -1245,6 +1247,19 @@ export function OperationalFlow() {
                       <code>{estadoControlado.lote.liberacaoHumanaAuditada ? "SIM" : "NÃO"}</code> · Status:{" "}
                       <code>{estadoControlado.lote.status}</code>
                     </li>
+                    {estadoControlado.lote.retryAuditadoVigente !== undefined && (
+                      <li>
+                        Retry auditado vigente (PF_CONTROLLED_RETRY_AUTORIZADO após a última mutação
+                        FAILED):{" "}
+                        <code>
+                          {estadoControlado.lote.retryAuditadoVigente === null
+                            ? "NÃO APLICÁVEL"
+                            : estadoControlado.lote.retryAuditadoVigente
+                              ? "SIM"
+                              : "NÃO"}
+                        </code>
+                      </li>
+                    )}
                   </>
                 ) : (
                   <li>Lote controlado ainda não existe (será criado pela preparação).</li>

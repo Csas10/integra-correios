@@ -16,7 +16,7 @@
  *
  * Massa 100% sintética; sem rede, sem Gmail real, sem PII.
  */
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import {
   Aes256GcmSecretBox,
@@ -42,9 +42,40 @@ function hash64(seed: string): string {
 const COMUNICACAO_INCIDENTE = "b76a1e9b-a59d-4777-8777-c2e61536613c";
 const CODIGO_LOTE = "CONTROLLED_GMAIL_TEST";
 
+// O código do lote é UNIQUE (origem, codigo) no banco e a recuperação valida
+// exatamente CONTROLLED_GMAIL_TEST — os cenários reutilizam a MESMA linha de
+// lote entre os testes (limpa no afterAll; cada teste cria profissional,
+// comunicação e outbox próprios). A primeira tentativa de falha do incidente
+// é determinada por busca/criação da outbox em tentativas=2.
+const POOL_COMPARTILHADO: { pool: NodePostgresPool | null } = { pool: null };
+afterAll(async () => {
+  if (!process.env.DATABASE_URL) return;
+  const pool = POOL_COMPARTILHADO.pool ?? new NodePostgresPool({ connectionString: process.env.DATABASE_URL });
+  try {
+    await pool.query(
+      `DELETE FROM evento_auditoria WHERE agregado_tipo IN ('COMUNICACAO','LOTE_COMUNICACAO')
+        AND agregado_id IN (
+          SELECT c.id FROM comunicacao c JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id WHERE l.codigo = $1
+          UNION SELECT l.id FROM lote_comunicacao l WHERE l.codigo = $1)`,
+      [CODIGO_LOTE],
+    );
+    await pool.query(
+      `DELETE FROM outbox_email WHERE comunicacao_id IN (
+        SELECT c.id FROM comunicacao c JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id WHERE l.codigo = $1)`,
+      [CODIGO_LOTE],
+    );
+    await pool.query(
+      `DELETE FROM comunicacao WHERE lote_comunicacao_id IN (SELECT id FROM lote_comunicacao WHERE codigo = $1)`,
+      [CODIGO_LOTE],
+    );
+    await pool.query(`DELETE FROM lote_comunicacao WHERE codigo = $1`, [CODIGO_LOTE]);
+  } finally {
+    await pool.close();
+  }
+});
+
 async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: string } = { erro: "FAILED_PERMANENT" }) {
   const profissionalId = randomUUID();
-  const loteId = randomUUID();
   const communicationId = COMUNICACAO_INCIDENTE;
   const outboxId = randomUUID();
   const confirmationId = randomUUID();
@@ -72,6 +103,64 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
     },
   });
 
+  // Lote com código UNIQUE compartilhado entre os testes: busca o existente
+  // (com ativação e retry autorizado prévios) ou cria um novo.
+  const loteExistente = await pool.query<{ id: string }>(
+    `SELECT id FROM lote_comunicacao WHERE codigo = $1 AND origem = 'PF' LIMIT 1`,
+    [CODIGO_LOTE],
+  );
+  let loteId: string;
+  if (loteExistente.rows[0]) {
+    loteId = loteExistente.rows[0].id;
+  } else {
+    loteId = randomUUID();
+    await repository.enqueueCommunicationBatch({
+      id: loteId,
+      code: CODIGO_LOTE,
+      origin: "PF",
+      templateVersion: "pf-confirmation-v1",
+      mode: "LIVE_PILOT",
+      source: "CONTROLADO_SINTETICO",
+      createdBy: "teste-recuperacao",
+      createdAt: new Date().toISOString(),
+      auditEvent: {
+        id: randomUUID(),
+        aggregateType: "LOTE_COMUNICACAO",
+        aggregateId: loteId,
+        type: "PF_LOTE_COMUNICACAO_CRIADO",
+        occurredAt: new Date().toISOString(),
+        metadata: { totalItens: 1 },
+        eventHash: hash64(loteId),
+      },
+      items: [],
+    });
+    // Ativa o lote (PREPARACAO → ATIVO, com evento auditado).
+    await repository.ativarLoteComunicacao({
+      batchId: loteId,
+      origin: "PF",
+      actorId: "operador-teste",
+      activatedAt: new Date().toISOString(),
+      auditEvent: {
+        id: randomUUID(),
+        aggregateType: "LOTE_COMUNICACAO",
+        aggregateId: loteId,
+        type: "PF_LOTE_COMUNICACAO_ATIVADO",
+        occurredAt: new Date().toISOString(),
+        metadata: { sintetico: true },
+        eventHash: hash64(`ativ-${loteId}`),
+      },
+    });
+    // Evento prévio PF_CONTROLLED_RETRY_AUTORIZADO no LOTE (exigência do vínculo).
+    await pool.query(
+      `INSERT INTO evento_auditoria (
+        id, agregado_tipo, agregado_id, tipo, ator_id, ocorreu_em,
+        metadados, hash_anterior, hash_evento
+      ) VALUES ($1, 'LOTE_COMUNICACAO', $2, 'PF_CONTROLLED_RETRY_AUTORIZADO', 'operador-teste', $3, '{"sintetico":true}'::jsonb, NULL, $4)`,
+      [randomUUID(), loteId, new Date().toISOString(), hash64(`retry-${loteId}`)],
+    );
+  }
+
+  // Comunicação + outbox próprios deste teste (ids únicos), vinculados ao lote.
   await repository.enqueueCommunicationBatch({
     id: loteId,
     code: CODIGO_LOTE,
@@ -83,12 +172,12 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
     createdAt: new Date().toISOString(),
     auditEvent: {
       id: randomUUID(),
-      aggregateType: "LOTE_COMUNICACAO",
-      aggregateId: loteId,
-      type: "PF_LOTE_COMUNICACAO_CRIADO",
+      aggregateType: "PROFISSIONAL",
+      aggregateId: profissionalId,
+      type: "PF_CONFIRMACAO_EMITIDA_REC",
       occurredAt: new Date().toISOString(),
-      metadata: { totalItens: 1 },
-      eventHash: hash64(loteId),
+      metadata: { loteComunicacaoId: loteId },
+      eventHash: hash64(confirmationId),
     },
     items: [
       {
@@ -114,34 +203,25 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
     ],
   });
 
-  // Ativa o lote (PREPARACAO → ATIVO, com evento auditado).
-  await repository.ativarLoteComunicacao({
-    batchId: loteId,
-    origin: "PF",
-    actorId: "operador-teste",
-    activatedAt: new Date().toISOString(),
+  // Reconstrói o estado do incidente: tentativas=2 (PROVIDER_NOT_CONFIGURED
+  // pré-rede + a falha final do gate) e FAILED com o código sob teste.
+  await repository.claimOutbox("worker-recuperacao", 10, new Date().toISOString());
+  await repository.markOutboxFailed({
+    outboxId,
+    communicationId,
+    errorCode: "PROVIDER_NOT_CONFIGURED",
+    retryAt: new Date().toISOString(),
     auditEvent: {
       id: randomUUID(),
-      aggregateType: "LOTE_COMUNICACAO",
-      aggregateId: loteId,
-      type: "PF_LOTE_COMUNICACAO_ATIVADO",
+      aggregateType: "COMUNICACAO",
+      aggregateId: communicationId,
+      type: "PF_COMMUNICATION_FAILED",
       occurredAt: new Date().toISOString(),
-      metadata: { sintetico: true },
-      eventHash: hash64(`ativ-${loteId}`),
+      metadata: { codigo: "PROVIDER_NOT_CONFIGURED" },
+      eventHash: hash64(`fail1-${outboxId}`),
     },
   });
-
-  // Evento prévio PF_CONTROLLED_RETRY_AUTORIZADO no LOTE (exigência do vínculo).
-  await pool.query(
-    `INSERT INTO evento_auditoria (
-      id, agregado_tipo, agregado_id, tipo, ator_id, ocorreu_em,
-      metadados, hash_anterior, hash_evento
-    ) VALUES ($1, 'LOTE_COMUNICACAO', $2, 'PF_CONTROLLED_RETRY_AUTORIZADO', 'operador-teste', $3, '{"sintetico":true}'::jsonb, NULL, $4)`,
-    [randomUUID(), loteId, new Date().toISOString(), hash64(`retry-${loteId}`)],
-  );
-
-  // Marca a FALHA persistida do incidente: claim + markOutboxFailed.
-  await repository.claimOutbox("worker-recuperacao", 10, new Date().toISOString());
+  await repository.claimOutbox("worker-recuperacao-2", 10, new Date().toISOString());
   await repository.markOutboxFailed({
     outboxId,
     communicationId,
@@ -154,7 +234,7 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
       type: "PF_COMMUNICATION_FAILED",
       occurredAt: new Date().toISOString(),
       metadata: { codigo: opcoes.erro, final: true },
-      eventHash: hash64(`fail-${outboxId}`),
+      eventHash: hash64(`fail2-${outboxId}`),
     },
   });
 

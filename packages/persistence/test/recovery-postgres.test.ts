@@ -16,8 +16,9 @@
  *
  * Massa 100% sintética; sem rede, sem Gmail real, sem PII.
  */
-import { afterAll, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import {
   Aes256GcmSecretBox,
   HmacSha256Fingerprinter,
@@ -68,47 +69,69 @@ function itemIncidente(
   };
 }
 
-/** Comunicação do incidente legado — definida server-side (id sintético). */
-const COMUNICACAO_INCIDENTE = "b76a1e9b-a59d-4777-8777-c2e61536613c";
-const CODIGO_LOTE = "CONTROLLED_GMAIL_TEST";
+const MIGRATIONS = [
+  "database/migrations/0001_operational_persistence.sql",
+  "database/migrations/0002_runtime_roles.sql",
+  "database/migrations/0003_batch_mode_dry_run.sql",
+  "database/migrations/0004_oauth_flow.sql",
+  "database/migrations/0005_oauth_flow_pkce.sql",
+] as const;
 
-// O código do lote é UNIQUE (origem, codigo) no banco e a recuperação valida
-// exatamente CONTROLLED_GMAIL_TEST — os cenários reutilizam a MESMA linha de
-// lote entre os testes (limpa no afterAll; cada teste cria profissional,
-// comunicação e outbox próprios). A primeira tentativa de falha do incidente
-// é determinada por busca/criação da outbox em tentativas=2.
-const POOL_COMPARTILHADO: { pool: NodePostgresPool | null } = { pool: null };
-afterAll(async () => {
+let databaseUrlTeste = "";
+let databaseNomeTeste = "";
+
+function urlBanco(base: string, database: string): string {
+  const url = new URL(base);
+  url.pathname = `/${database}`;
+  return url.toString();
+}
+
+async function criarBancoEfemero(): Promise<void> {
   if (!process.env.DATABASE_URL) return;
-  const pool = POOL_COMPARTILHADO.pool ?? new NodePostgresPool({ connectionString: process.env.DATABASE_URL });
+  databaseNomeTeste = `integra_recovery_${randomUUID().replaceAll("-", "")}`;
+  const adminUrl = urlBanco(process.env.DATABASE_URL, "postgres");
+  const admin = new NodePostgresPool({ connectionString: adminUrl });
   try {
-    await pool.query(
-      `DELETE FROM evento_auditoria WHERE agregado_tipo IN ('COMUNICACAO','LOTE_COMUNICACAO')
-        AND agregado_id IN (
-          SELECT c.id FROM comunicacao c JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id WHERE l.codigo = $1
-          UNION SELECT l.id FROM lote_comunicacao l WHERE l.codigo = $1)`,
-      [CODIGO_LOTE],
-    );
-    await pool.query(
-      `DELETE FROM outbox_email WHERE comunicacao_id IN (
-        SELECT c.id FROM comunicacao c JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id WHERE l.codigo = $1)`,
-      [CODIGO_LOTE],
-    );
-    await pool.query(
-      `DELETE FROM comunicacao WHERE lote_comunicacao_id IN (SELECT id FROM lote_comunicacao WHERE codigo = $1)`,
-      [CODIGO_LOTE],
-    );
-    await pool.query(`DELETE FROM lote_comunicacao WHERE codigo = $1`, [CODIGO_LOTE]);
+    await admin.query(`CREATE DATABASE "${databaseNomeTeste}"`);
+  } finally {
+    await admin.close();
+  }
+
+  databaseUrlTeste = urlBanco(process.env.DATABASE_URL, databaseNomeTeste);
+  const pool = new NodePostgresPool({ connectionString: databaseUrlTeste });
+  try {
+    for (const migration of MIGRATIONS) {
+      const sql = await readFile(migration, "utf8");
+      await pool.query(sql);
+    }
   } finally {
     await pool.close();
   }
-});
+}
+
+async function destruirBancoEfemero(): Promise<void> {
+  if (!process.env.DATABASE_URL || !databaseNomeTeste) return;
+  const admin = new NodePostgresPool({
+    connectionString: urlBanco(process.env.DATABASE_URL, "postgres"),
+  });
+  try {
+    await admin.query(`DROP DATABASE IF EXISTS "${databaseNomeTeste}" WITH (FORCE)`);
+  } finally {
+    await admin.close();
+    databaseUrlTeste = "";
+    databaseNomeTeste = "";
+  }
+}
+
+beforeEach(criarBancoEfemero);
+afterEach(destruirBancoEfemero);
 
 async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: string } = { erro: "FAILED_PERMANENT" }) {
   const profissionalId = randomUUID();
-  const communicationId = COMUNICACAO_INCIDENTE;
+  const communicationId = randomUUID();
   const outboxId = randomUUID();
   const confirmationId = randomUUID();
+  const codigoLote = `CONTROLLED_GMAIL_TEST_${randomUUID().slice(0, 8).toUpperCase()}`;
   const repository = new PostgresOperationalRepository(pool);
 
   await repository.createProfessional({
@@ -133,165 +156,84 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
     },
   });
 
-  // Lote com código UNIQUE compartilhado entre os testes: busca o existente
-  // (com ativação e retry autorizado prévios) ou cria um novo. O repositório
-  // exige ≥1 item por enqueue, então o item do incidente acompanha a criação;
-  // nos testes seguintes, nova chamada com o MESMO id do lote insere apenas
-  // os itens (a comunicação do incidente tem id fixo server-side).
-  const loteExistente = await pool.query<{ id: string }>(
-    `SELECT id FROM lote_comunicacao WHERE codigo = $1 AND origem = 'PF' LIMIT 1`,
-    [CODIGO_LOTE],
+  const loteId = randomUUID();
+  await repository.enqueueCommunicationBatch({
+    id: loteId,
+    code: codigoLote,
+    origin: "PF",
+    templateVersion: "pf-confirmation-v1",
+    mode: "LIVE_PILOT",
+    source: "CONTROLADO_SINTETICO",
+    createdBy: "teste-recuperacao",
+    createdAt: new Date().toISOString(),
+    auditEvent: {
+      id: randomUUID(),
+      aggregateType: "LOTE_COMUNICACAO",
+      aggregateId: loteId,
+      type: "PF_LOTE_COMUNICACAO_CRIADO",
+      occurredAt: new Date().toISOString(),
+      metadata: { totalItens: 1 },
+      eventHash: hash64(loteId),
+    },
+    items: [itemIncidente(profissionalId, confirmationId, communicationId, outboxId)],
+  });
+
+  await repository.ativarLoteComunicacao({
+    batchId: loteId,
+    origin: "PF",
+    actorId: "operador-teste",
+    activatedAt: new Date().toISOString(),
+    auditEvent: {
+      id: randomUUID(),
+      aggregateType: "LOTE_COMUNICACAO",
+      aggregateId: loteId,
+      type: "PF_LOTE_COMUNICACAO_ATIVADO",
+      occurredAt: new Date().toISOString(),
+      metadata: { sintetico: true },
+      eventHash: hash64(`ativ-${loteId}`),
+    },
+  });
+
+  await pool.query(
+    `INSERT INTO evento_auditoria (
+      id, agregado_tipo, agregado_id, tipo, ator_id, ocorreu_em,
+      metadados, hash_anterior, hash_evento
+    ) VALUES ($1, 'LOTE_COMUNICACAO', $2, 'PF_CONTROLLED_RETRY_AUTORIZADO', 'operador-teste', $3, '{"sintetico":true}'::jsonb, NULL, $4)`,
+    [randomUUID(), loteId, new Date().toISOString(), hash64(`retry-${loteId}`)],
   );
-  let loteId: string;
-  if (loteExistente.rows[0]) {
-    // Lote já existe de um teste anterior: insere confirmação + comunicação +
-    // outbox + item DIRETAMENTE (mesma estrutura gravada pelo repositório) —
-    // enqueueCommunicationBatch recriaria o lote (pkey). Sem evento novo:
-    // a recuperação não exige reativação.
-    loteId = loteExistente.rows[0].id;
-    await pool.query(`UPDATE lote_comunicacao SET status = 'ATIVO' WHERE id = $1`, [loteId]);
-    await pool.query(
-      `INSERT INTO confirmacao (
-        id, profissional_id, token_hash, template_versao, status, emitida_em, expira_em
-      ) VALUES ($1, $2, $3, 'pf-confirmation-v1', 'PENDING', $4, $5)`,
-      [
-        confirmationId,
-        profissionalId,
-        hash64(`token-${confirmationId}`),
-        new Date().toISOString(),
-        new Date(Date.now() + 3_600_000).toISOString(),
-      ],
-    );
-    await pool.query(
-      `INSERT INTO comunicacao (
-        id, profissional_id, confirmacao_id, lote_comunicacao_id, origem, provider,
-        destinatario_fingerprint, template_versao, idempotency_key, status, fonte_registro, criada_em
-      ) VALUES ($1, $2, $3, $4, 'PF', 'PENDING', $5, 'pf-confirmation-v1', $6, 'QUEUED', 'CONTROLADO_SINTETICO', $7)`,
-      [
-        communicationId,
-        profissionalId,
-        confirmationId,
-        loteId,
-        fingerprinter.fingerprint("email-rec", randomUUID()),
-        `pf-confirmation:rec:${confirmationId}`,
-        new Date().toISOString(),
-      ],
-    );
-    const payload = caixa.seal("payload-sintetico-rec", "outbox:email");
-    await pool.query(
-      `INSERT INTO outbox_email (
-        id, comunicacao_id, idempotency_key, payload_ciphertext,
-        payload_nonce, payload_auth_tag, chave_versao, status, disponivel_em
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', $8)`,
-      [
-        outboxId,
-        communicationId,
-        `pf-confirmation:rec:${confirmationId}`,
-        payload.ciphertext,
-        payload.nonce,
-        payload.authTag,
-        payload.keyVersion,
-        new Date().toISOString(),
-      ],
-    );
-    await pool.query(
-      `INSERT INTO item_lote_comunicacao (
-        id, lote_comunicacao_id, profissional_id, comunicacao_id, origem, status
-      ) VALUES ($1, $2, $3, $4, 'PF', 'ENFILEIRADO')
-      ON CONFLICT DO NOTHING`,
-      [randomUUID(), loteId, profissionalId, communicationId],
-    );
-  } else {
-    loteId = randomUUID();
-    await repository.enqueueCommunicationBatch({
-      id: loteId,
-      code: CODIGO_LOTE,
-      origin: "PF",
-      templateVersion: "pf-confirmation-v1",
-      mode: "LIVE_PILOT",
-      source: "CONTROLADO_SINTETICO",
-      createdBy: "teste-recuperacao",
-      createdAt: new Date().toISOString(),
-      auditEvent: {
-        id: randomUUID(),
-        aggregateType: "LOTE_COMUNICACAO",
-        aggregateId: loteId,
-        type: "PF_LOTE_COMUNICACAO_CRIADO",
-        occurredAt: new Date().toISOString(),
-        metadata: { totalItens: 1 },
-        eventHash: hash64(loteId),
-      },
-      items: [itemIncidente(profissionalId, confirmationId, communicationId, outboxId)],
-    });
-    // Ativa o lote (PREPARACAO → ATIVO, com evento auditado).
-    await repository.ativarLoteComunicacao({
-      batchId: loteId,
-      origin: "PF",
-      actorId: "operador-teste",
-      activatedAt: new Date().toISOString(),
-      auditEvent: {
-        id: randomUUID(),
-        aggregateType: "LOTE_COMUNICACAO",
-        aggregateId: loteId,
-        type: "PF_LOTE_COMUNICACAO_ATIVADO",
-        occurredAt: new Date().toISOString(),
-        metadata: { sintetico: true },
-        eventHash: hash64(`ativ-${loteId}`),
-      },
-    });
-    // Evento prévio PF_CONTROLLED_RETRY_AUTORIZADO no LOTE (exigência do vínculo).
-    await pool.query(
-      `INSERT INTO evento_auditoria (
-        id, agregado_tipo, agregado_id, tipo, ator_id, ocorreu_em,
-        metadados, hash_anterior, hash_evento
-      ) VALUES ($1, 'LOTE_COMUNICACAO', $2, 'PF_CONTROLLED_RETRY_AUTORIZADO', 'operador-teste', $3, '{"sintetico":true}'::jsonb, NULL, $4)`,
-      [randomUUID(), loteId, new Date().toISOString(), hash64(`retry-${loteId}`)],
-    );
-  }
 
+  // Reconstrói somente a outbox desta fixture. Não usa claimOutbox global:
+  // assim nenhum PENDING/FAILED de outra suíte pode ser reservado por engano.
+  const ocorreuEm = new Date().toISOString();
+  await pool.query(
+    `UPDATE outbox_email
+      SET status = 'FAILED', tentativas = 2, ultimo_erro_codigo = $2,
+          disponivel_em = $3, bloqueada_em = NULL, bloqueada_por = NULL
+      WHERE id = $1 AND comunicacao_id = $4`,
+    [
+      outboxId,
+      opcoes.erro,
+      new Date(Date.now() + 30 * 24 * 3_600_000).toISOString(),
+      communicationId,
+    ],
+  );
+  await pool.query(
+    `UPDATE comunicacao SET status = 'FAILED', falhou_em = $2 WHERE id = $1`,
+    [communicationId, ocorreuEm],
+  );
+  await pool.query(
+    `UPDATE item_lote_comunicacao SET status = 'FALHOU', atualizado_em = $2
+      WHERE comunicacao_id = $1`,
+    [communicationId, ocorreuEm],
+  );
 
-  // Reconstrói o estado do incidente: tentativas=2 (PROVIDER_NOT_CONFIGURED
-  // pré-rede + a falha final do gate) e FAILED com o código sob teste.
-  await repository.claimOutbox("worker-recuperacao", 10, new Date().toISOString());
-  await repository.markOutboxFailed({
-    outboxId,
-    communicationId,
-    errorCode: "PROVIDER_NOT_CONFIGURED",
-    retryAt: new Date().toISOString(),
-    auditEvent: {
-      id: randomUUID(),
-      aggregateType: "COMUNICACAO",
-      aggregateId: communicationId,
-      type: "PF_COMMUNICATION_FAILED",
-      occurredAt: new Date().toISOString(),
-      metadata: { codigo: "PROVIDER_NOT_CONFIGURED" },
-      eventHash: hash64(`fail1-${outboxId}`),
-    },
-  });
-  await repository.claimOutbox("worker-recuperacao-2", 10, new Date().toISOString());
-  await repository.markOutboxFailed({
-    outboxId,
-    communicationId,
-    errorCode: opcoes.erro,
-    retryAt: new Date(Date.now() + 30 * 24 * 3_600_000).toISOString(),
-    auditEvent: {
-      id: randomUUID(),
-      aggregateType: "COMUNICACAO",
-      aggregateId: communicationId,
-      type: "PF_COMMUNICATION_FAILED",
-      occurredAt: new Date().toISOString(),
-      metadata: { codigo: opcoes.erro, final: true },
-      eventHash: hash64(`fail2-${outboxId}`),
-    },
-  });
-
-  return { repository, pool, profissionalId, loteId, communicationId, outboxId };
+  return { repository, pool, profissionalId, loteId, codigoLote, communicationId, outboxId };
 }
 
-function comandoRecuperacao(opcoes: { erro: string; communicationId?: string; operador?: string }) {
+function comandoRecuperacao(opcoes: { erro: string; codigoLote: string; communicationId?: string; operador?: string }) {
   const agora = new Date().toISOString();
   return {
-    expectedCode: CODIGO_LOTE,
+    expectedCode: opcoes.codigoLote,
     expectedErrorCode: opcoes.erro,
     expectedAttempts: 2,
     ...(opcoes.communicationId ? { expectedCommunicationId: opcoes.communicationId } : {}),
@@ -312,11 +254,11 @@ function comandoRecuperacao(opcoes: { erro: string; communicationId?: string; op
 
 d("CORRECTIVE_RECOVERY_SQL_SYNTAX — recuperarOutboxControlada em PostgreSQL 16 real", () => {
   it("cenário legado EXATO do incidente: FAILED/FAILED_PERMANENT/tentativas=2 → RECOVERED com evento vinculado", async () => {
-    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    const pool = new NodePostgresPool({ connectionString: databaseUrlTeste });
     try {
-      const { repository, communicationId, outboxId } = await montarCenarioIncidente(pool);
+      const { repository, codigoLote, communicationId, outboxId } = await montarCenarioIncidente(pool);
       const resultado = await repository.recuperarOutboxControlada(
-        comandoRecuperacao({ erro: "FAILED_PERMANENT", communicationId }) as never,
+        comandoRecuperacao({ erro: "FAILED_PERMANENT", codigoLote, communicationId }) as never,
       );
       expect(resultado.resultCode).toBe("RECOVERED");
       expect(resultado.outboxId).toBe(outboxId);
@@ -348,16 +290,16 @@ d("CORRECTIVE_RECOVERY_SQL_SYNTAX — recuperarOutboxControlada em PostgreSQL 16
   });
 
   it("idempotência REAL: segunda chamada → ALREADY_RECOVERED sem nova mutação", async () => {
-    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    const pool = new NodePostgresPool({ connectionString: databaseUrlTeste });
     try {
-      const { repository, communicationId, outboxId } = await montarCenarioIncidente(pool);
+      const { repository, codigoLote, communicationId, outboxId } = await montarCenarioIncidente(pool);
       await repository.recuperarOutboxControlada(
-        comandoRecuperacao({ erro: "FAILED_PERMANENT", communicationId }) as never,
+        comandoRecuperacao({ erro: "FAILED_PERMANENT", codigoLote, communicationId }) as never,
       );
       // Idempotência REAL — a segunda chamada roda contra o PostgreSQL de
       // verdade: ALREADY_RECOVERED sem nova mutação e sem novo evento.
       const segunda = await repository.recuperarOutboxControlada(
-        comandoRecuperacao({ erro: "FAILED_PERMANENT", communicationId }) as never,
+        comandoRecuperacao({ erro: "FAILED_PERMANENT", codigoLote, communicationId }) as never,
       );
       expect(segunda.resultCode).toBe("ALREADY_RECOVERED");
 
@@ -380,14 +322,14 @@ d("CORRECTIVE_RECOVERY_SQL_SYNTAX — recuperarOutboxControlada em PostgreSQL 16
   });
 
   it("vínculo server-side: OUTRA comunicação do mesmo lote é recusada SEM mutação e SEM auditoria", async () => {
-    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    const pool = new NodePostgresPool({ connectionString: databaseUrlTeste });
     try {
       const { pool: _pool, ...cenario } = await montarCenarioIncidente(pool);
       const outraComunicacao = randomUUID();
       // Garante que o id divergente não existe — o filtro do SQL recusa.
       await expect(
         cenario.repository.recuperarOutboxControlada(
-          comandoRecuperacao({ erro: "FAILED_PERMANENT", communicationId: outraComunicacao }) as never,
+          comandoRecuperacao({ erro: "FAILED_PERMANENT", codigoLote: cenario.codigoLote, communicationId: outraComunicacao }) as never,
         ),
       ).rejects.toThrow(/COMMUNICATION_MISMATCH/);
 
@@ -408,12 +350,12 @@ d("CORRECTIVE_RECOVERY_SQL_SYNTAX — recuperarOutboxControlada em PostgreSQL 16
   });
 
   it("ROLLBACK: falha de gate (código divergente) após o FOR UPDATE não deixa mutação nem auditoria", async () => {
-    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    const pool = new NodePostgresPool({ connectionString: databaseUrlTeste });
     try {
-      const { repository, communicationId, outboxId } = await montarCenarioIncidente(pool);
+      const { repository, codigoLote, communicationId, outboxId } = await montarCenarioIncidente(pool, { erro: "DELIVERY_UNKNOWN" });
       await expect(
         repository.recuperarOutboxControlada(
-          comandoRecuperacao({ erro: "DELIVERY_UNKNOWN", communicationId }) as never,
+          comandoRecuperacao({ erro: "FAILED_PERMANENT", codigoLote, communicationId }) as never,
         ),
       ).rejects.toThrow(/ERROR_CODE_MISMATCH/);
 
@@ -439,13 +381,13 @@ d("CORRECTIVE_RECOVERY_SQL_SYNTAX — recuperarOutboxControlada em PostgreSQL 16
     // montado pelo repositório contém espaço antes de AND quando o vínculo
     // legado está ativo. Executada no PostgreSQL real via EXPLAIN — sintaxe
     // inválida falharia aqui também.
-    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    const pool = new NodePostgresPool({ connectionString: databaseUrlTeste });
     try {
       const sql = `SELECT o.id FROM outbox_email o
         JOIN comunicacao c ON c.id = o.comunicacao_id
         JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
         WHERE l.codigo = $1 AND o.comunicacao_id = $2 LIMIT 1`;
-      const explicado = await pool.query(`EXPLAIN ${sql}`, [CODIGO_LOTE, COMUNICACAO_INCIDENTE]);
+      const explicado = await pool.query(`EXPLAIN ${sql}`, [`CONTROLLED_GMAIL_TEST_${randomUUID().slice(0, 8)}`, randomUUID()]);
       expect(explicado.rows.length).toBeGreaterThan(0);
     } finally {
       await pool.close();

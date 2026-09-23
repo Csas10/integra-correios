@@ -287,5 +287,12 @@ export function workerPodeExecutar(
   if (env !== undefined && opcoes?.live === true && !providerGmailConfigurado(env)) {
     return { ok: false, motivo: "PROVIDER_NOT_CONFIGURED" };
   }
+  // OUTBOX_GATE_CHAIN_FIX — o caminho LIVE exige OAuth READY (conexão
+  // persistida avaliada pelo chamador). Sem isso o gateway real consumia
+  // token/refresh e o gate recusava com OAUTH_NOT_READY — bloqueio que deve
+  // acontecer ANTES do claim, sem consumir tentativa.
+  if (opcoes?.live === true && report.gmailOauth.status !== "READY") {
+    return { ok: false, motivo: "OAUTH_NOT_READY" };
+  }
   return { ok: true, motivo: report.executionMode };
 }

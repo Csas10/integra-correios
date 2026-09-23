@@ -147,6 +147,12 @@ interface EstadoLoteControladoItem {
   liberacaoHumanaAuditada: boolean;
   /** PRE_CLAIM_500_DIAGNOSIS — autorização PF_CONTROLLED_RETRY_AUTORIZADO vigente. */
   retryAuditadoVigente?: boolean | null;
+  /** OUTBOX_GATE_CHAIN_FIX — estado atual da outbox do teste (sanitizado). */
+  outbox?: {
+    status: "PENDING" | "PROCESSING" | "SENT" | "FAILED" | "FAILED_PERMANENT" | "CANCELLED";
+    tentativas: number;
+    codigoErro: string | null;
+  } | null;
   destinatarioCorresponde: boolean | null;
 }
 
@@ -288,6 +294,10 @@ export function OperationalFlow() {
     resultado: string | null;
   }>({ confirmacao: "", resultado: null });
   const [retryControlado, setRetryControlado] = useState<{
+    confirmacao: string;
+    resultado: string | null;
+  }>({ confirmacao: "", resultado: null });
+  const [oauthRecuperacao, setOauthRecuperacao] = useState<{
     confirmacao: string;
     resultado: string | null;
   }>({ confirmacao: "", resultado: null });
@@ -771,6 +781,33 @@ export function OperationalFlow() {
       setRetryControlado({ confirmacao: "", resultado: resposta.aviso ?? "Nova tentativa autorizada e auditada." });
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha ao registrar a nova tentativa.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  // Recuperação auditada exclusiva do incidente CONTROLLED_GATE_OAUTH_NOT_READY:
+  // bloqueio comprovadamente pré-messages.send. Nada é enviado aqui — apenas o
+  // evento auditado é registrado e o outbox retorna a PENDING
+  // (REAL_SEND_ENABLED precisa estar false).
+  const CONFIRMACAO_OAUTH_RECOVERY_UI =
+    "AUTORIZO RECUPERACAO AUDITADA DO OUTBOX DO LOTE CONTROLLED_GMAIL_TEST FALHADO " +
+    "POR CONTROLLED_GATE_OAUTH_NOT_READY, SEM CHAMADA MESSAGES.SEND, SEM REUTILIZAR " +
+    "RETRY ANTERIOR E MANTENDO TODOS OS DADOS";
+  async function autorizarRecuperacaoOauth() {
+    if (gmail?.realSendEnabled) return;
+    if (oauthRecuperacao.confirmacao.trim() !== CONFIRMACAO_OAUTH_RECOVERY_UI) return;
+    setOcupado(true);
+    setErro(undefined);
+    try {
+      const resposta = (await chamar("/api/pilot/controlled/oauth-recovery", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmacao: oauthRecuperacao.confirmacao.trim() }),
+      })) as { aviso?: string };
+      setOauthRecuperacao({ confirmacao: "", resultado: resposta.aviso ?? "Recuperação registrada e auditada." });
+    } catch (e) {
+      setErro(e instanceof Error ? e.message : "Falha ao registrar a recuperação.");
     } finally {
       setOcupado(false);
     }
@@ -1402,6 +1439,51 @@ export function OperationalFlow() {
                     </button>
                   </div>
                   {retryControlado.resultado && <p>{retryControlado.resultado}</p>}
+                </div>
+              )}
+              {estadoControlado.lote &&
+                estadoControlado.lote.status === "ATIVO" &&
+                estadoControlado.lote.outbox &&
+                estadoControlado.lote.outbox.status === "FAILED_PERMANENT" && (
+                <div className="flow-stats">
+                  <p>
+                    <strong>Recuperação auditada exclusiva</strong> — incidente
+                    CONTROLLED_GATE_OAUTH_NOT_READY (bloqueio de gate pré-`messages.send` com
+                    OAuth persistido ativo). Exige outbox FAILED_PERMANENT com código de erro
+                    exatamente CONTROLLED_GATE_OAUTH_NOT_READY, tentativas=2, receipt=0 e
+                    ausência de Message-ID/Thread-ID; recupera o outbox para PENDING e registra
+                    evento auditado. DELIVERY_UNKNOWN, AUTH_REQUIRED e demais falhas nunca
+                    são recuperáveis. O envio em si continua exigindo REAL_SEND_ENABLED=true
+                    em etapa separada.
+                  </p>
+                  <p>
+                    Cole exatamente a frase:
+                    <br />
+                    <code>{CONFIRMACAO_OAUTH_RECOVERY_UI}</code>
+                  </p>
+                  <input
+                    value={oauthRecuperacao.confirmacao}
+                    onChange={(e) =>
+                      setOauthRecuperacao((atual) => ({ ...atual, confirmacao: e.target.value }))
+                    }
+                    placeholder="Cole a frase de autorização aqui"
+                    disabled={ocupado}
+                    style={{ width: "100%" }}
+                  />
+                  <div className="flow-filters">
+                    <button
+                      type="button"
+                      onClick={autorizarRecuperacaoOauth}
+                      disabled={
+                        ocupado ||
+                        gmail.realSendEnabled ||
+                        oauthRecuperacao.confirmacao.trim() !== CONFIRMACAO_OAUTH_RECOVERY_UI
+                      }
+                    >
+                      Autorizar recuperação (auditada)
+                    </button>
+                  </div>
+                  {oauthRecuperacao.resultado && <p>{oauthRecuperacao.resultado}</p>}
                 </div>
               )}
             </div>

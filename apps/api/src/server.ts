@@ -24,6 +24,7 @@ import {
   BloqueioExecucaoControladaError,
   CODIGO_LOTE_HISTORICO_DRY_RUN,
   ativarLoteControlado,
+  autorizarRecuperacaoOauthGate,
   autorizarRetryPreRede,
   executarWorkerControladoUmaVez,
   mapearFalhaExecucao,
@@ -1027,6 +1028,65 @@ const ROTAS: readonly Rota[] = [
           return;
         }
         json(res, 500, { erro: "Falha ao registrar a nova tentativa." });
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // OUTBOX_GATE_CHAIN_FIX — recuperação auditada EXCLUSIVA da outbox do
+  // teste que falhou em CONTROLLED_GATE_OAUTH_NOT_READY (bloqueio de gate
+  // PRÉ-messages.send: zero chamada Gmail, OAuth persistido ativo).
+  // Fail-closed: somente esse código + tentativas=2 + receipt=0 + sem
+  // provider ids + fila zerada + REAL_SEND_ENABLED=false; confirmação
+  // humana textual específica; idempotente (já recuperado → estado atual);
+  // evento PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO na MESMA transação
+  // do UPDATE para PENDING. Outras falhas NUNCA são elegíveis.
+  // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/pilot/controlled/oauth-recovery",
+    handler: async (req, res, _url, corpo) => {
+      if (!exigirOperador(req, res)) return;
+      const { pool } = requireDb();
+      const body = JSON.parse(corpo.toString("utf8") || "{}") as { confirmacao?: string };
+      const confirmacaoEsperada =
+        "AUTORIZO RECUPERACAO AUDITADA DO OUTBOX DO LOTE CONTROLLED_GMAIL_TEST FALHADO " +
+        "POR CONTROLLED_GATE_OAUTH_NOT_READY, SEM CHAMADA MESSAGES.SEND, SEM REUTILIZAR " +
+        "RETRY ANTERIOR E MANTENDO TODOS OS DADOS";
+      if (!body.confirmacao || body.confirmacao.trim() !== confirmacaoEsperada) {
+        json(res, 422, {
+          erro: "Confirmação humana não corresponde ao texto obrigatório.",
+          codigo: "BLOCKED_RECOVERY_CONFIRMATION",
+        });
+        return;
+      }
+      if (process.env.REAL_SEND_ENABLED === "true") {
+        json(res, 409, {
+          erro: "REAL_SEND_ENABLED=true — recuperação exige envio desarmado.",
+          codigo: "REAL_SEND_ARMED",
+        });
+        return;
+      }
+      const repository = new PostgresOperationalRepository(pool);
+      try {
+        const resultado = await autorizarRecuperacaoOauthGate(
+          repository,
+          "operador-autenticado",
+          false,
+        );
+        json(res, 200, {
+          ...resultado,
+          aviso:
+            resultado.resultCode === "ALREADY_RECOVERED"
+              ? "Recuperação já registrada anteriormente — estado atual preservado, sem nova mutação."
+              : "Outbox recuperada para PENDING e evento auditado registrado. A execução só ocorre com OAuth READY, MAIL_PROVIDER=Gmail e REAL_SEND_ENABLED=true em etapa separada.",
+        });
+      } catch (error) {
+        if (error instanceof BloqueioExecucaoControladaError) {
+          json(res, 409, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 500, { erro: "Falha ao registrar a recuperação." });
       }
     },
   },

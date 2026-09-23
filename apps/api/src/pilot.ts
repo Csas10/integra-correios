@@ -594,6 +594,13 @@ export function carregarPoliticaControlada(
   };
 }
 
+/** OUTBOX_GATE_CHAIN_FIX — estado sanitizado da outbox do teste controlado. */
+export interface EstadoOutboxControlado {
+  readonly status: "PENDING" | "PROCESSING" | "SENT" | "FAILED" | "FAILED_PERMANENT" | "CANCELLED";
+  readonly tentativas: number;
+  readonly codigoErro: string | null;
+}
+
 export interface EstadoLoteControladoItem {
   readonly loteId: string;
   readonly status: "PREPARACAO" | "ATIVO" | "CONCLUIDO" | "CANCELADO";
@@ -606,6 +613,9 @@ export interface EstadoLoteControladoItem {
    * à última mutação FAILED da outbox do teste (correlação via bloqueada_em).
    * null = não aplicável (outbox não está FAILED) ou lote inexistente. */
   readonly retryAuditadoVigente: boolean | null;
+  /** OUTBOX_GATE_CHAIN_FIX — estado atual da outbox do teste, sanitizado
+   * (status/tentativas/código de erro); null = outbox inexistente. */
+  readonly outbox?: EstadoOutboxControlado | null;
   /** Verificação server-side do payload: destinatário === controlado.
    * null = indeterminado (payload ilegível/ausente) — exibição fail-closed. */
   readonly destinatarioCorresponde: boolean | null;
@@ -654,6 +664,18 @@ export async function lerEstadoLoteControlado(
       (SELECT count(*) FROM evento_auditoria ea
         WHERE ea.agregado_tipo = 'LOTE_COMUNICACAO' AND ea.agregado_id = l.id
           AND ea.tipo = 'PF_LOTE_COMUNICACAO_ATIVADO') AS ativacoes,
+      (SELECT ob1.status FROM outbox_email ob1
+        JOIN comunicacao c1 ON c1.id = ob1.comunicacao_id
+        WHERE c1.lote_comunicacao_id = l.id
+        ORDER BY COALESCE(ob1.bloqueada_em, ob1.criada_em) DESC LIMIT 1) AS outbox_status,
+      (SELECT ob1.tentativas FROM outbox_email ob1
+        JOIN comunicacao c1 ON c1.id = ob1.comunicacao_id
+        WHERE c1.lote_comunicacao_id = l.id
+        ORDER BY COALESCE(ob1.bloqueada_em, ob1.criada_em) DESC LIMIT 1) AS outbox_tentativas,
+      (SELECT ob1.ultimo_erro_codigo FROM outbox_email ob1
+        JOIN comunicacao c1 ON c1.id = ob1.comunicacao_id
+        WHERE c1.lote_comunicacao_id = l.id
+        ORDER BY COALESCE(ob1.bloqueada_em, ob1.criada_em) DESC LIMIT 1) AS outbox_erro,
       (SELECT count(*) FROM evento_auditoria ea
         WHERE ea.agregado_tipo = 'LOTE_COMUNICACAO' AND ea.agregado_id = l.id
           AND ea.tipo = 'PF_CONTROLLED_RETRY_AUTORIZADO'
@@ -719,6 +741,16 @@ export async function lerEstadoLoteControlado(
       // PRE_CLAIM_500_DIAGNOSIS — visível no painel: a autorização de retry
       // auditada está vigente (posterior à última mutação FAILED) ou não.
       retryAuditadoVigente: Number(linha.receipts) === 0 && Number(linha.retry_vigente ?? 0) > 0,
+      // OUTBOX_GATE_CHAIN_FIX — estado atual da outbox, para a UI bloquear
+      // execução quando a falha não é pré-rede (FAILED_PERMANENT). Última
+      // mutação pela coluna real bloqueada_em (markOutboxFailed/claim).
+      outbox: linha.outbox_status
+        ? {
+            status: String(linha.outbox_status) as EstadoOutboxControlado["status"],
+            tentativas: Number(linha.outbox_tentativas ?? 0),
+            codigoErro: (linha.outbox_erro as string | null) ?? null,
+          }
+        : null,
       destinatarioCorresponde,
     };
   }
@@ -1100,6 +1132,52 @@ export type ExecucaoLiveControlada = typeof executarWorkerUmaVezLive;
 
 /** Falha pré-rede comprovada que habilita o retry controlado exclusivo. */
 export const CODIGO_RETRY_PRE_REDE = "PROVIDER_NOT_CONFIGURED";
+
+/** OUTBOX_GATE_CHAIN_FIX — código do incidente de gate pré-messages.send. */
+export const CODIGO_GATE_OAUTH_NOT_READY = "CONTROLLED_GATE_OAUTH_NOT_READY";
+
+/**
+ * OUTBOX_GATE_CHAIN_FIX — RECUPERAÇÃO AUDITADA EXCLUSIVA do incidente
+ * CONTROLLED_GATE_OAUTH_NOT_READY: bloqueio de gate comprovadamente PRÉ-
+ * messages.send (zero chamada Gmail, refresh sem envio, OAuth persistido
+ * ativo). Toda a validação fail-closed e a mutação PENDING + evento de
+ * auditoria acontecem em UMA transação no repositório
+ * (recuperarOutboxControlada) — sem reutilizar o retry anterior e sem
+ * apagar histórico. Idempotente: já recuperado → estado atual.
+ */
+export async function autorizarRecuperacaoOauthGate(
+  repository: Pick<PostgresOperationalRepository, "recuperarOutboxControlada">,
+  operador: string,
+  realSendEnabled: boolean,
+): Promise<{ autorizado: boolean; resultCode: string; outboxId: string; status: string }> {
+  const agora = new Date().toISOString();
+  try {
+    const resultado = await repository.recuperarOutboxControlada({
+      expectedCode: CODIGO_LOTE_TESTE_CONTROLADO,
+      expectedErrorCode: CODIGO_GATE_OAUTH_NOT_READY,
+      expectedAttempts: 2,
+      realSendEnabled,
+      availableAt: agora,
+      auditEvent: {
+        id: randomUUID(),
+        aggregateType: "COMUNICACAO",
+        aggregateId: "",
+        type: "PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO",
+        occurredAt: agora,
+        metadata: { motivo: CODIGO_GATE_OAUTH_NOT_READY, finalidade: "recuperacao-gate-pre-send" },
+        eventHash: hashEvento(CODIGO_LOTE_TESTE_CONTROLADO, agora),
+      },
+    });
+    return { autorizado: true, ...resultado };
+  } catch (error) {
+    const mensagem = error instanceof Error ? error.message : String(error);
+    const codigo = mensagem.split(":")[0] ?? "RECOVERY_FAILED";
+    if (/^[A-Z0-9_]{3,60}$/.test(codigo)) {
+      throw new BloqueioExecucaoControladaError(codigo, "Recuperação recusada — estado não elegível.");
+    }
+    throw error;
+  }
+}
 
 /**
  * Executa o worker LIVE run-once com pré-voo fail-closed. Nunca chama o Gmail

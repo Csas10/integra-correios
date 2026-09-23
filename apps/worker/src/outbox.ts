@@ -239,7 +239,15 @@ function escapeHtml(value: string): string {
  */
 export function sanitizarErro(error: unknown): string {
   if (error instanceof GmailAuthError) return "AUTH_REQUIRED";
-  if (error instanceof GmailPermanentPolicyError) return "FAILED_PERMANENT";
+  if (error instanceof GmailPermanentPolicyError) {
+    const mensagem = error.message;
+    // OUTBOX_GATE_CHAIN_FIX — bloqueios de gate pré-messages.send com OAuth
+    // persistido ativo têm código PRÓPRIO (não colapsam em FAILED_PERMANENT):
+    // distinguem "gate recusou antes da rede" de falha real do provider.
+    if (mensagem.includes("OAUTH_NOT_READY")) return "CONTROLLED_GATE_OAUTH_NOT_READY";
+    if (mensagem.includes("ACCESS_TOKEN_UNAVAILABLE")) return "OAUTH_NOT_CONNECTED";
+    return "FAILED_PERMANENT";
+  }
   if (error instanceof GmailRateLimitError) return "RATE_LIMITED";
   if (error instanceof GmailAmbiguousError) return "DELIVERY_UNKNOWN";
   const mensagem = error instanceof Error ? error.message : String(error);
@@ -258,6 +266,12 @@ export function sanitizarErro(error: unknown): string {
  */
 export function calcularRetryAt(codigo: string, tentativas: number, now: Date): Date {
   if (codigo === "DELIVERY_UNKNOWN" || codigo === "AUTH_REQUIRED") {
+    return new Date(now.getTime() + 30 * 24 * 3_600_000);
+  }
+  // OUTBOX_GATE_CHAIN_FIX — códigos TERMINAIS nunca voltam à fila
+  // automaticamente: o agendamento genérico não pode reprocessar uma falha
+  // que exige recuperação auditada exclusiva (mesma janela de 30 dias).
+  if (codigo === "FAILED_PERMANENT" || codigo === "CONTROLLED_GATE_OAUTH_NOT_READY") {
     return new Date(now.getTime() + 30 * 24 * 3_600_000);
   }
   if (tentativas >= MAX_TENTATIVAS) {
@@ -358,23 +372,40 @@ export function criarGatewayDoAmbiente(
     // GATE 2: quando o modo controlado está ativo, cada envio passa pela
     // verificação (fonte sintética, destinatário controlado, lote ATIVO de
     // 1 item, liberação auditada, sem receipt) ANTES da chamada ao Gmail.
+    //
+    // OUTBOX_GATE_CHAIN_FIX — o gate roda ANTES de carregar/renovar o access
+    // token: uma recusa do gate NUNCA gera refresh em oauth2.googleapis.com/token
+    // nem consome chamada de rede. A ordem anterior (token → gate) consumia o
+    // refresh mesmo com zero chamadas messages.send.
     const gate = opcoes.gateControlado;
-    const transporteComGate: (message: OutboundMail, accessToken: string) => Promise<MailReceipt> =
-      gate
-        ? async (message, accessToken) => {
-            const communicationId = message.communicationId ?? "";
-            const veredito = await gate(communicationId, message.to);
-            if (!veredito.ok) {
-              // Zero chamadas ao Gmail: a divergência é recusada ANTES do
-              // transporte. Erro classificado como permanente (sem retry).
-              throw new GmailPermanentPolicyError(`controlled-gate: ${veredito.motivo}`);
-            }
-            return transporte.send(message, accessToken);
+    const transporteComGate: (message: OutboundMail, accessToken: string) => Promise<MailReceipt> = gate
+      ? async (message, _accessToken) => {
+          const communicationId = message.communicationId ?? "";
+          const veredito = await gate(communicationId, message.to);
+          if (!veredito.ok) {
+            // Zero chamadas ao Gmail: a divergência é recusada ANTES do
+            // transporte e ANTES do token. Erro classificado como permanente
+            // (sem retry); o motivo específico preserva o diagnóstico.
+            throw new GmailPermanentPolicyError(`controlled-gate: ${veredito.motivo}`);
           }
-        : (message, accessToken) => transporte.send(message, accessToken);
+          const accessToken = await loadAccessToken();
+          if (!accessToken) {
+            // Fail-closed sem rede: sem token não há chamada messages.send.
+            throw new GmailPermanentPolicyError("controlled-gate: ACCESS_TOKEN_UNAVAILABLE");
+          }
+          return transporte.send(message, accessToken);
+        }
+      : (message, accessToken) => transporte.send(message, accessToken);
     return new GmailMailGateway(
       transporteComGate,
-      loadAccessToken,
+      gate
+        ? // OUTBOX_GATE_CHAIN_FIX — com gate presente, o token NÃO é resolvido
+          // pelo gateway (a ordem token→gate causava refresh sem envio). O
+          // gateway recebe um sentinel não-vazio (apenas para atravessar a
+          // checagem interna de "conta conectada") e o transporteComGate
+          // resolve o token REAL somente DEPOIS do gate aprovado.
+          async () => "gate-delega-token"
+        : loadAccessToken,
       () => new Date(),
       // GATE 1 honra o AMBIENTE INJETADO (não o process.env do processo).
       env,
@@ -476,7 +507,29 @@ async function executarWorkerDoModo(
   opcoes: { dryRun: boolean; workerId?: string; env?: Readonly<Record<string, string | undefined>> },
 ): Promise<{ readiness: ReadinessReport; resultado?: WorkerResult; motivo?: string }> {
   const env = opcoes.env ?? process.env;
-  const readiness = await avaliarReadiness(env, () => sondarDatabase(env));
+  // OUTBOX_GATE_CHAIN_FIX — readiness LIVE injeta a leitura da oauth_connection
+  // PERSISTIDA: sem isso gmailOauth ficava "não conectado" mesmo com a conta
+  // conectada (painel/banco), e o gate recebia oauthPronto=false incorretamente.
+  // No LIVE o worker abre o pool de qualquer forma; a leitura usa o MESMO pool.
+  const pool = new NodePostgresPool({ connectionString: env.DATABASE_URL, max: 4 });
+  try {
+    const repository = new PostgresOperationalRepository(pool);
+    const readiness = await avaliarReadiness(env, () => sondarDatabase(env), () =>
+      repository.existeConexaoGmailAtiva(),
+    );
+    return await executarWorkerDoModoInterno(opcoes, env, pool, repository, readiness);
+  } finally {
+    await pool.close();
+  }
+}
+
+async function executarWorkerDoModoInterno(
+  opcoes: { dryRun: boolean; workerId?: string; env?: Readonly<Record<string, string | undefined>> },
+  env: Readonly<Record<string, string | undefined>>,
+  pool: NodePostgresPool,
+  repository: PostgresOperationalRepository,
+  readiness: ReadinessReport,
+): Promise<{ readiness: ReadinessReport; resultado?: WorkerResult; motivo?: string }> {
   const veredito = workerPodeExecutar(readiness, env, { live: !opcoes.dryRun });
   if (!veredito.ok) {
     return { readiness, motivo: veredito.motivo };
@@ -491,54 +544,48 @@ async function executarWorkerDoModo(
   if (live && !providerGmailConfigurado(env)) {
     return { readiness, motivo: "PROVIDER_NOT_CONFIGURED" };
   }
-  const pool = new NodePostgresPool({ connectionString: env.DATABASE_URL, max: 4 });
-  try {
-    const caixa = new Aes256GcmSecretBox(
-      Buffer.from(env.DATA_ENCRYPTION_KEY_BASE64 ?? "", "base64"),
-      env.DATA_ENCRYPTION_KEY_VERSION ?? "v1",
-    );
-    const repository = new PostgresOperationalRepository(pool);
-    // FINAL CLOSURE GATE item 2 — modo controlado: GATE 2 REAL por
-    // comunicação, imediatamente antes de users.messages.send (somente no
-    // caminho LIVE; o DRY_RUN nunca chama o Gmail de qualquer forma).
-    const controlledMode = env.GMAIL_CONTROLLED_MODE === "true";
-    const controlledRecipient = (env.GMAIL_CONTROLLED_RECIPIENT ?? "").trim();
-    const gateway = criarGatewayDoAmbiente(env, !live, {
-      credentials: repository,
-      repository,
-      caixa,
-      ...(live && controlledMode && controlledRecipient
-        ? {
-            gateControlado: (communicationId: string, destinatario: string) =>
-              repository.verificarEnvioControlado({
-                fonte: "CONTROLADO_SINTETICO",
-                communicationId,
-                destinatario,
-                oauthPronto: readiness.gmailOauth.status === "READY",
-              }),
-          }
-        : {}),
-    });
-    const resultado = await processarOutboxUmaVez(
-      opcoes.workerId ?? `worker-${process.pid}`,
-      pool,
-      gateway,
-      caixa,
-      repository,
-      new Date(),
-      live ? "LIVE_PILOT" : "DRY_RUN",
-    );
-    // F7: o modo declarado pelo gateway é conferido contra o modo dos lotes
-    // reclamados — divergência é impossível por construção (claim filtra por
-    // status do lote, e o gateway é escolhido server-side), mas a checagem
-    // torna a invariante explícita.
-    if (resultado && resultado.modo !== (live ? "LIVE_PILOT" : "DRY_RUN")) {
-      return { readiness, motivo: "MODE_MISMATCH" };
-    }
-    return { readiness, resultado };
-  } finally {
-    await pool.close();
+  const caixa = new Aes256GcmSecretBox(
+    Buffer.from(env.DATA_ENCRYPTION_KEY_BASE64 ?? "", "base64"),
+    env.DATA_ENCRYPTION_KEY_VERSION ?? "v1",
+  );
+  // FINAL CLOSURE GATE item 2 — modo controlado: GATE 2 REAL por
+  // comunicação, imediatamente antes de users.messages.send (somente no
+  // caminho LIVE; o DRY_RUN nunca chama o Gmail de qualquer forma).
+  const controlledMode = env.GMAIL_CONTROLLED_MODE === "true";
+  const controlledRecipient = (env.GMAIL_CONTROLLED_RECIPIENT ?? "").trim();
+  const gateway = criarGatewayDoAmbiente(env, !live, {
+    credentials: repository,
+    repository,
+    caixa,
+    ...(live && controlledMode && controlledRecipient
+      ? {
+          gateControlado: (communicationId: string, destinatario: string) =>
+            repository.verificarEnvioControlado({
+              fonte: "CONTROLADO_SINTETICO",
+              communicationId,
+              destinatario,
+              oauthPronto: readiness.gmailOauth.status === "READY",
+            }),
+        }
+      : {}),
+  });
+  const resultado = await processarOutboxUmaVez(
+    opcoes.workerId ?? `worker-${process.pid}`,
+    pool,
+    gateway,
+    caixa,
+    repository,
+    new Date(),
+    live ? "LIVE_PILOT" : "DRY_RUN",
+  );
+  // F7: o modo declarado pelo gateway é conferido contra o modo dos lotes
+  // reclamados — divergência é impossível por construção (claim filtra por
+  // status do lote, e o gateway é escolhido server-side), mas a checagem
+  // torna a invariante explícita.
+  if (resultado && resultado.modo !== (live ? "LIVE_PILOT" : "DRY_RUN")) {
+    return { readiness, motivo: "MODE_MISMATCH" };
   }
+  return { readiness, resultado };
 }
 
 /** Entrada CLI: uma iteração por invocação (sem daemon — piloto one-time). */

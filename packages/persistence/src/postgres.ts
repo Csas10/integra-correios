@@ -24,6 +24,7 @@ import type {
   GmailOauthCredentialSource,
   OauthFlowBindingConsumeResult,
   QueryResult,
+  RecoverControlledOutboxCommand,
   RefreshedOauthTokenCommand,
   RegisterConfirmationOutcomeCommand,
   RegisterOauthFlowBindingCommand,
@@ -582,6 +583,124 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
     });
   }
 
+  /**
+   * OUTBOX_GATE_CHAIN_FIX — recuperação auditada EXCLUSIVA da outbox do
+   * lote controlado que falhou em CONTROLLED_GATE_OAUTH_NOT_READY
+   * (bloqueio de gate PRÉ-messages.send: zero chamada Gmail, OAuth
+   * persistido ativo). Transação única: FOR UPDATE no outbox, todas as
+   * validações fail-closed, UPDATE para PENDING e evento de auditoria.
+   * Nenhuma outra falha (DELIVERY_UNKNOWN, AUTH_REQUIRED, tentativas
+   * divergentes, provider ids presentes) é elegível. Idempotente: já
+   * recuperado → estado atual sem nova mutação.
+   */
+  async recuperarOutboxControlada(
+    command: RecoverControlledOutboxCommand,
+  ): Promise<{ resultCode: "RECOVERED" | "ALREADY_RECOVERED"; outboxId: string; status: string }> {
+    if (command.realSendEnabled) {
+      throw new Error("REAL_SEND_ARMED: recuperação exige REAL_SEND_ENABLED=false");
+    }
+    return inTransaction(this.pool, async (sql) => {
+      const estado = await sql.query<{
+        outbox_id: string;
+        outbox_status: string;
+        tentativas: number;
+        erro: string | null;
+        lote_status: string;
+        lote_modo: string;
+        receipts_globais: string;
+        provider_ids: string;
+        recuperacoes: string;
+        pendente_fora: string;
+        processamento: string;
+        ativos_fora: string;
+      }>(
+        `SELECT
+          o.id AS outbox_id,
+          o.status AS outbox_status,
+          o.tentativas,
+          o.ultimo_erro_codigo AS erro,
+          l.status AS lote_status,
+          l.modo AS lote_modo,
+          (SELECT count(*) FROM comunicacao c2 WHERE c2.provider = 'GMAIL') AS receipts_globais,
+          (SELECT count(*) FROM comunicacao c3
+            WHERE c3.lote_comunicacao_id = l.id
+              AND (c3.provider_message_id IS NOT NULL OR c3.provider_thread_id IS NOT NULL)) AS provider_ids,
+          (SELECT count(*) FROM evento_auditoria ea
+            WHERE ea.agregado_tipo = 'COMUNICACAO' AND ea.agregado_id = o.comunicacao_id
+              AND ea.tipo = 'PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO') AS recuperacoes,
+          (SELECT count(*) FROM outbox_email o4
+            JOIN comunicacao c4 ON c4.id = o4.comunicacao_id
+            JOIN lote_comunicacao l4 ON l4.id = c4.lote_comunicacao_id
+            WHERE l4.codigo <> $1 AND o4.status IN ('PENDING', 'FAILED')) AS pendente_fora,
+          (SELECT count(*) FROM outbox_email o5 WHERE o5.status = 'PROCESSING') AS processamento,
+          (SELECT count(*) FROM lote_comunicacao l5 WHERE l5.status = 'ATIVO' AND l5.codigo <> $1) AS ativos_fora
+        FROM outbox_email o
+        JOIN comunicacao c ON c.id = o.comunicacao_id
+        JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
+        WHERE l.codigo = $1
+        ORDER BY o.criada_em DESC
+        LIMIT 1
+        FOR UPDATE OF o`,
+        [command.expectedCode],
+      );
+      const linha = estado.rows[0];
+      if (!linha) {
+        throw new Error("OUTBOX_MISSING: outbox do lote controlado inexistente");
+      }
+      if (linha.lote_status !== "ATIVO" || linha.lote_modo !== "LIVE_PILOT") {
+        throw new Error(`INVALID_STATE: lote em ${linha.lote_status}/${linha.lote_modo} não é recuperável`);
+      }
+      if (linha.outbox_status === "PENDING") {
+        // Idempotência: já recuperado — estado atual, sem nova mutação.
+        const jaRecuperado = await sql.query<{ total: string }>(
+          `SELECT count(*) AS total FROM evento_auditoria ea
+          WHERE ea.agregado_tipo = 'COMUNICACAO' AND ea.agregado_id = (SELECT comunicacao_id FROM outbox_email WHERE id = $1)
+            AND ea.tipo = 'PF_CONTROLLED_GATE_OAUTH_RECOVERY_AUTORIZADO'`,
+          [linha.outbox_id],
+        );
+        if (Number(jaRecuperado.rows[0]?.total ?? 0) > 0) {
+          return { resultCode: "ALREADY_RECOVERED", outboxId: linha.outbox_id, status: linha.outbox_status };
+        }
+        throw new Error("INVALID_STATE: outbox PENDING sem recuperação auditada precedente");
+      }
+      if (linha.outbox_status !== "FAILED") {
+        throw new Error(`INVALID_STATE: outbox em ${linha.outbox_status} não é recuperável`);
+      }
+      if (linha.erro !== command.expectedErrorCode) {
+        throw new Error(`ERROR_CODE_MISMATCH: recuperação exclusiva para ${command.expectedErrorCode} (atual: ${linha.erro ?? "—"})`);
+      }
+      if (Number(linha.tentativas) !== command.expectedAttempts) {
+        throw new Error(`ATTEMPTS_MISMATCH: recuperação exige tentativas=${command.expectedAttempts} (atual: ${linha.tentativas})`);
+      }
+      if (Number(linha.receipts_globais) > 0) {
+        throw new Error("RECEIPT_ALREADY_EXISTS: existe receipt Gmail — recuperação proibida");
+      }
+      if (Number(linha.provider_ids) > 0) {
+        throw new Error("PROVIDER_IDS_PRESENT: existe Gmail Message-ID/Thread-ID — recuperação proibida");
+      }
+      if (Number(linha.recuperacoes) > 0) {
+        throw new Error("RECOVERY_ALREADY_AUTHORIZED: recuperação não reexecutável");
+      }
+      if (Number(linha.pendente_fora) > 0 || Number(linha.processamento) > 0) {
+        throw new Error("OUTBOX_NOT_SETTLED: outbox pendente/processing fora do teste");
+      }
+      if (Number(linha.ativos_fora) > 0) {
+        throw new Error("ACTIVE_BATCHES_OUTSIDE_TEST: lotes ATIVOS fora do teste");
+      }
+      const recuperado = await sql.query(
+        `UPDATE outbox_email
+        SET status = 'PENDING', disponivel_em = $2, bloqueada_em = NULL, bloqueada_por = NULL
+        WHERE id = $1 AND status = 'FAILED'`,
+        [linha.outbox_id, command.availableAt],
+      );
+      if (recuperado.rowCount !== 1) {
+        throw new Error("INVALID_STATE: CAS da recuperação falhou");
+      }
+      await insertAudit(sql, command.auditEvent);
+      return { resultCode: "RECOVERED", outboxId: linha.outbox_id, status: "PENDING" };
+    });
+  }
+
   async claimOutbox(workerId: string, limit: number, now: string): Promise<readonly ClaimedOutboxItem[]> {
     if (!workerId.trim()) throw new Error("workerId obrigatório");
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
@@ -606,7 +725,14 @@ export class PostgresOperationalRepository implements GmailOauthCredentialSource
           JOIN lote_comunicacao lote ON lote.id = comunicacao.lote_comunicacao_id
           WHERE lote.status = 'ATIVO'
             AND (
-              (outbox.status IN ('PENDING', 'FAILED') AND outbox.disponivel_em <= $1)
+              (outbox.status = 'PENDING' AND outbox.disponivel_em <= $1)
+              -- OUTBOX_GATE_CHAIN_FIX: falhas TERMINAIS nunca voltam à fila
+              -- pelo agendamento genérico; só a recuperação auditada
+              -- (recuperarOutboxControlada) as devolve a PENDING.
+              OR (outbox.status = 'FAILED' AND outbox.disponivel_em <= $1
+                  AND (outbox.ultimo_erro_codigo IS NULL
+                    OR outbox.ultimo_erro_codigo NOT IN
+                      ('FAILED_PERMANENT', 'CONTROLLED_GATE_OAUTH_NOT_READY')))
               OR (outbox.status = 'PROCESSING' AND outbox.bloqueada_em <= $1::timestamptz - interval '15 minutes')
             )
           ORDER BY outbox.disponivel_em, outbox.criada_em

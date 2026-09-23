@@ -124,6 +124,24 @@ export interface CancelCommunicationBatchCommand {
   readonly auditEvent: AuditEventInput;
 }
 
+/**
+ * OUTBOX_GATE_CHAIN_FIX — recuperação auditada EXCLUSIVA do incidente
+ * CONTROLLED_GATE_OAUTH_NOT_READY (bloqueio de gate comprovadamente pré-
+ * messages.send). Devolve o outbox a PENDING na mesma transação do evento
+ * de auditoria; nenhuma outra falha é recuperável por este mecanismo.
+ */
+export interface RecoverControlledOutboxCommand {
+  readonly expectedCode: string;
+  /** Código de erro exigido: CONTROLLED_GATE_OAUTH_NOT_READY. */
+  readonly expectedErrorCode: string;
+  /** Tentativas exigidas (2: PROVIDER_NOT_CONFIGURED + gate OAuth). */
+  readonly expectedAttempts: number;
+  /** REAL_SEND_ENABLED lido do ambiente pelo chamador (nunca do request). */
+  readonly realSendEnabled: boolean;
+  readonly availableAt: string;
+  readonly auditEvent: AuditEventInput;
+}
+
 export interface BatchCancellationState {
   readonly status: "PREPARACAO" | "ATIVO" | "CONCLUIDO" | "CANCELADO";
   readonly totalItems: number;

@@ -144,30 +144,63 @@ async function montarCenarioIncidente(pool: NodePostgresPool, opcoes: { erro: st
   );
   let loteId: string;
   if (loteExistente.rows[0]) {
+    // Lote já existe de um teste anterior: insere confirmação + comunicação +
+    // outbox + item DIRETAMENTE (mesma estrutura gravada pelo repositório) —
+    // enqueueCommunicationBatch recriaria o lote (pkey). Sem evento novo:
+    // a recuperação não exige reativação.
     loteId = loteExistente.rows[0].id;
-    await repository.enqueueCommunicationBatch({
-      id: loteId,
-      code: CODIGO_LOTE,
-      origin: "PF",
-      templateVersion: "pf-confirmation-v1",
-      mode: "LIVE_PILOT",
-      source: "CONTROLADO_SINTETICO",
-      createdBy: "teste-recuperacao",
-      createdAt: new Date().toISOString(),
-      auditEvent: {
-        id: randomUUID(),
-        aggregateType: "PROFISSIONAL",
-        aggregateId: profissionalId,
-        type: "PF_CONFIRMACAO_EMITIDA_REC",
-        occurredAt: new Date().toISOString(),
-        metadata: { loteComunicacaoId: loteId },
-        eventHash: hash64(confirmationId),
-      },
-      items: [itemIncidente(profissionalId, confirmationId, communicationId, outboxId)],
-    });
-    // Reativa o lote (o afterAll do run anterior pode tê-lo deixado CANCELADO —
-    // sem evento novo: a recuperação não exige reativação).
     await pool.query(`UPDATE lote_comunicacao SET status = 'ATIVO' WHERE id = $1`, [loteId]);
+    await pool.query(
+      `INSERT INTO confirmacao (
+        id, profissional_id, token_hash, template_versao, status, emitida_em, expira_em
+      ) VALUES ($1, $2, $3, 'pf-confirmation-v1', 'PENDING', $4, $5)`,
+      [
+        confirmationId,
+        profissionalId,
+        hash64(`token-${confirmationId}`),
+        new Date().toISOString(),
+        new Date(Date.now() + 3_600_000).toISOString(),
+      ],
+    );
+    await pool.query(
+      `INSERT INTO comunicacao (
+        id, profissional_id, confirmacao_id, lote_comunicacao_id, origem, provider,
+        destinatario_fingerprint, template_versao, idempotency_key, status, fonte_registro, criada_em
+      ) VALUES ($1, $2, $3, $4, 'PF', 'PENDING', $5, 'pf-confirmation-v1', $6, 'QUEUED', 'CONTROLADO_SINTETICO', $7)`,
+      [
+        communicationId,
+        profissionalId,
+        confirmationId,
+        loteId,
+        fingerprinter.fingerprint("email-rec", randomUUID()),
+        `pf-confirmation:rec:${confirmationId}`,
+        new Date().toISOString(),
+      ],
+    );
+    const payload = caixa.seal("payload-sintetico-rec", "outbox:email");
+    await pool.query(
+      `INSERT INTO outbox_email (
+        id, comunicacao_id, idempotency_key, payload_ciphertext,
+        payload_nonce, payload_auth_tag, chave_versao, status, disponivel_em
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', $8)`,
+      [
+        outboxId,
+        communicationId,
+        `pf-confirmation:rec:${confirmationId}`,
+        payload.ciphertext,
+        payload.nonce,
+        payload.authTag,
+        payload.keyVersion,
+        new Date().toISOString(),
+      ],
+    );
+    await pool.query(
+      `INSERT INTO item_lote_comunicacao (
+        id, lote_comunicacao_id, profissional_id, comunicacao_id, origem, status
+      ) VALUES ($1, $2, $3, $4, 'PF', 'ENFILEIRADO')
+      ON CONFLICT DO NOTHING`,
+      [randomUUID(), loteId, profissionalId, communicationId],
+    );
   } else {
     loteId = randomUUID();
     await repository.enqueueCommunicationBatch({

@@ -23,11 +23,21 @@ export interface OperatorIdentity {
 }
 
 export interface ProvisionOperatorCommand {
+  readonly actorOperatorId: string;
   readonly operatorId: string;
   readonly code: string;
   readonly displayName: string;
   readonly roles: readonly OperatorRole[];
   readonly tokenHash: string;
+  readonly now: string;
+  readonly tokenExpiresAt?: string;
+}
+
+export interface ReplaceOperatorCredentialCommand {
+  readonly actorOperatorId: string;
+  readonly operatorId: string;
+  readonly tokenHash: string;
+  readonly reason: "ROTACAO" | "RECUPERACAO";
   readonly now: string;
   readonly tokenExpiresAt?: string;
 }
@@ -93,9 +103,9 @@ async function insertOperatorAudit(
   const eventId = randomUUID();
   return sql.query(
     `INSERT INTO evento_auditoria (
-      id, agregado_tipo, agregado_id, tipo, ator_id, operator_id,
+      id, agregado_tipo, agregado_id, tipo, ator_id, operator_id, ator_operator_id,
       ocorreu_em, metadados, hash_evento
-    ) VALUES ($1, 'OPERADOR', $2, $3, $4, $2, $5, $6::jsonb, $7)`,
+    ) VALUES ($1, 'OPERADOR', $2, $3, $4, $2, $4::uuid, $5, $6::jsonb, $7)`,
     [eventId, operatorId, type, actorId, occurredAt, JSON.stringify(metadata),
       eventHash(eventId, operatorId, type, occurredAt)],
   );
@@ -114,6 +124,7 @@ export class PostgresOperatorIdentityRepository {
   constructor(readonly pool: SqlPool) {}
 
   async provisionOperator(command: ProvisionOperatorCommand): Promise<void> {
+    assertUuid(command.actorOperatorId, "actorOperatorId");
     assertUuid(command.operatorId, "operatorId");
     assertSha256(command.tokenHash, "tokenHash");
     const roles = normalizeRoles(command.roles);
@@ -138,12 +149,19 @@ export class PostgresOperatorIdentityRepository {
       }
       await sql.query(
         `INSERT INTO operador_token (
-          id, operator_id, token_hash, status, criado_em, expira_em
-        ) VALUES ($1, $2, $3, 'ATIVO', $4, $5)`,
-        [randomUUID(), command.operatorId, command.tokenHash, command.now, command.tokenExpiresAt ?? null],
+          id, operator_id, token_hash, emitido_por_operator_id, status, criado_em, expira_em
+        ) VALUES ($1, $2, $3, $4, 'ATIVO', $5, $6)`,
+        [
+          randomUUID(),
+          command.operatorId,
+          command.tokenHash,
+          command.actorOperatorId,
+          command.now,
+          command.tokenExpiresAt ?? null,
+        ],
       );
       await insertOperatorAudit(
-        sql, command.operatorId, "TECH_ADMIN_LEGACY",
+        sql, command.operatorId, command.actorOperatorId,
         "OPERADOR_PROVISIONADO", command.now, { role_count: roles.length },
       );
     });
@@ -242,8 +260,64 @@ export class PostgresOperatorIdentityRepository {
     });
   }
 
-  async suspendOperator(operatorId: string, now: string): Promise<boolean> {
+  async replaceCredential(command: ReplaceOperatorCredentialCommand): Promise<boolean> {
+    assertUuid(command.actorOperatorId, "actorOperatorId");
+    assertUuid(command.operatorId, "operatorId");
+    assertSha256(command.tokenHash, "tokenHash");
+    return inTransaction(this.pool, async (sql) => {
+      const active = await sql.query<{ id: string }>(
+        `SELECT id FROM operador
+          WHERE id = $1 AND status = 'ATIVO'
+          FOR UPDATE`,
+        [command.operatorId],
+      );
+      if (!active.rows[0]) return false;
+
+      await sql.query(
+        `UPDATE operador_token
+            SET status = 'REVOGADO', revogado_em = $2
+          WHERE operator_id = $1 AND status = 'ATIVO'`,
+        [command.operatorId, command.now],
+      );
+      await sql.query(
+        `UPDATE operador_sessao
+            SET status = 'REVOGADA', revogada_em = $2
+          WHERE operator_id = $1 AND status = 'ATIVA'`,
+        [command.operatorId, command.now],
+      );
+      await sql.query(
+        `INSERT INTO operador_token (
+          id, operator_id, token_hash, emitido_por_operator_id, status, criado_em, expira_em
+        ) VALUES ($1, $2, $3, $4, 'ATIVO', $5, $6)`,
+        [
+          randomUUID(),
+          command.operatorId,
+          command.tokenHash,
+          command.actorOperatorId,
+          command.now,
+          command.tokenExpiresAt ?? null,
+        ],
+      );
+      await insertOperatorAudit(
+        sql,
+        command.operatorId,
+        command.actorOperatorId,
+        command.reason === "ROTACAO"
+          ? "OPERADOR_CREDENCIAL_ROTACIONADA"
+          : "OPERADOR_CREDENCIAL_RECUPERADA",
+        command.now,
+      );
+      return true;
+    });
+  }
+
+  async suspendOperator(
+    operatorId: string,
+    actorOperatorId: string,
+    now: string,
+  ): Promise<boolean> {
     assertUuid(operatorId, "operatorId");
+    assertUuid(actorOperatorId, "actorOperatorId");
     return inTransaction(this.pool, async (sql) => {
       const updated = await sql.query<{ id: string }>(
         `UPDATE operador
@@ -263,7 +337,7 @@ export class PostgresOperatorIdentityRepository {
           WHERE operator_id = $1 AND status = 'ATIVA'`,
         [operatorId, now],
       );
-      await insertOperatorAudit(sql, operatorId, "TECH_ADMIN_LEGACY", "OPERADOR_SUSPENSO", now);
+      await insertOperatorAudit(sql, operatorId, actorOperatorId, "OPERADOR_SUSPENSO", now);
       return true;
     });
   }

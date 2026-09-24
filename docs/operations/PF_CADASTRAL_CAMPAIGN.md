@@ -169,6 +169,23 @@ originou cinco corretivos obrigatórios, sem abrir capacidades da campanha:
   e preserva administração técnica ativa, bloqueando o conjunto de
   `ADMIN_TECNICO` ativos durante a decisão.
 
+## Corretivos da segunda revisão integral
+
+A revisão formal do CodeRabbit sobre o HEAD
+`1a8dadc33019b3823adf05029213115ce2e91379` originou três novos corretivos,
+sem abrir capacidades da campanha:
+
+- a normalização de e-mail remove somente whitespace nas extremidades; qualquer
+  whitespace interno permanece no valor normalizado e torna o registro
+  `EMAIL_INVALIDO`, evitando reescrita silenciosa para outra caixa postal;
+- logout da interface trata `401` como sessão já encerrada e remove a
+  identidade visual; `503` e falha de rede continuam preservando a identidade
+  exibida porque a revogação é incerta;
+- assuntos UTF-8 usam encoded-words RFC 2047 com payload reduzido e header
+  folding `\r\n `; cada linha física do `Subject:` permanece com no máximo
+  76 caracteres e os testes desdobram as continuações antes de reconstruir o
+  assunto.
+
 ## Gate restante
 
 Este incremento fecha o ciclo administrativo básico em código, mas a PR #12

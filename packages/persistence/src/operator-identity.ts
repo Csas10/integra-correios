@@ -22,6 +22,33 @@ export interface OperatorIdentity {
   readonly sessionExpiresAt: string;
 }
 
+export class OperatorAdminAuthorizationError extends Error {
+  readonly code = "OPERATOR_ADMIN_AUTH_REQUIRED";
+
+  constructor() {
+    super("Administrador técnico individual ativo é obrigatório");
+    this.name = "OperatorAdminAuthorizationError";
+  }
+}
+
+export class InitialAdminBootstrapError extends Error {
+  readonly code = "INITIAL_ADMIN_BOOTSTRAP_FORBIDDEN";
+
+  constructor() {
+    super("Bootstrap inicial permitido somente quando não existe operador");
+    this.name = "InitialAdminBootstrapError";
+  }
+}
+
+export interface BootstrapInitialAdminCommand {
+  readonly operatorId: string;
+  readonly code: string;
+  readonly displayName: string;
+  readonly tokenHash: string;
+  readonly now: string;
+  readonly tokenExpiresAt?: string;
+}
+
 export interface ProvisionOperatorCommand {
   readonly actorOperatorId: string;
   readonly operatorId: string;
@@ -128,8 +155,79 @@ async function loadRoles(sql: SqlExecutor, operatorId: string): Promise<Operator
   return result.rows.map((row) => row.papel);
 }
 
+async function assertActiveTechnicalAdmin(
+  sql: SqlExecutor,
+  actorOperatorId: string,
+): Promise<void> {
+  const authorized = await sql.query<{ id: string }>(
+    `SELECT o.id
+       FROM operador o
+       JOIN operador_papel p
+         ON p.operator_id = o.id
+        AND p.papel = 'ADMIN_TECNICO'
+        AND p.ativo = true
+      WHERE o.id = $1
+        AND o.status = 'ATIVO'
+      FOR UPDATE OF o, p`,
+    [actorOperatorId],
+  );
+  if (!authorized.rows[0]) {
+    throw new OperatorAdminAuthorizationError();
+  }
+}
+
 export class PostgresOperatorIdentityRepository {
   constructor(readonly pool: SqlPool) {}
+
+  async bootstrapInitialAdmin(command: BootstrapInitialAdminCommand): Promise<void> {
+    assertUuid(command.operatorId, "operatorId");
+    assertSha256(command.tokenHash, "tokenHash");
+    const code = command.code.trim();
+    const displayName = command.displayName.trim();
+    if (!code || code.length > 80) throw new Error("Código do operador inválido");
+    if (!displayName || displayName.length > 160) throw new Error("Nome do operador inválido");
+
+    await inTransaction(this.pool, async (sql) => {
+      await sql.query("LOCK TABLE operador IN SHARE ROW EXCLUSIVE MODE");
+      const existing = await sql.query<{ total: string }>(
+        "SELECT count(*)::text AS total FROM operador",
+      );
+      if (Number(existing.rows[0]?.total ?? "0") !== 0) {
+        throw new InitialAdminBootstrapError();
+      }
+
+      await sql.query(
+        `INSERT INTO operador (
+          id, codigo, nome_exibicao, status, criado_em, atualizado_em
+        ) VALUES ($1, $2, $3, 'ATIVO', $4, $4)`,
+        [command.operatorId, code, displayName, command.now],
+      );
+      await sql.query(
+        `INSERT INTO operador_papel (operator_id, papel, ativo, concedido_em)
+         VALUES ($1, 'ADMIN_TECNICO', true, $2)`,
+        [command.operatorId, command.now],
+      );
+      await sql.query(
+        `INSERT INTO operador_token (
+          id, operator_id, token_hash, emitido_por_operator_id, status, criado_em, expira_em
+        ) VALUES ($1, $2, $3, $2, 'ATIVO', $4, $5)`,
+        [
+          randomUUID(),
+          command.operatorId,
+          command.tokenHash,
+          command.now,
+          command.tokenExpiresAt ?? null,
+        ],
+      );
+      await insertOperatorAudit(
+        sql,
+        command.operatorId,
+        command.operatorId,
+        "ADMIN_BOOTSTRAP_INICIAL",
+        command.now,
+      );
+    });
+  }
 
   async provisionOperator(command: ProvisionOperatorCommand): Promise<void> {
     assertUuid(command.actorOperatorId, "actorOperatorId");
@@ -142,6 +240,7 @@ export class PostgresOperatorIdentityRepository {
     if (!displayName || displayName.length > 160) throw new Error("Nome do operador inválido");
 
     await inTransaction(this.pool, async (sql) => {
+      await assertActiveTechnicalAdmin(sql, command.actorOperatorId);
       await sql.query(
         `INSERT INTO operador (
           id, codigo, nome_exibicao, status, criado_em, atualizado_em
@@ -273,6 +372,7 @@ export class PostgresOperatorIdentityRepository {
     assertUuid(command.operatorId, "operatorId");
     assertSha256(command.tokenHash, "tokenHash");
     return inTransaction(this.pool, async (sql) => {
+      await assertActiveTechnicalAdmin(sql, command.actorOperatorId);
       const active = await sql.query<{ id: string }>(
         `SELECT id FROM operador
           WHERE id = $1 AND status = 'ATIVO'
@@ -327,6 +427,7 @@ export class PostgresOperatorIdentityRepository {
     assertUuid(operatorId, "operatorId");
     assertUuid(actorOperatorId, "actorOperatorId");
     return inTransaction(this.pool, async (sql) => {
+      await assertActiveTechnicalAdmin(sql, actorOperatorId);
       const updated = await sql.query<{ id: string }>(
         `UPDATE operador
             SET status = 'SUSPENSO', atualizado_em = $2, suspenso_em = $2

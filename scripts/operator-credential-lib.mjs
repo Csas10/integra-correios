@@ -50,6 +50,7 @@ export function writeCredentialArtifact(
   }
 
   const outputPath = resolve(outArg);
+  let createdByThisCall = false;
   try {
     writeFileSync(
       outputPath,
@@ -65,6 +66,7 @@ export function writeCredentialArtifact(
       ) + "\n",
       { encoding: "utf8", flag: "wx", mode: 0o600 },
     );
+    createdByThisCall = true;
     chmodSync(outputPath, 0o600);
     const mode = statSync(outputPath).mode & 0o777;
     if (mode !== 0o600) {
@@ -74,7 +76,7 @@ export function writeCredentialArtifact(
     }
     return outputPath;
   } catch (error) {
-    if (existsSync(outputPath)) {
+    if (createdByThisCall && existsSync(outputPath)) {
       try { unlinkSync(outputPath); } catch {}
     }
     throw error;

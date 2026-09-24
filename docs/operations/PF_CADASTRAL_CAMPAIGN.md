@@ -186,6 +186,19 @@ sem abrir capacidades da campanha:
   76 caracteres e os testes desdobram as continuações antes de reconstruir o
   assunto.
 
+## Corretivos da terceira revisão integral
+
+A revisão formal do CodeRabbit sobre o HEAD
+`2e0f28f54bd8aa0b6a1f942fb46c58517051a6e2` originou dois corretivos Minor,
+sem abrir capacidades da campanha:
+
+- cada rótulo do domínio do e-mail deve ter no máximo 63 bytes; o pré-voo
+  aceita exatamente 63 bytes e bloqueia 64 bytes como `EMAIL_INVALIDO`;
+- o bootstrap inicial rejeita operandos ausentes ou iniciados por `-` para
+  `--code`, `--name` e `--out` antes de gerar credencial ou tocar no banco.
+  A regressão comprova saída não-zero, zero operador, zero evento
+  `ADMIN_BOOTSTRAP_INICIAL` e zero artefato secreto.
+
 ## Gate restante
 
 Este incremento fecha o ciclo administrativo básico em código, mas a PR #12

@@ -601,6 +601,10 @@ describeDb("CAMPAIGN_READ_ROUTES — papéis, contratos HTTP e zero-escrita (Pos
     const adminCookie = await bootstrapAdmin();
     const preparador = await provisionOperator(adminCookie, ["PREPARADOR"]);
     const cookie = { cookie: preparador.cookie };
+    // /authorize exige APROVADOR: o papel é verificado ANTES do corpo, então
+    // a validação de entradas inválidas dessa rota usa sessão de aprovador
+    // (o 403 de PREPARADOR já é coberto na matriz de papéis).
+    const aprovador = await provisionOperator(adminCookie, ["APROVADOR"]);
     const xlsx = () => Buffer.from(xlsxMinimo([...CABECALHOS_CANONICOS], []));
 
     const nomeMalformado = await despachar("POST", ROTA_ANALYZE, {
@@ -682,7 +686,7 @@ describeDb("CAMPAIGN_READ_ROUTES — papéis, contratos HTTP e zero-escrita (Pos
       "{invalido",
     ]) {
       const resposta = await despachar("POST", ROTA_AUTHORIZE, {
-        headers: { ...cookie, "content-type": "application/json" },
+        headers: { cookie: aprovador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(corpoAutorizacao),
       });
       expect([400, 422]).toContain(resposta.status);

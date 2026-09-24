@@ -1844,3 +1844,283 @@ button:focus-visible {
     align-items: start;
   }
 }
+
+
+/* ==========================================================================
+   Jornada operacional da campanha (etapas 1–10) — contadores, painéis e
+   tabelas da interface /operacao/email.
+   ========================================================================== */
+
+.campaign-journey {
+  margin-top: 26px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+  padding: 14px 16px;
+}
+
+.campaign-journey ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.campaign-journey li button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f7f9fb;
+  color: var(--ink-700);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.campaign-journey li button:hover {
+  border-color: var(--accent, #14532d);
+}
+
+.campaign-journey li.is-active button {
+  background: var(--accent, #14532d);
+  border-color: var(--accent, #14532d);
+  color: #fff;
+}
+
+.campaign-journey li button span {
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+
+.campaign-counters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.campaign-counters article {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  padding: 12px 14px;
+}
+
+.campaign-counters span {
+  display: block;
+  color: var(--ink-500);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.campaign-counters strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.campaign-counters small {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-500);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.campaign-actions-note {
+  margin: 12px 2px 0;
+  color: var(--ink-500);
+  font-size: 11px;
+}
+
+.campaign-feedback {
+  margin-top: 14px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 12px;
+}
+
+.campaign-feedback-error {
+  border: 1px solid #b91c1c;
+  background: #fef2f2;
+  color: #7f1d1d;
+}
+
+.campaign-panel {
+  margin-top: 22px;
+  padding: 22px 24px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+}
+
+.campaign-panel h2 {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+
+.campaign-panel p {
+  margin: 0 0 12px;
+  color: var(--ink-500);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.campaign-panel input[type="file"] {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+
+.campaign-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.campaign-panel-actions button {
+  padding: 9px 16px;
+  border: 1px solid var(--accent, #14532d);
+  border-radius: 10px;
+  background: var(--accent, #14532d);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+
+.campaign-panel-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.campaign-panel-actions small {
+  color: #7f1d1d;
+  font-size: 11px;
+}
+
+.campaign-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.campaign-table th,
+.campaign-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.campaign-table th {
+  color: var(--ink-500);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.campaign-table code {
+  font-size: 11px;
+}
+
+.campaign-table select {
+  max-width: 220px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.campaign-table tr.is-excluded td {
+  background: #fef2f2;
+  color: #7f1d1d;
+}
+
+.campaign-required {
+  color: #b45309;
+  font-size: 10px;
+  font-style: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.campaign-decision {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.campaign-flow-stats {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  background: #f7f9fb;
+  color: var(--ink-500);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.campaign-flow-stats p,
+.campaign-flow-stats ul {
+  margin: 0;
+}
+
+.campaign-flow-stats code {
+  font-size: 10px;
+  word-break: break-all;
+}
+
+.campaign-preview-nav {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--ink-500);
+}
+
+.campaign-preview-nav button {
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fff;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.campaign-preview-nav button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.campaign-preview {
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f7f9fb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

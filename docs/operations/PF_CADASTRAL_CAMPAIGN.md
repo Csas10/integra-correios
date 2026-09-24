@@ -12,7 +12,7 @@ integralmente o piloto Gmail controlado e o lote `CONTROLLED_GMAIL_TEST`.
 - nenhum worker de campanha é executado;
 - nenhuma chamada ao Gmail é feita;
 - `OPERATOR_TOKEN` não representa identidade humana da campanha;
-- a próxima fase exige `operator_id` individual, revogável e auditável.
+- `canPersistImport=false`, `canCreateBatch=false` e `canExecute=false`.
 
 ## Importação
 
@@ -37,36 +37,57 @@ A mensagem pede resposta com telefone/WhatsApp, CEP, logradouro, número,
 complemento, bairro, cidade, UF e protocolo não sensível. A rota de confirmação
 existente permanece, mas o template desta campanha não depende dela.
 
-## Próximo gate
-
-Identidade individual + papéis, tabelas de campanha/aprovação, auditoria
-append-only, resolução humana das duplicidades, materialização imutável em
-PREPARACAO/APROVADO e só então integração com a outbox homologada.
-
-
 ## Identidade operacional individual
 
-O primeiro gate após a integração do piloto introduz identidade persistente sem
-abrir qualquer capacidade de campanha:
+A identidade foi implementada sem abrir capacidade de campanha:
 
-- `operator_id` persistente, nome, código e status ATIVO/SUSPENSO;
-- papéis PREPARADOR, REVISOR, APROVADOR, EXECUTOR, SUPERVISOR e ADMIN_TECNICO;
-- token individual base64url com mínimo equivalente a 256 bits; somente SHA-256
-  é persistido;
-- sessão opaca aleatória de 256 bits; somente SHA-256 é persistido;
-- cookie `__Host-ic_campaign_operator_session` com HttpOnly, Secure,
-  SameSite=Strict e Path=/;
-- `GET /api/operator/me` expõe identidade/papéis/expiração e nenhum segredo;
+- `operator_id` persistente, nome, código e status `ATIVO | SUSPENSO`;
+- papéis `PREPARADOR`, `REVISOR`, `APROVADOR`, `EXECUTOR`,
+  `SUPERVISOR` e `ADMIN_TECNICO`;
+- token individual armazenado somente como SHA-256;
+- sessão opaca armazenada somente como SHA-256;
+- vínculo obrigatório no PostgreSQL entre sessão, token e o mesmo operador;
+- cookie `__Host-ic_campaign_operator_session` com `HttpOnly`, `Secure`,
+  `SameSite=Strict` e `Path=/`;
+- `GET /api/operator/me` expõe apenas identidade, papéis e expiração;
 - suspensão revoga tokens e sessões na mesma transação;
-- as rotas da campanha não aceitam `OPERATOR_TOKEN` nem sessão compartilhada
+- logout responde sucesso somente quando a revogação da sessão é confirmada;
+- falha ou ausência de confirmação da revogação não limpa o cookie e retorna
+  resposta fail-closed;
+- as rotas da campanha não aceitam `OPERATOR_TOKEN` nem a sessão compartilhada
   do piloto como fallback;
-- provisionamento/suspensão permanecem ações técnicas separadas;
 - auditoria append-only recebe vínculo `operator_id`.
 
-Os gates continuam fechados:
+### Histórico da migration 0006
+
+Dentro desta PR, a migration `0006_operator_identity.sql` foi executada apenas
+no PostgreSQL 16 efêmero do quality-gate. Não houve execução identificada em
+banco Preview ou outro ambiente persistente. Por isso o vínculo
+`sessão → token → mesmo operador` foi corrigido diretamente na `0006`, antes
+de qualquer promoção da PR.
+
+Se houver evidência externa posterior de que uma versão anterior da `0006`
+foi aplicada em ambiente persistente, essa premissa deve ser reavaliada antes
+do merge e a correção deverá ser promovida por migration aditiva.
+
+## Gates ainda obrigatórios antes da persistência da campanha
+
+A identidade operacional não libera a próxima fase. Permanecem pendentes:
+
+- eliminar `TECH_ADMIN_LEGACY` como autoria administrativa genérica;
+- gerar credenciais individuais fortes por mecanismo controlado, em vez de
+  recebê-las como segredo escolhido no provisionamento;
+- atribuir toda ação administrativa a uma identidade individual autenticada;
+- homologar provisionamento, rotação, suspensão e recuperação administrativa;
+- somente depois disso considerar tabelas/persistência/aprovação da campanha.
+
+Os gates executáveis continuam fechados:
 
 ```
 canPersistImport = false
 canCreateBatch   = false
 canExecute       = false
 ```
+
+O próximo incremento não deve materializar campanha, lote ou outbox enquanto
+os gates administrativos acima não estiverem homologados.

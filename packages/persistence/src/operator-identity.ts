@@ -31,6 +31,15 @@ export class OperatorAdminAuthorizationError extends Error {
   }
 }
 
+export class OperatorAdminContinuityError extends Error {
+  readonly code = "OPERATOR_ADMIN_CONTINUITY_REQUIRED";
+
+  constructor(message = "A operação deve preservar outro administrador técnico ativo") {
+    super(message);
+    this.name = "OperatorAdminContinuityError";
+  }
+}
+
 export class InitialAdminBootstrapError extends Error {
   readonly code = "INITIAL_ADMIN_BOOTSTRAP_FORBIDDEN";
 
@@ -175,6 +184,24 @@ async function assertActiveTechnicalAdmin(
     throw new OperatorAdminAuthorizationError();
   }
 }
+
+async function lockActiveTechnicalAdmins(
+  sql: SqlExecutor,
+): Promise<readonly string[]> {
+  const result = await sql.query<{ id: string }>(
+    `SELECT o.id
+       FROM operador o
+       JOIN operador_papel p
+         ON p.operator_id = o.id
+        AND p.papel = 'ADMIN_TECNICO'
+        AND p.ativo = true
+      WHERE o.status = 'ATIVO'
+      ORDER BY o.id
+      FOR UPDATE OF o, p`,
+  );
+  return result.rows.map((row) => row.id);
+}
+
 
 export class PostgresOperatorIdentityRepository {
   constructor(readonly pool: SqlPool) {}
@@ -427,7 +454,22 @@ export class PostgresOperatorIdentityRepository {
     assertUuid(operatorId, "operatorId");
     assertUuid(actorOperatorId, "actorOperatorId");
     return inTransaction(this.pool, async (sql) => {
-      await assertActiveTechnicalAdmin(sql, actorOperatorId);
+      const activeAdminIds = await lockActiveTechnicalAdmins(sql);
+      if (!activeAdminIds.includes(actorOperatorId)) {
+        throw new OperatorAdminAuthorizationError();
+      }
+      if (operatorId === actorOperatorId) {
+        throw new OperatorAdminContinuityError(
+          "Auto-suspensão de administrador técnico não é permitida",
+        );
+      }
+      if (
+        activeAdminIds.includes(operatorId) &&
+        activeAdminIds.filter((id) => id !== operatorId).length === 0
+      ) {
+        throw new OperatorAdminContinuityError();
+      }
+
       const updated = await sql.query<{ id: string }>(
         `UPDATE operador
             SET status = 'SUSPENSO', atualizado_em = $2, suspenso_em = $2

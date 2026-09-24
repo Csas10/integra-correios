@@ -70,7 +70,7 @@ export function normalizarNomeCampanha(value: string): string {
 }
 
 export function normalizarEmailCampanha(value: string): string {
-  return value.replace(/\s+/g, "").trim().toLowerCase();
+  return value.trim().toLowerCase();
 }
 
 export function emailCampanhaValido(value: string): boolean {
@@ -152,7 +152,7 @@ export function analisarCampanhaAtualizacaoPf(
       }
 
       if (nomeOriginal !== nome) normalizacoes.push("NOME_ESPACOS");
-      const emailSemEspacos = emailOriginal.replace(/\s+/g, "").trim();
+      const emailSemEspacos = emailOriginal.trim();
       if (emailSemEspacos !== emailOriginal) normalizacoes.push("EMAIL_ESPACOS");
       if (emailSemEspacos && emailSemEspacos !== emailNormalizado) normalizacoes.push("EMAIL_CASE");
 

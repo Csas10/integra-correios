@@ -13,6 +13,9 @@ import {
   PostgresConfirmationOwnership,
   Aes256GcmSecretBox,
   HmacSha256Fingerprinter,
+  PostgresOperatorIdentityRepository,
+  type OperatorIdentity,
+  type OperatorRole,
 } from "@integra-correios/persistence";
 import {
   analisarXlsx,
@@ -135,9 +138,32 @@ const ROTAS_PUBLICAS = new Set([
   "POST /api/operator/session", // F12: valida token UMA vez e emite sessão (fail-closed sem env)
   "GET /api/operator/session", // F17: restore da sessão pela UI (200/401 sanitizado)
   "DELETE /api/operator/session", // logout operacional
+  "POST /api/operator/identity/session", // autenticação individual; handler próprio
+  "DELETE /api/operator/identity/session", // logout individual; handler próprio
 ]);
 
+// Rotas da nova interface com autenticação própria. Não passam pelo fallback
+// de OPERATOR_TOKEN/sessão compartilhada do piloto.
+const ROTAS_AUTH_PROPRIA = new Set([
+  "GET /api/operator/me",
+  "GET /api/campaigns/status",
+  "GET /api/operator/workspace/status",
+  "POST /api/operator/admin/provision",
+  "POST /api/operator/admin/suspend",
+]);
+
+
 const OPERATOR_SESSION_COOKIE = "ic_operator_session";
+const CAMPAIGN_OPERATOR_SESSION_COOKIE = "__Host-ic_campaign_operator_session";
+const CAMPAIGN_OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const CAMPAIGN_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43,128}$/;
+const CAMPAIGN_WORKSPACE_ROLES: readonly OperatorRole[] = [
+  "PREPARADOR",
+  "REVISOR",
+  "APROVADOR",
+  "EXECUTOR",
+  "SUPERVISOR",
+];
 
 /** F12 — TTL da sessão operacional (cookie HttpOnly; token NUNCA vai ao browser). */
 const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
@@ -410,6 +436,80 @@ function cookiesDo(req: IncomingMessage): Record<string, string> {
   return cookies;
 }
 
+function hashSegredoOpaco(valor: string): string {
+  return createHash("sha256").update(valor, "utf8").digest("hex");
+}
+
+function cookieSessaoCampanha(valor: string, maxAgeSeconds: number): string {
+  return `${CAMPAIGN_OPERATOR_SESSION_COOKIE}=${valor}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAgeSeconds}`;
+}
+
+function cookieSessaoCampanhaRemovido(): string {
+  return `${CAMPAIGN_OPERATOR_SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
+}
+
+function tokenIndividualValido(token: string): boolean {
+  return CAMPAIGN_TOKEN_PATTERN.test(token);
+}
+
+function operatorIdentityRepository(): PostgresOperatorIdentityRepository {
+  return new PostgresOperatorIdentityRepository(requireDb().pool);
+}
+
+async function resolverOperadorCampanha(
+  req: IncomingMessage,
+): Promise<OperatorIdentity | undefined> {
+  const rawSession = cookiesDo(req)[CAMPAIGN_OPERATOR_SESSION_COOKIE];
+  if (!rawSession || !CAMPAIGN_TOKEN_PATTERN.test(rawSession)) return undefined;
+  return operatorIdentityRepository().resolveSession(
+    hashSegredoOpaco(rawSession),
+    new Date().toISOString(),
+  );
+}
+
+async function exigirOperadorCampanha(
+  req: IncomingMessage,
+  res: ServerResponse,
+  allowedRoles?: readonly OperatorRole[],
+): Promise<OperatorIdentity | undefined> {
+  let identity: OperatorIdentity | undefined;
+  try {
+    identity = await resolverOperadorCampanha(req);
+  } catch {
+    json(res, 503, {
+      erro: "Identidade operacional indisponível.",
+      codigo: "OPERATOR_IDENTITY_UNAVAILABLE",
+    });
+    return undefined;
+  }
+  if (!identity) {
+    json(res, 401, {
+      erro: "Sessão individual ausente, expirada ou revogada.",
+      codigo: "INDIVIDUAL_OPERATOR_AUTH_REQUIRED",
+    });
+    return undefined;
+  }
+  if (allowedRoles && !identity.roles.some((role) => allowedRoles.includes(role))) {
+    json(res, 403, {
+      erro: "Papel operacional insuficiente.",
+      codigo: "OPERATOR_ROLE_FORBIDDEN",
+    });
+    return undefined;
+  }
+  return identity;
+}
+
+function exigirAdminTecnicoLegado(req: IncomingMessage, res: ServerResponse): boolean {
+  // Somente Bearer técnico explícito. Nem a sessão legada nem a sessão
+  // individual são fallback para provisionamento/suspensão.
+  if (verificarOperador(req)) return true;
+  json(res, 401, {
+    erro: "Autenticação técnica exigida.",
+    codigo: "TECH_ADMIN_AUTH_REQUIRED",
+  });
+  return false;
+}
+
 function autenticacaoDeSessao(req: IncomingMessage): boolean {
   // F16: sessão stateless — nenhuma memória de processo; qualquer instância
   // valida o mesmo cookie assinado.
@@ -478,27 +578,235 @@ const ROTAS: readonly Rota[] = [
   },
 
   // ------------------------------------------------------------------
-  // CAMPANHA PF — OPERATOR_ROUTE. Fundação somente-leitura: não persiste
-  // importação, não cria lote, não executa worker e não acessa Gmail.
+  // CAMPANHA PF — identidade INDIVIDUAL obrigatória. Nenhuma destas rotas
+  // aceita OPERATOR_TOKEN nem a sessão compartilhada do piloto como fallback.
   // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/identity/session",
+    handler: async (_req, res, _url, corpo) => {
+      let token = "";
+      try {
+        const body = JSON.parse(corpo.toString("utf8") || "{}") as { token?: unknown };
+        token = typeof body.token === "string" ? body.token.trim() : "";
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      if (!tokenIndividualValido(token)) {
+        json(res, 401, {
+          erro: "Credencial individual inválida.",
+          codigo: "INDIVIDUAL_OPERATOR_AUTH_INVALID",
+        });
+        return;
+      }
+
+      const tokenHash = hashSegredoOpaco(token);
+      token = "";
+      const sessionSecret = randomBytes(32).toString("base64url");
+      const sessionHash = hashSegredoOpaco(sessionSecret);
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + CAMPAIGN_OPERATOR_SESSION_TTL_MS);
+      try {
+        const identity = await operatorIdentityRepository().createSessionFromToken({
+          tokenHash,
+          sessionHash,
+          now: now.toISOString(),
+          sessionExpiresAt: expiresAt.toISOString(),
+        });
+        if (!identity) {
+          json(res, 401, {
+            erro: "Credencial individual inválida, expirada ou revogada.",
+            codigo: "INDIVIDUAL_OPERATOR_AUTH_INVALID",
+          });
+          return;
+        }
+        json(
+          res,
+          200,
+          {
+            status: "INDIVIDUAL_OPERATOR_SESSION_ACTIVE",
+            expiraEm: identity.sessionExpiresAt,
+          },
+          {
+            "set-cookie": cookieSessaoCampanha(
+              sessionSecret,
+              Math.floor(CAMPAIGN_OPERATOR_SESSION_TTL_MS / 1000),
+            ),
+          },
+        );
+      } catch {
+        json(res, 503, {
+          erro: "Identidade operacional indisponível.",
+          codigo: "OPERATOR_IDENTITY_UNAVAILABLE",
+        });
+      }
+    },
+  },
+  {
+    metodo: "DELETE",
+    caminhoExato: "/api/operator/identity/session",
+    handler: async (req, res) => {
+      const sessionSecret = cookiesDo(req)[CAMPAIGN_OPERATOR_SESSION_COOKIE];
+      if (sessionSecret && CAMPAIGN_TOKEN_PATTERN.test(sessionSecret)) {
+        try {
+          await operatorIdentityRepository().revokeSession(
+            hashSegredoOpaco(sessionSecret),
+            new Date().toISOString(),
+          );
+        } catch {
+          // O cookie ainda é removido. Sem sessão válida, ações futuras
+          // continuam fail-closed.
+        }
+      }
+      json(
+        res,
+        200,
+        { status: "INDIVIDUAL_OPERATOR_SESSION_CLOSED" },
+        { "set-cookie": cookieSessaoCampanhaRemovido() },
+      );
+    },
+  },
+  {
+    metodo: "GET",
+    caminhoExato: "/api/operator/me",
+    handler: async (req, res) => {
+      const identity = await exigirOperadorCampanha(req, res);
+      if (!identity) return;
+      json(res, 200, {
+        operatorId: identity.operatorId,
+        code: identity.code,
+        displayName: identity.displayName,
+        status: identity.status,
+        roles: identity.roles,
+        sessionExpiresAt: identity.sessionExpiresAt,
+      });
+    },
+  },
   {
     metodo: "GET",
     caminhoExato: "/api/campaigns/status",
-    handler: async (_req, res) => {
+    handler: async (req, res) => {
+      const identity = await exigirOperadorCampanha(req, res);
+      if (!identity) return;
       json(res, 200, carregarPoliticaCampanhaAtualizacao());
     },
   },
   {
     metodo: "GET",
     caminhoExato: "/api/operator/workspace/status",
-    handler: async (_req, res) => {
-      const policy = carregarPoliticaCampanhaAtualizacao();
+    handler: async (req, res) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_WORKSPACE_ROLES);
+      if (!identity) return;
       json(res, 200, {
-        campaign: policy,
-        operatorIdentity: "INDIVIDUAL_REQUIRED",
+        campaign: carregarPoliticaCampanhaAtualizacao(),
+        operatorIdentity: "INDIVIDUAL_ACTIVE",
+        operatorId: identity.operatorId,
+        roles: identity.roles,
         queueAvailable: false,
-        nextAction: "CONFIGURE_INDIVIDUAL_OPERATOR_IDENTITY",
+        nextAction: "WAIT_FOR_CAMPAIGN_PERSISTENCE_GATE",
       });
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/admin/provision",
+    handler: async (req, res, _url, corpo) => {
+      if (!exigirAdminTecnicoLegado(req, res)) return;
+      let body: {
+        operatorId?: unknown;
+        code?: unknown;
+        displayName?: unknown;
+        roles?: unknown;
+        token?: unknown;
+        tokenExpiresAt?: unknown;
+      };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      let token = typeof body.token === "string" ? body.token.trim() : "";
+      const roles = Array.isArray(body.roles) ? body.roles : [];
+      const rolesValid = roles.length > 0 && roles.every(
+        (role) => typeof role === "string" &&
+          ["PREPARADOR","REVISOR","APROVADOR","EXECUTOR","SUPERVISOR","ADMIN_TECNICO"].includes(role),
+      );
+      if (
+        typeof body.operatorId !== "string" ||
+        typeof body.code !== "string" ||
+        typeof body.displayName !== "string" ||
+        !rolesValid ||
+        !tokenIndividualValido(token)
+      ) {
+        json(res, 422, {
+          erro: "Dados de provisionamento inválidos.",
+          codigo: "OPERATOR_PROVISION_INVALID",
+        });
+        return;
+      }
+      const tokenHash = hashSegredoOpaco(token);
+      token = "";
+      try {
+        await operatorIdentityRepository().provisionOperator({
+          operatorId: body.operatorId,
+          code: body.code,
+          displayName: body.displayName,
+          roles: roles as OperatorRole[],
+          tokenHash,
+          now: new Date().toISOString(),
+          ...(typeof body.tokenExpiresAt === "string" ? { tokenExpiresAt: body.tokenExpiresAt } : {}),
+        });
+        json(res, 201, {
+          operatorId: body.operatorId,
+          status: "ATIVO",
+          roles: [...new Set(roles as string[])].sort(),
+        });
+      } catch (error) {
+        if ((error as { code?: unknown })?.code === "23505") {
+          json(res, 409, {
+            erro: "Operador ou credencial já provisionados.",
+            codigo: "OPERATOR_EXISTS",
+          });
+          return;
+        }
+        json(res, 503, {
+          erro: "Provisionamento operacional indisponível.",
+          codigo: "OPERATOR_PROVISION_UNAVAILABLE",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/admin/suspend",
+    handler: async (req, res, _url, corpo) => {
+      if (!exigirAdminTecnicoLegado(req, res)) return;
+      let operatorId = "";
+      try {
+        const body = JSON.parse(corpo.toString("utf8") || "{}") as { operatorId?: unknown };
+        operatorId = typeof body.operatorId === "string" ? body.operatorId : "";
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      try {
+        const suspended = await operatorIdentityRepository().suspendOperator(
+          operatorId,
+          new Date().toISOString(),
+        );
+        if (!suspended) {
+          json(res, 404, { erro: "Operador ativo não encontrado.", codigo: "OPERATOR_NOT_ACTIVE" });
+          return;
+        }
+        json(res, 200, { operatorId, status: "SUSPENSO", sessionsRevoked: true });
+      } catch {
+        json(res, 503, {
+          erro: "Suspensão operacional indisponível.",
+          codigo: "OPERATOR_SUSPEND_UNAVAILABLE",
+        });
+      }
     },
   },
 
@@ -1568,8 +1876,10 @@ export function criarServidor() {
         return;
       }
       // F10: público explícito; todo o resto exige operador autenticado.
-      const publica = ROTAS_PUBLICAS.has(`${req.method} ${rota.caminhoExato ?? ""}`);
-      if (!publica && !exigirOperador(req, res)) return;
+      const routeKey = `${req.method} ${rota.caminhoExato ?? ""}`;
+      const publica = ROTAS_PUBLICAS.has(routeKey);
+      const authPropria = ROTAS_AUTH_PROPRIA.has(routeKey);
+      if (!publica && !authPropria && !exigirOperador(req, res)) return;
       const corpo = req.method === "POST" ? await lerCorpo(req) : Buffer.alloc(0);
       await rota.handler(req, res, url, corpo);
     } catch (error) {
@@ -1642,8 +1952,10 @@ export async function despachar(
       json(coletor.res as unknown as ServerResponse, 404, { erro: "Rota não encontrada." });
       return coletor.obter();
     }
-    const publica = ROTAS_PUBLICAS.has(`${metodo} ${rota.caminhoExato ?? ""}`);
-    if (!publica && !exigirOperador(req, coletor.res as unknown as ServerResponse)) {
+    const routeKey = `${metodo} ${rota.caminhoExato ?? ""}`;
+    const publica = ROTAS_PUBLICAS.has(routeKey);
+    const authPropria = ROTAS_AUTH_PROPRIA.has(routeKey);
+    if (!publica && !authPropria && !exigirOperador(req, coletor.res as unknown as ServerResponse)) {
       return coletor.obter();
     }
     const corpo = metodo === "POST" ? await lerCorpo(req) : Buffer.alloc(0);

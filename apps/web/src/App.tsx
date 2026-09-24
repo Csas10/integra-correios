@@ -1,10 +1,15 @@
 import { AppHeader } from "./components/AppHeader";
 import { ConfirmationPage } from "./pages/ConfirmationPage";
 import { OperationalFlow } from "./pages/OperationalFlow";
+import { CampaignWorkspace } from "./pages/CampaignWorkspace";
 
 export function App() {
   if (window.location.pathname.startsWith("/confirma/")) {
     return <ConfirmationPage />;
+  }
+
+  if (window.location.pathname === "/operacao/email") {
+    return <CampaignWorkspace />;
   }
 
   return (

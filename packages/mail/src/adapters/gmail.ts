@@ -408,6 +408,40 @@ export interface GmailTokenRefreshResponse {
  * Headers sanitizados: CRLF proibido em from/replyTo/to/subject (header
  * injection); subject em RFC 2047 quando contém não-ASCII.
  */
+function encodeRfc2047Utf8Base64(value: string): string {
+  if (/^[\x20-\x7E]*$/.test(value)) return value;
+
+  // RFC 2047 limita cada encoded-word a 75 caracteres, incluindo
+  // "=?UTF-8?B?" e "?=". Com Base64 em múltiplos de 4, 60 caracteres
+  // codificados permitem no máximo 45 bytes UTF-8 por segmento.
+  const maxPayloadBytes = 45;
+  const segments: string[] = [];
+  let current = "";
+  let currentBytes = 0;
+
+  for (const codePoint of value) {
+    const bytes = Buffer.byteLength(codePoint, "utf8");
+    if (bytes > maxPayloadBytes) {
+      throw new Error("Caractere UTF-8 excede limite RFC 2047");
+    }
+    if (current && currentBytes + bytes > maxPayloadBytes) {
+      const encoded = Buffer.from(current, "utf8").toString("base64");
+      segments.push(`=?UTF-8?B?${encoded}?=`);
+      current = "";
+      currentBytes = 0;
+    }
+    current += codePoint;
+    currentBytes += bytes;
+  }
+
+  if (current) {
+    const encoded = Buffer.from(current, "utf8").toString("base64");
+    segments.push(`=?UTF-8?B?${encoded}?=`);
+  }
+
+  return segments.join(" ");
+}
+
 export function composeMimeMessage(message: OutboundMail): string {
   const headerSanitize = (valor: string): string => {
     if (/[\r\n]/.test(valor)) throw new Error("Cabeçalho MIME inválido (CRLF detectado)");
@@ -417,9 +451,7 @@ export function composeMimeMessage(message: OutboundMail): string {
   const replyTo = headerSanitize(message.replyTo);
   const to = headerSanitize(message.to);
   const subject = headerSanitize(message.subject);
-  const subjectEncoded = /^[\x20-\x7E]*$/.test(subject)
-    ? subject
-    : `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
+  const subjectEncoded = encodeRfc2047Utf8Base64(subject);
   const boundary = `ic-${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}-${randomBytes(8).toString("hex")}`;
   // Seção 6 — Message-ID determinístico por communication_id (RFC 5322
   // msg-id sem aspas angulares, reservado ao provedor): permite detecção de

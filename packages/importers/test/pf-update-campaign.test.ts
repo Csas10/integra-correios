@@ -29,7 +29,7 @@ describe("Campanha PF — importação e pré-voo", () => {
         folha: folha(
           ["REGISTRO", "NOME", "E- MAIL"],
           [
-            ["1001", "  Ana\nSilva  ", " ANA@\nEXEMPLO.COM "],
+            ["1001", "  Ana\nSilva  ", " ANA@EXEMPLO.COM "],
             ["1002", "Bruna Souza", "ana@exemplo.com"],
             ["1003", "Carlos Lima", "email-invalido"],
             ["1004", "Daniel Costa", "daniel@example.com"],
@@ -77,6 +77,31 @@ describe("Campanha PF — importação e pré-voo", () => {
     expect(report.registros[0]?.motivo_bloqueio).toContain("IDENTIFICADOR_INSTITUCIONAL_AUSENTE");
     expect(report.registros[1]?.motivo_bloqueio).toContain("IDENTIFICADOR_INSTITUCIONAL_DUPLICADO");
     expect(report.registros[2]?.motivo_bloqueio).toContain("IDENTIFICADOR_INSTITUCIONAL_DUPLICADO");
+  });
+
+  it("não corrige silenciosamente espaços internos no e-mail", () => {
+    const report = analisarCampanhaAtualizacaoPf(
+      {
+        sha256: "e".repeat(64),
+        folha: folha(
+          ["REGISTRO", "NOME", "EMAIL"],
+          [
+            ["3001", "João Silva", "joao silva@gmail.com"],
+            ["3002", "Maria Souza", " maria.souza@gmail.com "],
+          ],
+        ),
+      },
+      { colunaIdentificadorInstitucional: "REGISTRO" },
+    );
+
+    expect(report.registros[0]?.email).toBe("joao silva@gmail.com");
+    expect(report.registros[0]?.email_normalizado).toBe("joao silva@gmail.com");
+    expect(report.registros[0]?.motivo_bloqueio).toContain("EMAIL_INVALIDO");
+    expect(report.registros[0]?.status_validacao).toBe("BLOQUEADO");
+
+    expect(report.registros[1]?.email_normalizado).toBe("maria.souza@gmail.com");
+    expect(report.registros[1]?.status_validacao).toBe("APTO");
+    expect(report.registros[1]?.normalizacoes_aplicadas).toContain("EMAIL_ESPACOS");
   });
 
   it("bloqueia local-part com ponto inicial, final ou consecutivo", () => {

@@ -62,6 +62,7 @@ import {
   ConfirmationInvalidaError,
   type ConfirmationDecisionInput,
 } from "./confirmation.js";
+import { carregarPoliticaCampanhaAtualizacao } from "./campaigns.js";
 import { createWebTokenService } from "@integra-correios/pf-workflow";
 import { MapeamentoInvalidoError } from "@integra-correios/importers";
 import {
@@ -472,6 +473,31 @@ const ROTAS: readonly Rota[] = [
         pilot: policy,
         ppn: { enabled: false },
         gmail: { oauthStatus: oauth, realSendEnabled: policy.realSendEnabled },
+      });
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // CAMPANHA PF — OPERATOR_ROUTE. Fundação somente-leitura: não persiste
+  // importação, não cria lote, não executa worker e não acessa Gmail.
+  // ------------------------------------------------------------------
+  {
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/status",
+    handler: async (_req, res) => {
+      json(res, 200, carregarPoliticaCampanhaAtualizacao());
+    },
+  },
+  {
+    metodo: "GET",
+    caminhoExato: "/api/operator/workspace/status",
+    handler: async (_req, res) => {
+      const policy = carregarPoliticaCampanhaAtualizacao();
+      json(res, 200, {
+        campaign: policy,
+        operatorIdentity: "INDIVIDUAL_REQUIRED",
+        queueAvailable: false,
+        nextAction: "CONFIGURE_INDIVIDUAL_OPERATOR_IDENTITY",
       });
     },
   },

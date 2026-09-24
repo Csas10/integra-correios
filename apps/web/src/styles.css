@@ -1522,3 +1522,225 @@ button:focus-visible {
     min-width: 0;
   }
 }
+
+
+/* ==========================================================================
+   Campanha de Atualização Cadastral PF — superfície operacional segregada
+   ========================================================================== */
+
+.campaign-shell {
+  background: #eef2f6;
+}
+
+.campaign-workspace {
+  width: min(100%, 1380px);
+  min-height: calc(100vh - 72px);
+  margin: 0 auto;
+  padding: 42px clamp(18px, 4vw, 52px) 68px;
+}
+
+.campaign-hero {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 28px;
+  margin-bottom: 18px;
+}
+
+.campaign-hero h1 {
+  max-width: 800px;
+  margin: 0;
+  color: var(--ink-900);
+  font-size: clamp(30px, 4vw, 44px);
+  font-weight: 760;
+  letter-spacing: -0.04em;
+  line-height: 1.08;
+}
+
+.campaign-hero p {
+  max-width: 780px;
+  margin: 12px 0 0;
+  color: var(--ink-700);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.campaign-lock {
+  display: grid;
+  min-width: 275px;
+  gap: 4px;
+  padding: 14px 16px;
+  color: #72520d;
+  border: 1px solid #e5cf9f;
+  border-radius: 12px;
+  background: #fff8e6;
+}
+
+.campaign-lock strong {
+  font-size: 12px;
+}
+
+.campaign-lock span {
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.campaign-guardrail,
+.campaign-operator-card {
+  margin-bottom: 18px;
+  padding: 17px 19px;
+  border-radius: 13px;
+}
+
+.campaign-guardrail {
+  border: 1px solid #d7e2ec;
+  background: #fff;
+}
+
+.campaign-guardrail strong {
+  color: var(--navy-800);
+  font-size: 12px;
+}
+
+.campaign-guardrail p {
+  margin: 6px 0 0;
+  color: var(--ink-500);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.campaign-operator-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  border: 1px solid #b9dbd0;
+  background: var(--success-soft);
+}
+
+.campaign-operator-card div {
+  display: grid;
+  gap: 3px;
+}
+
+.campaign-operator-card span {
+  color: #467667;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.campaign-operator-card strong {
+  color: #165f49;
+  font-size: 13px;
+}
+
+.campaign-operator-card p {
+  max-width: 620px;
+  margin: 0;
+  color: #467667;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.campaign-steps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.campaign-step {
+  display: flex;
+  min-height: 96px;
+  align-items: flex-start;
+  gap: 15px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+}
+
+.campaign-step > span {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  color: var(--blue-600);
+  border-radius: 50%;
+  background: #edf5fa;
+  font-size: 9px;
+  font-weight: 900;
+}
+
+.campaign-step h2 {
+  margin: 1px 0 6px;
+  color: var(--ink-900);
+  font-size: 14px;
+}
+
+.campaign-step p {
+  margin: 0;
+  color: var(--ink-500);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.campaign-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.campaign-summary-grid article {
+  min-height: 128px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+}
+
+.campaign-summary-grid span {
+  color: var(--ink-500);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.campaign-summary-grid strong {
+  display: block;
+  margin: 10px 0 8px;
+  color: var(--navy-800);
+  font-size: 26px;
+}
+
+.campaign-summary-grid p {
+  margin: 0;
+  color: var(--ink-500);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+@media (max-width: 760px) {
+  .campaign-workspace {
+    padding: 28px 16px 44px;
+  }
+
+  .campaign-hero,
+  .campaign-operator-card {
+    display: grid;
+    align-items: start;
+  }
+
+  .campaign-lock {
+    min-width: 0;
+  }
+
+  .campaign-steps,
+  .campaign-summary-grid {
+    grid-template-columns: 1fr;
+  }
+}

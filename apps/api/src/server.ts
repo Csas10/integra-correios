@@ -14,6 +14,7 @@ import {
   Aes256GcmSecretBox,
   HmacSha256Fingerprinter,
   PostgresOperatorIdentityRepository,
+  OperatorAdminAuthorizationError,
   type OperatorIdentity,
   type OperatorRole,
 } from "@integra-correios/persistence";
@@ -780,6 +781,13 @@ const ROTAS: readonly Rota[] = [
           provisionedBy: admin.operatorId,
         });
       } catch (error) {
+        if (error instanceof OperatorAdminAuthorizationError) {
+          json(res, 403, {
+            erro: "Administrador técnico individual não está mais autorizado.",
+            codigo: "OPERATOR_ADMIN_AUTH_STALE",
+          });
+          return;
+        }
         if ((error as { code?: unknown })?.code === "23505") {
           json(res, 409, {
             erro: "Operador ou credencial já provisionados.",
@@ -844,7 +852,14 @@ const ROTAS: readonly Rota[] = [
           sessionsRevoked: true,
           performedBy: admin.operatorId,
         });
-      } catch {
+      } catch (error) {
+        if (error instanceof OperatorAdminAuthorizationError) {
+          json(res, 403, {
+            erro: "Administrador técnico individual não está mais autorizado.",
+            codigo: "OPERATOR_ADMIN_AUTH_STALE",
+          });
+          return;
+        }
         json(res, 503, {
           erro: "Rotação de credencial indisponível.",
           codigo: "OPERATOR_CREDENTIAL_ROTATION_UNAVAILABLE",
@@ -902,7 +917,14 @@ const ROTAS: readonly Rota[] = [
           sessionsRevoked: true,
           performedBy: admin.operatorId,
         });
-      } catch {
+      } catch (error) {
+        if (error instanceof OperatorAdminAuthorizationError) {
+          json(res, 403, {
+            erro: "Administrador técnico individual não está mais autorizado.",
+            codigo: "OPERATOR_ADMIN_AUTH_STALE",
+          });
+          return;
+        }
         json(res, 503, {
           erro: "Recuperação de credencial indisponível.",
           codigo: "OPERATOR_CREDENTIAL_RECOVERY_UNAVAILABLE",
@@ -941,7 +963,14 @@ const ROTAS: readonly Rota[] = [
           sessionsRevoked: true,
           performedBy: admin.operatorId,
         });
-      } catch {
+      } catch (error) {
+        if (error instanceof OperatorAdminAuthorizationError) {
+          json(res, 403, {
+            erro: "Administrador técnico individual não está mais autorizado.",
+            codigo: "OPERATOR_ADMIN_AUTH_STALE",
+          });
+          return;
+        }
         json(res, 503, {
           erro: "Suspensão operacional indisponível.",
           codigo: "OPERATOR_SUSPEND_UNAVAILABLE",

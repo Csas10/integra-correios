@@ -201,6 +201,7 @@ export class PostgresOperatorIdentityRepository {
          FROM operador_sessao s
          JOIN operador o ON o.id = s.operator_id
          JOIN operador_token t ON t.id = s.token_id
+                              AND t.operator_id = s.operator_id
         WHERE s.session_hash = $1
           AND s.status = 'ATIVA'
           AND s.expira_em > $2::timestamptz

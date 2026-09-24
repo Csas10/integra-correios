@@ -1,8 +1,17 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "installCommand": "npm ci",
-  "buildCommand": "npm run build:web",
+  "buildCommand": "npm run build:vercel",
   "outputDirectory": "apps/web/dist",
   "framework": "vite",
-  "rewrites": [{ "source": "/confirma/:token", "destination": "/index.html" }]
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/confirma/:token",
+      "destination": "/index.html"
+    }
+  ]
 }

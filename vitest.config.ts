@@ -12,6 +12,7 @@ export default defineConfig({
       "@integra-correios/persistence": fileURLToPath(new URL("./packages/persistence/src/index.ts", import.meta.url)),
       "@integra-correios/pf-workflow": fileURLToPath(new URL("./packages/pf-workflow/src/index.ts", import.meta.url)),
       "@integra-correios/shared": fileURLToPath(new URL("./packages/shared/src/index.ts", import.meta.url)),
+      "@integra-correios/worker": fileURLToPath(new URL("./apps/worker/src/index.ts", import.meta.url)),
       "@integra-correios/validation": fileURLToPath(new URL("./packages/validation/src/index.ts", import.meta.url)),
     },
   },

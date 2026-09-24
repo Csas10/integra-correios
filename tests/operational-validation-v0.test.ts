@@ -327,6 +327,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigo}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: new Date().toISOString(),
         auditEvent: {
@@ -495,6 +497,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigo}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: new Date().toISOString(),
         auditEvent: {
@@ -602,6 +606,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           code: `PF-MAIL-V0-${codigo}`,
           origin: "PF",
           templateVersion: "pf-confirmation-v1",
+          mode: "DRY_RUN",
+          source: "INSTITUCIONAL_XLSX",
           createdBy: "validacao-v0",
           createdAt: new Date().toISOString(),
           auditEvent: {
@@ -709,6 +715,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigo}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: agora,
         auditEvent: {
@@ -743,6 +751,46 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
           },
         ],
       });
+
+      // GATE DE LIBERAÇÃO: o lote nasce PREPARACAO — outbox persistida porém
+      // NÃO elegível a claim (evita que apenas habilitar REAL_SEND_ENABLED
+      // libere lotes previamente preparados).
+      const antesAtivacao = await repository.claimOutbox("worker-v0-pre", 100, agora);
+      expect(antesAtivacao.find((item) => item.id === outboxId)).toBeUndefined();
+
+      // Liberação deliberada (CAS PREPARACAO → ATIVO, auditada).
+      await repository.ativarLoteComunicacao({
+        batchId: loteId,
+        origin: "PF",
+        actorId: "validacao-v0",
+        activatedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_ATIVADO_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`ativ:${loteId}`),
+        },
+      });
+      // Segunda ativação é determinística: ALREADY_ACTIVE, sem segundo evento.
+      const reativacao = await repository.ativarLoteComunicacao({
+        batchId: loteId,
+        origin: "PF",
+        actorId: "validacao-v0",
+        activatedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_ATIVADO_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`ativ:${loteId}`),
+        },
+      });
+      expect(reativacao.resultCode).toBe("ALREADY_ACTIVE");
 
       // Claim reserva o item. O banco é compartilhado entre cenários
       // paralelos, então a asserção filtra pelos itens deste cenário —
@@ -837,6 +885,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigo}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: new Date().toISOString(),
         auditEvent: {
@@ -944,6 +994,8 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         code: `PF-MAIL-V0-${codigoA}`,
         origin: "PF",
         templateVersion: "pf-confirmation-v1",
+        mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
         createdBy: "validacao-v0",
         createdAt: agora,
         auditEvent: {
@@ -977,6 +1029,23 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         })),
       });
 
+      // Liberação do lote antes das claims (gate ATIVO).
+      await repository.ativarLoteComunicacao({
+        batchId: loteId,
+        origin: "PF",
+        actorId: "validacao-v0",
+        activatedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_ATIVADO_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`ativ:${loteId}`),
+        },
+      });
+
       // Duas claims SIMULTÂNEAS de workers diferentes: cada item reservado
       // exatamente uma vez — SKIP LOCKED impede duplicação e deadlock.
       const [claimA, claimB] = await Promise.all([
@@ -999,6 +1068,635 @@ d("V0 persistencia — PostgreSQL real (sintetico)", () => {
         [outboxIds],
       );
       expect(estado.rows[0]!.processando).toBe("2");
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("gate de liberacao: PREPARACAO e CANCELADO nunca sao claimed; ATIVO é; ativacao inválida é rejeitada", async () => {
+    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      const agora = new Date().toISOString();
+
+      // Um profissional distinto por lote: o índice parcial único
+      // item_lote_profissional_ativo_idx impede o mesmo profissional em dois
+      // lotes "vivos" simultâneos (invariante de domínio). Este cenário varia
+      // o STATUS do lote, não o profissional, então cada lote recebe o seu.
+      async function criarProfissional(): Promise<string> {
+        const profissionalId = randomUUID();
+        const codigo = `GL-${randomUUID().slice(0, 8).toUpperCase()}`;
+        await repository.createProfessional({
+          id: profissionalId,
+          origin: "PF",
+          operationalCode: codigo,
+          status: "CARTEIRA_IDENTIFICADA",
+          document: {
+            documentType: "CPF",
+            fingerprint: fingerprinter.fingerprint("cpf-v0", `${codigo}:${CPF_VALIDO}`),
+            encrypted: caixa.seal(CPF_VALIDO_FORMATADO, "documento:cpf"),
+          },
+          originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
+          auditEvent: {
+            id: randomUUID(),
+            aggregateType: "PROFISSIONAL",
+            aggregateId: profissionalId,
+            type: "PF_IMPORTADO_V0",
+            occurredAt: agora,
+            metadata: {},
+            eventHash: hash64(profissionalId),
+          },
+        });
+        return profissionalId;
+      }
+
+      // Três lotes com outbox PENDING: PREPARACAO (padrão), ATIVO e CANCELADO.
+      async function criarLoteComOutbox(suffix: string): Promise<{ loteId: string; outboxId: string }> {
+        const profissionalId = await criarProfissional();
+        const loteId = randomUUID();
+        const outboxId = randomUUID();
+        await repository.enqueueCommunicationBatch({
+          id: loteId,
+          code: `PF-MAIL-V0-${randomUUID().slice(0, 8).toUpperCase()}-${suffix}`,
+          origin: "PF",
+          templateVersion: "pf-confirmation-v1",
+          mode: "DRY_RUN",
+          source: "INSTITUCIONAL_XLSX",
+          createdBy: "validacao-v0",
+          createdAt: agora,
+          auditEvent: {
+            id: randomUUID(),
+            aggregateType: "LOTE_COMUNICACAO",
+            aggregateId: loteId,
+            type: "PF_LOTE_COMUNICACAO_CRIADO",
+            occurredAt: agora,
+            metadata: {},
+            eventHash: hash64(loteId),
+          },
+          items: [
+            {
+              professionalId: profissionalId,
+              confirmationId: randomUUID(),
+              communicationId: randomUUID(),
+              outboxId,
+              tokenHash: hash64(`token-gl-${suffix}`),
+              expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+              recipientFingerprint: hash64(`email-gl-${suffix}`),
+              idempotencyKey: `pf-confirmation:v0:${outboxId}`,
+              encryptedPayload: caixa.seal(`payload-gl-${suffix}`, "outbox:email"),
+              auditEvent: {
+                id: randomUUID(),
+                aggregateType: "PROFISSIONAL",
+                aggregateId: profissionalId,
+                type: "PF_CONFIRMACAO_EMITIDA_V0",
+                occurredAt: agora,
+                metadata: {},
+                eventHash: hash64(outboxId),
+              },
+            },
+          ],
+        });
+        return { loteId, outboxId };
+      }
+
+      const preparacao = await criarLoteComOutbox("prep");
+      const ativo = await criarLoteComOutbox("ativo");
+      const cancelado = await criarLoteComOutbox("cancel");
+
+      await pool.query(
+        `UPDATE lote_comunicacao SET status = 'CANCELADO' WHERE id = $1`,
+        [cancelado.loteId],
+      );
+      await repository.ativarLoteComunicacao({
+        batchId: ativo.loteId,
+        origin: "PF",
+        actorId: "validacao-v0",
+        activatedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: ativo.loteId,
+          type: "PF_LOTE_COMUNICACAO_ATIVADO_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`ativ:${ativo.loteId}`),
+        },
+      });
+
+      // Somente o lote ATIVO é elegível: PREPARACAO e CANCELADO não são claimed.
+      const claims = await repository.claimOutbox("worker-gate", 100, agora);
+      expect(claims.find((i) => i.id === preparacao.outboxId)).toBeUndefined();
+      expect(claims.find((i) => i.id === cancelado.outboxId)).toBeUndefined();
+      expect(claims.find((i) => i.id === ativo.outboxId)).toBeDefined();
+
+      // Ativação rejeitada deterministicamente para estados inválidos.
+      await expect(
+        repository.ativarLoteComunicacao({
+          batchId: cancelado.loteId,
+          origin: "PF",
+          actorId: "validacao-v0",
+          activatedAt: agora,
+          auditEvent: {
+            id: randomUUID(),
+            aggregateType: "LOTE_COMUNICACAO",
+            aggregateId: cancelado.loteId,
+            type: "PF_LOTE_COMUNICACAO_ATIVADO_V0",
+            occurredAt: agora,
+            metadata: {},
+            eventHash: hash64(`ativ:${cancelado.loteId}`),
+          },
+        }),
+      ).rejects.toThrow(/INVALID_STATE/);
+
+      // Ativação de lote inexistente → INVALID_STATE (e nunca sucesso silencioso).
+      const inexistente = randomUUID();
+      await expect(
+        repository.ativarLoteComunicacao({
+          batchId: inexistente,
+          origin: "PF",
+          actorId: "validacao-v0",
+          activatedAt: agora,
+          auditEvent: {
+            id: randomUUID(),
+            aggregateType: "LOTE_COMUNICACAO",
+            aggregateId: inexistente,
+            type: "PF_LOTE_COMUNICACAO_ATIVADO_V0",
+            occurredAt: agora,
+            metadata: {},
+            eventHash: hash64(`ativ:${inexistente}`),
+          },
+        }),
+      ).rejects.toThrow(/INVALID_STATE/);
+
+      // Estado do banco confirma: PREPARACAO segue com outbox PENDING não reservada.
+      const estado = await pool.query<{ status: string; outbox: string }>(
+        `SELECT l.status, o.status AS outbox
+        FROM lote_comunicacao l
+        JOIN comunicacao c ON c.lote_comunicacao_id = l.id
+        JOIN outbox_email o ON o.comunicacao_id = c.id
+        WHERE l.id = $1`,
+        [preparacao.loteId],
+      );        expect(estado.rows[0]).toEqual({ status: "PREPARACAO", outbox: "PENDING" });
+    } finally {
+      await pool.close();
+    }
+  });
+
+  // ==========================================================================
+  // Kernel B — regressões dos findings F4/F7/F8/F9.
+  // ==========================================================================
+
+  it("F8: falha no meio da importação → ROLLBACK integral nas 6 tabelas", async () => {
+    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      // Segunda linha rompe a UNIQUE (origem, documento_fingerprint): falha
+      // PROVOCADA no meio da escrita (após arquivo/importação/1ª linha).
+      const sha256 = hash64(`rollback-import-${randomUUID()}`);
+      const idLinha1 = randomUUID();
+      const idLinha2 = randomUUID();
+      const linhaValida = {
+        numeroLinha: 1,
+        dadosBrutos: caixa.seal(JSON.stringify({ CODIGO: "RB-1", CPF: CPF_VALIDO }), "linha:bruta"),
+        documentoFingerprint: fingerprinter.fingerprint("cpf-v0-rb", "rb-unico-1"),
+        statusLinha: "VALIDA" as const,
+        inconsistencias: [],
+        profissional: {
+          id: idLinha1,
+          codigoOperacional: `RB-${randomUUID().slice(0, 8).toUpperCase()}`,
+          status: "CARTEIRA_IDENTIFICADA",
+          documento: caixa.seal(CPF_VALIDO, "documento:cpf"),
+          originalSnapshot: caixa.seal(JSON.stringify({ nome: "Rollback Um" }), "snapshot:original"),
+        },
+      };
+      const mesmaDigitacao = (numero: number, codigo: string, id: string): typeof linhaValida => ({
+        numeroLinha: numero,
+        dadosBrutos: caixa.seal(JSON.stringify({ CODIGO: codigo, CPF: CPF_VALIDO }), "linha:bruta"),
+        documentoFingerprint: fingerprinter.fingerprint("cpf-v0-rb", "rb-unico-1"),
+        statusLinha: "VALIDA",
+        inconsistencias: [],
+        profissional: {
+          id,
+          codigoOperacional: codigo,
+          status: "CARTEIRA_IDENTIFICADA",
+          documento: caixa.seal(CPF_VALIDO, "documento:cpf"),
+          originalSnapshot: caixa.seal(JSON.stringify({ nome: `Rollback ${numero}` }), "snapshot:original"),
+        },
+      });
+      const command = {
+        nomeArquivo: "sintetico-rollback.xlsx",
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        bytesLength: 100,
+        sha256,
+        storageKey: `mem://pf/${sha256}`,
+        folha: "PROFISSIONAIS",
+        operador: "validacao-v0",
+        agora: new Date().toISOString(),
+        linhas: [linhaValida, mesmaDigitacao(2, `RB-${randomUUID().slice(0, 8).toUpperCase()}`, idLinha2)],
+      };
+      await expect(repository.registrarImportacaoPf(command)).rejects.toThrow();
+
+      // ROLLBACK integral: NENHUM resíduo relativo a esta importação.
+      const residuos = await pool.query<{
+        arquivo: string;
+        importacao: string;
+        linha: string;
+        profissional: string;
+        snapshot: string;
+        evento: string;
+      }>(
+        `SELECT
+          (SELECT count(*) FROM arquivo_importacao WHERE sha256 = $1) AS arquivo,
+          (SELECT count(*) FROM importacao i JOIN arquivo_importacao a ON a.id = i.arquivo_importacao_id WHERE a.sha256 = $1) AS importacao,
+          (SELECT count(*) FROM linha_importada li JOIN importacao i ON i.id = li.importacao_id JOIN arquivo_importacao a ON a.id = i.arquivo_importacao_id WHERE a.sha256 = $1) AS linha,
+          (SELECT count(*) FROM profissional WHERE id = ANY($2::uuid[])) AS profissional,
+          (SELECT count(*) FROM snapshot_cadastral WHERE profissional_id = ANY($2::uuid[])) AS snapshot,
+          (SELECT count(*) FROM evento_auditoria WHERE agregado_id = ANY($2::uuid[])) AS evento`,
+        [sha256, [idLinha1, idLinha2]],
+      );
+      expect(residuos.rows[0]).toEqual({
+        arquivo: "0",
+        importacao: "0",
+        linha: "0",
+        profissional: "0",
+        snapshot: "0",
+        evento: "0",
+      });
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("F9: contagens semanticamente corretas (reimportação do mesmo SHA, linha pendente/inválida) + F4/F7: modo DRY_RUN e threadId persistidos", async () => {
+    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      const sha256 = hash64(`contagens-${randomUUID()}`);
+      const agora = new Date().toISOString();
+      const base = {
+        nomeArquivo: "sintetico-contagens.xlsx",
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        bytesLength: 100,
+        sha256,
+        storageKey: `mem://pf/${sha256}`,
+        folha: "PROFISSIONAIS",
+        operador: "validacao-v0",
+        agora,
+      };
+
+      const linha = (
+        numero: number,
+        codigo: string,
+        doc: string,
+        statusLinha: "VALIDA" | "PENDENTE" | "INVALIDA",
+      ) => ({
+        numeroLinha: numero,
+        dadosBrutos: caixa.seal(JSON.stringify({ CODIGO: codigo }), "linha:bruta"),
+        documentoFingerprint: doc ? fingerprinter.fingerprint("cpf-v0-ct", doc) : null,
+        statusLinha,
+        inconsistencias: [],
+        ...(statusLinha === "INVALIDA"
+          ? {}
+          : {
+              profissional: {
+                id: randomUUID(),
+                codigoOperacional: codigo,
+                status: "CARTEIRA_IDENTIFICADA",
+                documento: caixa.seal(doc, "documento:cpf"),
+                originalSnapshot: caixa.seal(JSON.stringify({ nome: `Contagem ${numero}` }), "snapshot:original"),
+              },
+            }),
+      });
+
+      const command = {
+        ...base,
+        linhas: [
+          linha(1, `CT-${randomUUID().slice(0, 8).toUpperCase()}`, "rb-contagem-1", "VALIDA"),
+          linha(2, `CT-${randomUUID().slice(0, 8).toUpperCase()}`, "rb-contagem-2", "PENDENTE"),
+          linha(3, `CT-${randomUUID().slice(0, 8).toUpperCase()}`, "", "INVALIDA"),
+        ],
+      };
+
+      // 1ª importação: 2 válidas, 1 pendente, 1 inválida, 2 criados.
+      const primeira = await repository.registrarImportacaoPf(command);
+      expect(primeira.linhasValidas).toBe(2);
+      expect(primeira.linhasPendentes).toBe(1);
+      expect(primeira.linhasInvalidas).toBe(1);
+      expect(primeira.profissionaisCriados).toBe(2);
+
+      // Reimportação do MESMO SHA: determinística; criados = 0, válidas = 2.
+      const segunda = await repository.registrarImportacaoPf({
+        ...command,
+        agora: new Date(Date.now() + 1_000).toISOString(),
+        linhas: command.linhas.map((l, i) => ({
+          ...l,
+          profissional: command.linhas[i]!.profissional
+            ? { ...command.linhas[i]!.profissional!, id: randomUUID() }
+            : undefined,
+        })),
+      });
+      expect(segunda.profissionaisCriados).toBe(0);
+      expect(segunda.linhasValidas).toBe(2);
+
+      const contagens = await pool.query<{ validas: number; pendentes: number }>(
+        `SELECT linhas_validas AS validas, linhas_pendentes AS pendentes
+        FROM importacao WHERE arquivo_importacao_id = (SELECT id FROM arquivo_importacao WHERE sha256 = $1)
+        ORDER BY iniciada_em`,
+        [sha256],
+      );
+      expect(contagens.rows).toHaveLength(2);
+      for (const row of contagens.rows) {
+        expect(Number(row.validas)).toBe(2);
+        expect(Number(row.pendentes)).toBe(1);
+      }
+
+      // F7: lote nasce com modo DRY_RUN inequívoco no banco.
+      // (A confirmacao PENDING é criada pelo próprio enqueueCommunicationBatch.)
+      const loteId = randomUUID();
+      const outboxId = randomUUID();
+      const communicationId = randomUUID();
+      const profissionalId = (command.linhas[0]!.profissional as { id: string }).id;
+      const confirmationId = randomUUID();
+      await repository.enqueueCommunicationBatch({
+        id: loteId,
+        code: `PF-MAIL-CT-${randomUUID().slice(0, 8).toUpperCase()}`,
+        origin: "PF",
+        templateVersion: "pf-pilot-crtba-v1",
+        mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
+        createdBy: "validacao-v0",
+        createdAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_CRIADO_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(loteId),
+        },
+        items: [
+          {
+            professionalId: profissionalId,
+            confirmationId,
+            communicationId,
+            outboxId,
+            tokenHash: hash64(`ct-token-${loteId}`),
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+            recipientFingerprint: hash64("ct-email"),
+            idempotencyKey: `pf-pilot:ct:${outboxId}`,
+            encryptedPayload: caixa.seal(
+              JSON.stringify({ confirmationId, confirmationBaseUrl: "https://app.exemplo.test", nome: "Contagem Um", destinatario: "sintetico@exemplo.test", enderecoApresentado: "Rua de Teste, 100", telefone: "00000000000" }),
+              "outbox:email",
+            ),
+            auditEvent: {
+              id: randomUUID(),
+              aggregateType: "PROFISSIONAL",
+              aggregateId: profissionalId,
+              type: "PF_CONFIRMACAO_EMITIDA_V0",
+              occurredAt: agora,
+              metadata: {},
+              eventHash: hash64(outboxId),
+            },
+          },
+        ],
+      });
+      const modoLote = await pool.query<{ modo: string }>(
+        `SELECT modo FROM lote_comunicacao WHERE id = $1`,
+        [loteId],
+      );
+      expect(modoLote.rows[0]!.modo).toBe("DRY_RUN");
+
+      // F4: threadId do receipt é propagado até comunicacao.provider_thread_id.
+      await repository.ativarLoteComunicacao({
+        batchId: loteId,
+        origin: "PF",
+        actorId: "validacao-v0",
+        activatedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_ATIVADO_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`ativ:${loteId}`),
+        },
+      });
+      await repository.claimOutbox("worker-ct", 10, agora);
+      await repository.markOutboxAccepted({
+        outboxId,
+        communicationId,
+        provider: "DRY_RUN" as const,
+        providerMessageId: "sintetico-msg-ct-001",
+        providerThreadId: "sintetico-thread-001",
+        acceptedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "COMUNICACAO",
+          aggregateId: communicationId,
+          type: "PF_COMMUNICATION_ACCEPTED_V0",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(communicationId),
+        },
+      });
+      const receipt = await pool.query<{ provider: string; thread: string | null }>(
+        `SELECT provider, provider_thread_id AS thread FROM comunicacao WHERE id = $1`,
+        [communicationId],
+      );
+      expect(receipt.rows[0]).toEqual({ provider: "DRY_RUN", thread: "sintetico-thread-001" });
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("fecha item e lote somente após receipt aceito e confirmação consumida", async () => {
+    const pool = new NodePostgresPool({ connectionString: process.env.DATABASE_URL! });
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      const ownership = new PostgresConfirmationOwnership(pool);
+      const profissionalId = randomUUID();
+      const loteId = randomUUID();
+      const confirmationId = randomUUID();
+      const communicationId = randomUUID();
+      const outboxId = randomUUID();
+      const codigo = `FECHAMENTO-${randomUUID().slice(0, 8).toUpperCase()}`;
+      const agora = new Date().toISOString();
+      const tokenHash = hash64(`fechamento-token-${loteId}`);
+
+      await repository.createProfessional({
+        id: profissionalId,
+        origin: "PF",
+        operationalCode: codigo,
+        status: "APTO_CONTATO",
+        document: {
+          documentType: "CPF",
+          fingerprint: fingerprinter.fingerprint("cpf-fechamento", `${codigo}:${CPF_VALIDO}`),
+          encrypted: caixa.seal(CPF_VALIDO, "documento:cpf"),
+        },
+        originalSnapshot: caixa.seal(JSON.stringify(snapshotPf()), "snapshot:original"),
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "PROFISSIONAL",
+          aggregateId: profissionalId,
+          type: "PF_IMPORTADO_FECHAMENTO",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`importado-${profissionalId}`),
+        },
+      });
+
+      await repository.enqueueCommunicationBatch({
+        id: loteId,
+        code: `PF-MAIL-FECHAMENTO-${codigo}`,
+        origin: "PF",
+        templateVersion: "pf-pilot-crtba-v1",
+        mode: "DRY_RUN",
+        source: "INSTITUCIONAL_XLSX",
+        createdBy: "teste-fechamento",
+        createdAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_CRIADO_FECHAMENTO",
+          occurredAt: agora,
+          metadata: { totalItens: 1 },
+          eventHash: hash64(`lote-${loteId}`),
+        },
+        items: [
+          {
+            professionalId: profissionalId,
+            confirmationId,
+            communicationId,
+            outboxId,
+            tokenHash,
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+            recipientFingerprint: fingerprinter.fingerprint("email-fechamento", "sintetico@exemplo.test"),
+            idempotencyKey: `pf-fechamento:${confirmationId}`,
+            encryptedPayload: caixa.seal("payload-fechamento", "outbox:email"),
+            auditEvent: {
+              id: randomUUID(),
+              aggregateType: "PROFISSIONAL",
+              aggregateId: profissionalId,
+              type: "PF_CONFIRMACAO_EMITIDA_FECHAMENTO",
+              occurredAt: agora,
+              metadata: { loteComunicacaoId: loteId },
+              eventHash: hash64(`confirmacao-${confirmationId}`),
+            },
+          },
+        ],
+      });
+
+      await repository.ativarLoteComunicacao({
+        batchId: loteId,
+        origin: "PF",
+        actorId: "teste-fechamento",
+        activatedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "LOTE_COMUNICACAO",
+          aggregateId: loteId,
+          type: "PF_LOTE_COMUNICACAO_ATIVADO_FECHAMENTO",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`ativado-${loteId}`),
+        },
+      });
+      const claimed = await repository.claimOutbox("worker-fechamento", 10, agora);
+      expect(claimed).toHaveLength(1);
+      await repository.markOutboxAccepted({
+        outboxId,
+        communicationId,
+        provider: "DRY_RUN",
+        providerMessageId: `dryrun-${confirmationId}`,
+        acceptedAt: agora,
+        auditEvent: {
+          id: randomUUID(),
+          aggregateType: "COMUNICACAO",
+          aggregateId: communicationId,
+          type: "PF_COMMUNICATION_ACCEPTED_FECHAMENTO",
+          occurredAt: agora,
+          metadata: {},
+          eventHash: hash64(`accepted-${communicationId}`),
+        },
+      });
+      const aposReceipt = await pool.query<{ lote: string; item: string; confirmacao: string }>(
+        `SELECT l.status AS lote, i.status AS item, c.status AS confirmacao
+        FROM lote_comunicacao l
+        JOIN item_lote_comunicacao i ON i.lote_comunicacao_id = l.id
+        JOIN comunicacao cm ON cm.id = i.comunicacao_id
+        JOIN confirmacao c ON c.id = cm.confirmacao_id
+        WHERE l.id = $1`,
+        [loteId],
+      );
+      expect(aposReceipt.rows[0]).toEqual({
+        lote: "ATIVO",
+        item: "ENVIADO",
+        confirmacao: "PENDING",
+      });
+
+      const consumida = await ownership.consumePending({
+        confirmationId,
+        tokenHash,
+        usedAt: agora,
+        decision: "CONFIRMAR",
+      });
+      expect(consumida?.status).toBe("SUBMITTED");
+
+      const decidido = snapshotPf();
+      const resultado = await repository.registrarResultadoConfirmacao({
+        confirmationId,
+        professionalId: profissionalId,
+        snapshotCifrado: caixa.seal(JSON.stringify(decidido), "snapshot:original"),
+        snapshotDecidido: decidido as unknown as Record<string, unknown>,
+        decisao: "CONFIRMAR",
+        fonte: "CONFIRMACAO_WEB",
+        occurredAt: agora,
+      });
+      expect(resultado.status).toBe("APTO_PREPOSTAGEM");
+
+      const estado = await pool.query<{
+        lote: string;
+        item: string;
+        profissional: string;
+        confirmacao: string;
+        comunicacao: string;
+        outbox: string;
+      }>(
+        `SELECT
+          l.status AS lote,
+          i.status AS item,
+          p.status AS profissional,
+          c.status AS confirmacao,
+          cm.status AS comunicacao,
+          o.status AS outbox
+        FROM lote_comunicacao l
+        JOIN item_lote_comunicacao i ON i.lote_comunicacao_id = l.id
+        JOIN profissional p ON p.id = i.profissional_id
+        JOIN comunicacao cm ON cm.id = i.comunicacao_id
+        JOIN confirmacao c ON c.id = cm.confirmacao_id
+        JOIN outbox_email o ON o.comunicacao_id = cm.id
+        WHERE l.id = $1`,
+        [loteId],
+      );
+      expect(estado.rows[0]).toEqual({
+        lote: "CONCLUIDO",
+        item: "CONCLUIDO",
+        profissional: "APTO_PREPOSTAGEM",
+        confirmacao: "SUBMITTED",
+        comunicacao: "ACCEPTED",
+        outbox: "SENT",
+      });
+
+      const auditoria = await pool.query<{ total: string }>(
+        `SELECT count(*)::text AS total
+        FROM evento_auditoria
+        WHERE agregado_id = $1 AND tipo = 'PF_LOTE_COMUNICACAO_CONCLUIDO'`,
+        [loteId],
+      );
+      expect(auditoria.rows[0]?.total).toBe("1");
     } finally {
       await pool.close();
     }

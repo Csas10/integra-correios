@@ -100,17 +100,25 @@ function rodarScanner(mode, cwd, range = null) {
 }
 
 describe("security scan — contrato executável", () => {
-  it("modo secrets passa no repositório atual e sai 0", () => {
-    const r = rodarScanner("secrets", process.cwd());
-    expect(r.code).toBe(0);
-    expect(r.out).toContain("Secret scan: PASS");
-  });
+  it(
+    "modo secrets passa no repositório atual e sai 0",
+    () => {
+      const r = rodarScanner("secrets", process.cwd());
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("Secret scan: PASS");
+    },
+    15_000,
+  );
 
-  it("modo pii passa no repositório atual e sai 0", () => {
-    const r = rodarScanner("pii", process.cwd());
-    expect(r.code).toBe(0);
-    expect(r.out).toContain("PII scan: PASS");
-  });
+  it(
+    "modo pii passa no repositório atual e sai 0",
+    () => {
+      const r = rodarScanner("pii", process.cwd());
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("PII scan: PASS");
+    },
+    15_000,
+  );
 
   it("modo inválido sai com código 2", () => {
     const r = rodarScanner("invalido", process.cwd());

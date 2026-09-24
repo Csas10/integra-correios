@@ -5,6 +5,13 @@
     "outDir": "dist",
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
-  "references": [{ "path": "../../packages/domain" }],
+  "references": [
+    { "path": "../../packages/domain" },
+    { "path": "../../packages/importers" },
+    { "path": "../../packages/mail" },
+    { "path": "../../packages/persistence" },
+    { "path": "../../packages/pf-workflow" },
+    { "path": "../worker" }
+  ],
   "include": ["src/**/*.ts"]
 }

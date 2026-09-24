@@ -23,6 +23,8 @@ export const CAMPOS_TODOS = [
   "CIDADE",
   "UF",
   "TELEFONE",
+  "CELULAR",
+  "ENDERECO_COMPOSTO",
   "EMAIL",
 ] as const;
 
@@ -30,14 +32,17 @@ export type Campo = (typeof CAMPOS_TODOS)[number];
 
 /**
  * Obrigatoriedade distinta por origem.
- * - PF: campos do workflow de confirmação cadastral (pf-workflow).
- * - PJ: razão social e fantasia, sem dependentes do fluxo PF.
- * ORIGEM é sempre obrigatória (segregação de identidade).
+ * - PF: a origem é definida pelo fluxo de ingestão (endpoint PF), porque a
+ *   planilha institucional CRT não possui coluna ORIGEM. Exigir uma coluna
+ *   inexistente obrigava o operador a criar um mapping semanticamente falso.
+ *   CODIGO e ENDERECO_COMPOSTO são opcionais: o primeiro recebe o UUID
+ *   interno na persistência e o segundo pode ser composto de campos individuais.
+ * - PJ: mantém o contrato legado com ORIGEM explícita nesta etapa.
  */
 export const CAMPOS_OBRIGATORIOS: Readonly<
   Record<OrigemMapeamento, readonly Campo[]>
 > = {
-  PF: ["ORIGEM", "CODIGO", "NOME", "CPF_CNPJ", "CEP", "LOGRADOURO", "CIDADE", "UF", "TELEFONE"],
+  PF: ["NOME", "CPF_CNPJ", "TELEFONE"],
   PJ: ["ORIGEM", "CODIGO", "NOME", "NOME_FANTASIA", "CPF_CNPJ", "CEP", "LOGRADOURO", "CIDADE", "UF"],
 };
 
@@ -47,15 +52,17 @@ const ALIASES: Readonly<Record<Campo, readonly string[]>> = {
   CODIGO: ["CODIGO", "ID", "COD", "CODIGO INTERNO"],
   NOME: ["NOME", "NOME COMPLETO", "RAZAO SOCIAL", "NOME RAZAO SOCIAL"],
   NOME_FANTASIA: ["NOME FANTASIA", "FANTASIA"],
-  CPF_CNPJ: ["CPF CNPJ", "CPFCNPJ", "DOCUMENTO", "CPF/CNPJ"],
+  CPF_CNPJ: ["CPF", "CPF CNPJ", "CPFCNPJ", "DOCUMENTO", "CPF/CNPJ", "REGISTRO NACIONAL"],
   CEP: ["CEP", "CEP RESIDENCIAL", "CEP DO ENDERECO"],
-  LOGRADOURO: ["LOGRADOURO", "ENDERECO", "RUA"],
+  LOGRADOURO: ["LOGRADOURO", "RUA"],
   NUMERO: ["NUMERO", "NUM", "N"],
   COMPLEMENTO: ["COMPLEMENTO", "COMPL"],
   BAIRRO: ["BAIRRO"],
   CIDADE: ["CIDADE", "MUNICIPIO"],
   UF: ["UF", "ESTADO", "UNIDADE FEDERATIVA"],
-  TELEFONE: ["TELEFONE", "TEL", "CELULAR", "FONE"],
+  TELEFONE: ["TELEFONE", "TEL", "FONE"],
+  CELULAR: ["CELULAR", "WHATSAPP", "CEL"],
+  ENDERECO_COMPOSTO: ["ENDERECO", "ENDERECO COMPLETO", "LOGRADOURO COMPLETO"],
   EMAIL: ["EMAIL", "E-MAIL", "CORREIO ELETRONICO"],
 };
 
@@ -105,6 +112,18 @@ export interface ItemMapeamento {
 /** Mapeamento confirmado pelo operador (nada é aplicado sem confirmação). */
 export interface Mapeamento {
   readonly itens: readonly ItemMapeamento[];
+}
+
+/**
+ * Erro de contrato de mapping. Os detalhes contêm somente nomes de campos e
+ * índices de coluna — nunca valores das linhas/PII — e podem ser retornados
+ * ao operador para corrigir o mapping sem transformar todo erro em 422 opaco.
+ */
+export class MapeamentoInvalidoError extends Error {
+  constructor(readonly erros: readonly string[]) {
+    super(`Mapeamento inválido: ${erros.join(" ")}`);
+    this.name = "MapeamentoInvalidoError";
+  }
 }
 
 /** Marca privada: somente confirmarMapeamento pode criar este contrato. */
@@ -161,6 +180,15 @@ export function validarMapeamento(
 /**
  * Fronteira explícita da confirmação do operador. Valida e congela uma cópia
  * do mapeamento; aplicarMapeamento não aceita o contrato estrutural comum.
+ *
+ * Fluxo institucional PF (base real CRT): a origem PF vem do próprio fluxo,
+ * e a base possui ENDERECO composto (sem CEP/UF/logradouro decompostos).
+ * Portanto os obrigatórios no arquivo são NOME/CPF/TELEFONE. CODIGO pode
+ * faltar (o UUID interno vira o código operacional) e ENDERECO_COMPOSTO pode
+ * faltar quando não há endereço composto na fonte; campos individuais podem
+ * ser compostos pelo intake. O parsing assistido sugere a decomposição
+ * depois, sempre com endereco_origem preservado e revisão do operador quando
+ * ambíguo.
  */
 export function confirmarMapeamento(
   mapeamento: Mapeamento,
@@ -169,7 +197,7 @@ export function confirmarMapeamento(
 ): MapeamentoConfirmado {
   const erros = validarMapeamento(mapeamento, totalColunas, origem);
   if (erros.length > 0) {
-    throw new Error(`Mapeamento inválido: ${erros.join(" ")}`);
+    throw new MapeamentoInvalidoError(erros);
   }
   const itens = Object.freeze(
     mapeamento.itens.map((item) => Object.freeze({ ...item })),
@@ -281,8 +309,9 @@ export interface ResultadoValidacaoPfPj {
 
 /**
  * Validação PF/PJ das linhas mapeadas.
- * - ORIGEM deve ser PF ou PJ e corresponder à origem do fluxo.
- * - CEP deve ter 8 dígitos (hífen tolerado).
+ * - ORIGEM, quando presente no fluxo PF, deve ser PF; no fluxo PJ permanece
+ *   obrigatória.
+ * - CEP deve ter 8 dígitos quando o endereço for informado (hífen tolerado).
  * - CPF (PF) e CNPJ (PJ) têm validadores distintos.
  */
 export function validarLinhasPfPj(
@@ -299,14 +328,27 @@ export function validarLinhasPfPj(
     }
 
     const valorOrigem = (linha.valores.ORIGEM ?? "").trim().toUpperCase();
-    if (valorOrigem !== origem) {
+    if ((origem === "PJ" && valorOrigem !== origem) || (origem === "PF" && valorOrigem && valorOrigem !== origem)) {
       erros.push(
         `ORIGEM inválida: "${linha.valores.ORIGEM ?? ""}" (esperado ${origem} para este fluxo).`,
       );
     }
 
+    const enderecoInformado = [
+      "ENDERECO_COMPOSTO",
+      "CEP",
+      "LOGRADOURO",
+      "NUMERO",
+      "COMPLEMENTO",
+      "BAIRRO",
+      "CIDADE",
+      "UF",
+    ].some((campo) => Boolean(linha.valores[campo as Campo]?.trim()));
     const cep = (linha.valores.CEP ?? "").replace(/\D/g, "");
-    if (cep.length !== 8) {
+    if (
+      (origem === "PJ" && cep.length !== 8) ||
+      (origem === "PF" && enderecoInformado && cep.length > 0 && cep.length !== 8)
+    ) {
       erros.push(`CEP inválido: "${linha.valores.CEP ?? ""}" (esperado 8 dígitos).`);
     }
 
@@ -324,7 +366,7 @@ export function validarLinhasPfPj(
       erros.push(`CNPJ inválido: "${linha.valores.CPF_CNPJ ?? ""}".`);
     }
 
-    if (!(linha.valores.CODIGO ?? "").trim()) {
+    if (origem === "PJ" && !(linha.valores.CODIGO ?? "").trim()) {
       erros.push("CODIGO vazio.");
     }
 

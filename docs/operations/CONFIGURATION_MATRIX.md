@@ -1,0 +1,79 @@
+# CONFIGURATION_MATRIX — Fase B (PF Gmail Pilot)
+
+Inventário exato de toda a configuração usada pela vertical slice, verificado no
+código (nomes reais, nada hipotético). Nenhum valor real no Git.
+
+| NAME | OWNER | PURPOSE | REQUIRED_WHEN | SOURCE | SENSITIVE | DEFAULT_ALLOWED | CURRENT_STATUS |
+|---|---|---|---|---|---|---|---|
+| `DATABASE_URL` | Titular/ambiente | Conexão PostgreSQL 16 do estado operacional | API persistente, worker run-once, DRY_RUN | ENVIRONMENT | SIM (DSN) | NÃO | BLOCKED_EXTERNAL no Preview; provisionado na CI de teste |
+| `DATA_ENCRYPTION_KEY_BASE64` | Titular/ambiente | Chave AES-256-GCM de dados recuperáveis (CPF, snapshots, outbox) | Persistência, cockpit, worker | ENVIRONMENT | SIM | NÃO | BLOCKED_EXTERNAL no Preview |
+| `DATA_ENCRYPTION_KEY_VERSION` | Titular/ambiente | Versão da chave (rotação, envelope autenticado) | Persistência | ENVIRONMENT | NÃO | SIM (`v1`) | Default aplicado |
+| `DOCUMENT_FINGERPRINT_KEY_BASE64` | Titular/ambiente | Chave HMAC-SHA-256 de dedup por documento/e-mail | Importação, lote | ENVIRONMENT | SIM | NÃO | BLOCKED_EXTERNAL no Preview |
+| `CONFIRMATION_BASE_URL` | Titular/ambiente | Base das URLs de confirmação no e-mail | Lote/preview | ENVIRONMENT | NÃO | SIM (`https://preview.exemplo.test` em preview) | Default seguro de preview |
+| `PORT` | Plataforma | Porta de escuta da API (0.0.0.0) | API | ENVIRONMENT | NÃO | SIM (`8787`) | OK |
+| `PILOT_MODE` | Operação (env do processo) | Liga a execução controlada do worker run-once | Worker run-once | ENVIRONMENT | NÃO | SIM (`false`) | DISABLED por padrão (fail-closed) |
+| `OPERATOR_TOKEN` | Operação (env do processo) | Bearer token das rotas OPERATOR_ROUTE (F10) | Todas as rotas operacionais no Preview | ENVIRONMENT | SIM | NÃO | Fail-closed: sem valor, NENHUMA rota operacional responde (401) |
+| `VITE_API_BASE` | Plataforma/build do web | Base da API para o browser (opcional) | Preview/somente se API em outra origem | APPLICATION (build-time) | NÃO | SIM (mesma origem) | Default = mesma origem via adapter serverless `/api/*` — localhost NUNCA é usado no Preview |
+| `PILOT_MAX_RECIPIENTS` | Operação (env do processo) | Hard cap server-side do piloto (1–100) | Preview, prepare, activate | ENVIRONMENT | NÃO | SIM (`5`) | OK, aplicado em 4 camadas |
+| `REAL_SEND_ENABLED` | Operação (env do processo) | GATE 1 do envio externo (Gmail real) | Worker LIVE_PILOT | ENVIRONMENT | NÃO | SIM (`false`) | DISABLED — envio real proibido nesta fase |
+| `MAIL_PROVIDER` | Operação (env do processo) | Seleção do gateway real (`gmail`) | LIVE_PILOT | ENVIRONMENT | NÃO | SIM (ausente = Disabled) | OK |
+| `GMAIL_OAUTH_CLIENT_ID` | Titular (Google Cloud) | OAuth client do envio institucional | LIVE_PILOT | EXTERNAL_SECRET | SIM | NÃO | CONFIGURATION_REQUIRED |
+| `GMAIL_OAUTH_CLIENT_SECRET` | Titular (Google Cloud) | OAuth client secret (somente server-side) | LIVE_PILOT | EXTERNAL_SECRET | SIM | NÃO | CONFIGURATION_REQUIRED |
+| `GMAIL_OAUTH_REDIRECT_URI` | Titular (Google Cloud) | Redirect URI do OAuth (gmail.send) | LIVE_PILOT | EXTERNAL_SECRET | NÃO (URL) | NÃO | CONFIGURATION_REQUIRED |
+| `GMAIL_OAUTH_STATE_KEY` | Titular/ambiente | Chave HMAC do state OAuth (CSRF assinado, ≥32 bytes) | OAuth start/callback | ENVIRONMENT | SIM | NÃO | CONFIGURATION_REQUIRED |
+| `GMAIL_EXPECTED_ACCOUNT` | Operação (env do processo) | Conta Google institucional autorizada (F14; comparada exatamente à identidade OIDC com `email_verified`) | OAuth start e callback (fail-closed sem ela) | ENVIRONMENT | NÃO | NÃO | CONFIGURATION_REQUIRED — sem ela NENHUMA conexão é aceita |
+| `GMAIL_ACCOUNT_FINGERPRINT` | Derivado | HMAC da CONTA Google VERIFICADA para `oauth_connection` (não do clientId) | Conexão OAuth, worker, refresh | DERIVED (identidade OIDC + chave HMAC) | NÃO (fingerprint) | NÃO | DERIVED |
+| Binding OAuth (cookie `ic_oauth_binding` + tabela `oauth_flow`) | Aplicação | Binding one-time start↔callback (nonce HttpOnly; hash SHA-256 persistido em PostgreSQL; F13/F18) | Sempre (emitido pelo START autenticado) | APPLICATION | NÃO (nonce opaco; banco recebe só o hash) | NÃO | IMPLEMENTADO (consumo atômico one-time entre instâncias; replay/expiração FAIL) |
+| Sessão operacional (cookie `ic_operator_session` stateless) | Aplicação | Sessão STATELESS assinada (HMAC-SHA256 derivado do `OPERATOR_TOKEN` via HKDF; F16): payload `version.issuedAt.expiresAt.nonce.signature` | Rotas operacionais no Preview | APPLICATION (DERIVED do OPERATOR_TOKEN) | NÃO (assinatura; token NUNCA vai ao cookie/browser) | NÃO | IMPLEMENTADO (8h; rotação do token invalida sessões; sem memória de processo — serverless-safe) |
+| Mapping (colunas → campos) | Operador (UI) | Confirmar mapping assistido do XLSX | Importação | APPLICATION (contrato versionado) | NÃO | NÃO | IMPLEMENTADO |
+| `PPN_ENABLED` | — | Motor PPN/Correios | (fora do escopo desta fase) | HUMAN_DECISION | NÃO | SIM (`false`) | DISABLED deliberadamente |
+| Liberação do lote (PREPARACAO → ATIVO) | Operador humano | GATE 2: elegibilidade da outbox | Envio (DRY_RUN também exige ATIVO) | HUMAN_DECISION + auditoria | NÃO | NÃO | IMPLEMENTADO (`/api/pilot/activate`) |
+| Encerramento do lote (ATIVO → CONCLUIDO) | Aplicação, após confirmação | Libera a reserva do profissional e encerra o ciclo da comunicação | Confirmação consumida e comunicação ACCEPTED/DELIVERED | APPLICATION + auditoria | NÃO | NÃO | IMPLEMENTADO de forma transacional |
+
+## Regras aplicadas
+
+- **SOURCE = EXTERNAL_SECRET**: nunca inventado, nunca contornado; o código fica
+  pronto e o estado vira `CONFIGURATION_REQUIRED`/`BLOCKED_EXTERNAL` no
+  readiness até o titular configurar.
+- **SOURCE = ENVIRONMENT**: lido apenas server-side (`process.env` do processo);
+  o browser nunca define parâmetro efetivo.
+- **Default allowed**: somente parâmetros não sensíveis e fail-closed.
+- `REAL_SEND_ENABLED` e `PILOT_MODE` são GATES, não features: defaults fechados.
+
+## Lista objetiva para o DRY_RUN no Preview (BLOCKED_EXTERNAL)
+
+Para executar o DRY_RUN no Preview, o titular deve configurar **exatamente**:
+
+1. `DATABASE_URL` — PostgreSQL 16 acessível pelo serviço;
+2. `DATA_ENCRYPTION_KEY_BASE64` — chave AES-256-GCM (32 bytes, base64);
+3. `DOCUMENT_FINGERPRINT_KEY_BASE64` — chave HMAC-SHA-256 (32 bytes, base64);
+4. `DATA_ENCRYPTION_KEY_VERSION` — rótulo da versão (ex.: `v1`);
+5. `PILOT_MODE=true` — habilita o worker run-once no ambiente;
+6. `OPERATOR_TOKEN` — habilita as rotas operacionais (F10; a rota pública de
+   confirmação `/api/confirmation` não depende dele). A UI autentica via
+   `POST /api/operator/session`, que emite sessão STATELESS assinada (F16:
+   HMAC derivado do próprio token; rotação do token invalida sessões
+   anteriores) e a restaura via `GET /api/operator/session` (F17); Bearer
+   direto permanece para CLI/admin.
+
+Para o LIVE_PILOT acrescentam-se: `GMAIL_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI`,
+`GMAIL_OAUTH_STATE_KEY` (≥32 bytes) e `GMAIL_EXPECTED_ACCOUNT`
+(= carteiras@crtba.org.br) — sem a conta esperada, nenhuma conexão OAuth é
+aceita (F14, fail-closed). O binding one-time do fluxo OAuth é persistido em
+PostgreSQL (tabela `oauth_flow`, migration 0004; F18) — serverless-safe.
+`.env.example` com placeholders vazios deve ser atualizado pelo titular
+(edição bloqueada por política no ambiente atual).
+
+Não é necessário nenhum segredo do Google para o DRY_RUN (o gateway é
+sintético). Para o LIVE_PILOT, adicionam-se as credenciais OAuth do titular
+(`GMAIL_OAUTH_*`) e a decisão humana de liberação do lote + `REAL_SEND_ENABLED`.
+
+## Encerramento do ciclo
+
+O receipt do worker não encerra o lote sozinho: ele deixa a comunicação
+`ACCEPTED`, a outbox `SENT` e o item `ENVIADO`. A confirmação do profissional
+consome o token uma única vez e, na mesma transação do snapshot e da auditoria,
+promove o item para `CONCLUIDO`. Quando não restam itens não terminais
+(`CONCLUIDO` ou `CANCELADO`), o lote é promovido de `ATIVO` para `CONCLUIDO`.
+Até essa confirmação, o índice parcial de reserva mantém o profissional
+impedido de entrar em outro lote ativo.

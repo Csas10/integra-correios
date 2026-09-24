@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Aes256GcmSecretBox } from "../src/crypto.js";
 import { NodePostgresPool } from "../src/driver.js";
 import { PostgresOperationalRepository } from "../src/postgres.js";
@@ -128,6 +128,96 @@ d("round-trip OAuth em PostgreSQL real (sintético)", () => {
         }),
       ).rejects.toThrow("Conflito entre identidade OAuth e fingerprint");
 
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("F18 — binding OAuth one-time: consumo atômico, replay, expiração e corrida", async () => {
+    const pool = new NodePostgresPool({
+      connectionString: process.env.DATABASE_URL!,
+    });
+    try {
+      const repository = new PostgresOperationalRepository(pool);
+      const agoraIso = new Date().toISOString();
+      const futuro = new Date(Date.now() + 60_000).toISOString();
+      const nonce = randomUUID();
+      const nonceHash = createHash("sha256").update(nonce).digest("hex");
+      const operadorHash = createHash("sha256").update("operador-pg").digest("hex");
+      const verifierSealed = {
+        ciphertext: new Uint8Array([1, 2, 3]),
+        nonce: new Uint8Array([4, 5, 6]),
+        authTag: new Uint8Array([7, 8, 9]),
+        keyVersion: "v1",
+      };
+
+      await repository.registrarBindingOauthFlow({
+        nonceHash,
+        codeVerifier: verifierSealed,
+        operadorHash,
+        expiresAt: futuro,
+      });
+
+      // Primeira tentativa vence; segunda é replay.
+      await expect(
+        repository.consumirBindingOauthFlow({ nonceHash, operadorHash, now: agoraIso }),
+      ).resolves.toMatchObject({ status: "CONSUMED" });
+      await expect(
+        repository.consumirBindingOauthFlow({ nonceHash, operadorHash, now: agoraIso }),
+      ).resolves.toMatchObject({ status: "REPLAY" });
+
+      // Binding expirado (registrado no passado) → EXPIRED.
+      const expiradoHash = createHash("sha256").update(`${nonce}-expirado`).digest("hex");
+      await repository.registrarBindingOauthFlow({
+        nonceHash: expiradoHash,
+        codeVerifier: verifierSealed,
+        operadorHash,
+        expiresAt: new Date(Date.now() - 1_000).toISOString(),
+      });
+      await expect(
+        repository.consumirBindingOauthFlow({ nonceHash: expiradoHash, operadorHash, now: agoraIso }),
+      ).resolves.toMatchObject({ status: "EXPIRED" });
+
+      // Nonce nunca registrado → MISSING.
+      await expect(
+        repository.consumirBindingOauthFlow({
+          nonceHash: createHash("sha256").update(`${nonce}-fantasma`).digest("hex"),
+          operadorHash,
+          now: agoraIso,
+        }),
+      ).resolves.toMatchObject({ status: "MISSING" });
+
+      // Sessão divergente (operador diferente do START) → SESSION_MISMATCH.
+      const sessaoHash = createHash("sha256").update(`${nonce}-sessao`).digest("hex");
+      await repository.registrarBindingOauthFlow({
+        nonceHash: sessaoHash,
+        codeVerifier: verifierSealed,
+        operadorHash,
+        expiresAt: futuro,
+      });
+      await expect(
+        repository.consumirBindingOauthFlow({
+          nonceHash: sessaoHash,
+          operadorHash: createHash("sha256").update("outro-operador").digest("hex"),
+          now: agoraIso,
+        }),
+      ).resolves.toMatchObject({ status: "SESSION_MISMATCH" });
+
+      // Corrida: 8 consumos concorrentes do MESMO binding → exatamente 1 sucesso.
+      const corridaHash = createHash("sha256").update(`${nonce}-corrida`).digest("hex");
+      await repository.registrarBindingOauthFlow({
+        nonceHash: corridaHash,
+        codeVerifier: verifierSealed,
+        operadorHash,
+        expiresAt: futuro,
+      });
+      const resultados = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          repository.consumirBindingOauthFlow({ nonceHash: corridaHash, operadorHash, now: agoraIso }),
+        ),
+      );
+      expect(resultados.filter((r) => r.status === "CONSUMED")).toHaveLength(1);
+      expect(resultados.filter((r) => r.status === "REPLAY")).toHaveLength(7);
     } finally {
       await pool.close();
     }

@@ -31,6 +31,7 @@ const CABECALHOS = [
   "UF",
   "Telefone",
   "Fantasia",
+  "Endereço",
 ];
 
 const LINHAS = [
@@ -54,6 +55,7 @@ const MAPEAMENTO_PADRAO: Mapeamento = {
     { campo: "UF", coluna: 7 },
     { campo: "TELEFONE", coluna: 8 },
     { campo: "NOME_FANTASIA", coluna: 9 },
+    { campo: "ENDERECO_COMPOSTO", coluna: 10 },
   ],
 };
 
@@ -313,7 +315,23 @@ describe("sugestão e confirmação de mapeamento", () => {
 
   it("mapeamento sem obrigatórios de PF é rejeitado na origem PF", () => {
     const erros = validarMapeamento({ itens: [{ campo: "NOME", coluna: 0 }] }, 9, "PF");
-    expect(erros.some((e) => e.includes("PF") && e.includes("ORIGEM"))).toBe(true);
+    expect(erros.some((e) => e.includes("PF") && e.includes("CPF_CNPJ"))).toBe(true);
+    expect(erros.some((e) => e.includes("TELEFONE"))).toBe(true);
+    expect(erros.some((e) => e.includes("CODIGO"))).toBe(false);
+    expect(erros.some((e) => e.includes("ENDERECO_COMPOSTO"))).toBe(false);
+    expect(erros.some((e) => e.includes("ORIGEM"))).toBe(false);
+  });
+
+  it("PF aceita mapping sem CODIGO e ENDERECO_COMPOSTO", () => {
+    const mapeamento: Mapeamento = {
+      itens: [
+        { campo: "NOME", coluna: 0 },
+        { campo: "CPF_CNPJ", coluna: 1 },
+        { campo: "TELEFONE", coluna: 2 },
+      ],
+    };
+    expect(validarMapeamento(mapeamento, 3, "PF")).toEqual([]);
+    expect(() => confirmarMapeamento(mapeamento, 3, "PF")).not.toThrow();
   });
 
   it("obrigatoriedade é DISTINTA por origem (PF exige TELEFONE, PJ não)", () => {
@@ -321,9 +339,9 @@ describe("sugestão e confirmação de mapeamento", () => {
       itens: MAPEAMENTO_PADRAO.itens.filter((i) => i.campo !== "TELEFONE"),
     };
     // PJ: sem TELEFONE mapeado → válido (obrigatórios PJ satisfeitos).
-    expect(validarMapeamento(semTelefone, 10, "PJ")).toEqual([]);
+    expect(validarMapeamento(semTelefone, CABECALHOS.length, "PJ")).toEqual([]);
     // PF: sem TELEFONE mapeado → erro específico.
-    const errosPf = validarMapeamento(semTelefone, 10, "PF");
+    const errosPf = validarMapeamento(semTelefone, CABECALHOS.length, "PF");
     expect(errosPf.some((e) => e.includes("TELEFONE"))).toBe(true);
   });
 
@@ -331,9 +349,9 @@ describe("sugestão e confirmação de mapeamento", () => {
     const semFantasia: Mapeamento = {
       itens: MAPEAMENTO_PADRAO.itens.filter((i) => i.campo !== "NOME_FANTASIA"),
     };
-    const errosPj = validarMapeamento(semFantasia, 9, "PJ");
+    const errosPj = validarMapeamento(semFantasia, CABECALHOS.length, "PJ");
     expect(errosPj.some((e) => e.includes("NOME_FANTASIA"))).toBe(true);
-    expect(validarMapeamento(semFantasia, 9, "PF")).toEqual([]);
+    expect(validarMapeamento(semFantasia, CABECALHOS.length, "PF")).toEqual([]);
   });
 
   it("coluna duplicada no mapeamento é rejeitada", () => {
@@ -371,7 +389,7 @@ describe("sugestão e confirmação de mapeamento", () => {
     expect(() => aplicarMapeamento(
       { nome: "f", linhaCabecalho: 1, cabecalhos: CABECALHOS.slice(0, -1), linhas: [] },
       confirmado,
-    )).toThrow(/confirmado para 10 colunas/);
+    )    ).toThrow(/confirmado para 11 colunas/);
   });
 });
 

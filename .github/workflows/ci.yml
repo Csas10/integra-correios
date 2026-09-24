@@ -64,6 +64,9 @@ jobs:
           SECURITY_SCAN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: npm run security:pii
 
+      - name: Production dependency audit
+        run: npm audit --omit=dev
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -72,6 +75,15 @@ jobs:
 
       - name: PostgreSQL runtime roles migration
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0002_runtime_roles.sql
+
+      - name: PostgreSQL batch mode migration (DRY_RUN/LIVE_PILOT)
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0003_batch_mode_dry_run.sql
+
+      - name: PostgreSQL OAuth binding migration (F18 — one-time cross-instance)
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0004_oauth_flow.sql
+
+      - name: PostgreSQL OAuth PKCE + communication source migration (closure gate)
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0005_oauth_flow_pkce.sql
 
       - name: PostgreSQL runtime role fail-closed regressions
         shell: bash
@@ -103,11 +115,11 @@ jobs:
       - name: PostgreSQL runtime roles
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/tests/0002_runtime_roles.test.sql
 
-      - name: Build
-        run: npm run build
+      - name: Build Vercel application and backend runtime
+        run: npm run build:vercel
 
-      - name: Build web application
-        run: npm run build:web
+      - name: Verify Vercel serverless runtime contract
+        run: npm run verify:vercel-runtime
 
       - name: Git whitespace check
         # Vendor de terceiros (SheetJS) preserva o whitespace original do

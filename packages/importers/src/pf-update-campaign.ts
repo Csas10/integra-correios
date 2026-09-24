@@ -81,7 +81,14 @@ export function emailCampanhaValido(value: string): boolean {
   if (!local || !domain || local.length > 64) return false;
   if (local.startsWith(".") || local.endsWith(".") || local.includes("..")) return false;
   if (!domain.includes(".") || domain.startsWith(".") || domain.endsWith(".")) return false;
-  if (domain.split(".").some((label) => !label || label.startsWith("-") || label.endsWith("-"))) {
+  if (
+    domain.split(".").some((label) =>
+      !label ||
+      Buffer.byteLength(label, "utf8") > 63 ||
+      label.startsWith("-") ||
+      label.endsWith("-")
+    )
+  ) {
     return false;
   }
   return /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(local) &&

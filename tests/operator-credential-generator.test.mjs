@@ -1,12 +1,25 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
+import {
+  CredentialArtifactSecurityError,
+  generateCredentialMaterial,
+  writeCredentialArtifact,
+} from "../scripts/operator-credential-lib.mjs";
+
+const itPosix = process.platform === "win32" ? it.skip : it;
+const itWindows = process.platform === "win32" ? it : it.skip;
 
 describe("gerador controlado de credencial operacional", () => {
-  it("gera 256 bits, grava 0600, não imprime segredo e não sobrescreve artefato", () => {
+  itPosix("gera 256 bits, confirma 0600, não imprime segredo e não sobrescreve artefato", () => {
     const dir = mkdtempSync(join(tmpdir(), "integra-operator-credential-"));
     const artifactPath = join(dir, "admin.operator-credential.json");
     const scriptPath = resolve("scripts/operator-credential.mjs");
@@ -37,5 +50,30 @@ describe("gerador controlado de credencial operacional", () => {
     );
     expect(second.status).not.toBe(0);
     expect(readFileSync(artifactPath, "utf8")).toBe(original);
+  });
+
+  it("política Windows falha fechado antes de criar arquivo secreto", () => {
+    const dir = mkdtempSync(join(tmpdir(), "integra-operator-win32-"));
+    const artifactPath = join(dir, "blocked.operator-credential.json");
+    const material = generateCredentialMaterial();
+
+    expect(() =>
+      writeCredentialArtifact(artifactPath, material, "win32"),
+    ).toThrow(CredentialArtifactSecurityError);
+    expect(existsSync(artifactPath)).toBe(false);
+  });
+
+  itWindows("CLI real no Windows também falha fechado sem criar artefato", () => {
+    const dir = mkdtempSync(join(tmpdir(), "integra-operator-win32-cli-"));
+    const artifactPath = join(dir, "blocked.operator-credential.json");
+    const result = spawnSync(
+      process.execPath,
+      [resolve("scripts/operator-credential.mjs"), "--out", artifactPath],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("WINDOWS_ACL_UNSUPPORTED");
+    expect(existsSync(artifactPath)).toBe(false);
   });
 });

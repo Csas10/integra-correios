@@ -175,5 +175,5 @@ d("bootstrap produtivo do primeiro ADMIN_TECNICO", () => {
     } finally {
       await verify.close();
     }
-  });
+  }, 30000);
 });

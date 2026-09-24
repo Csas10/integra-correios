@@ -85,6 +85,9 @@ jobs:
       - name: PostgreSQL OAuth PKCE + communication source migration (closure gate)
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0005_oauth_flow_pkce.sql
 
+      - name: PostgreSQL individual operator identity migration
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0006_operator_identity.sql
+
       - name: PostgreSQL runtime role fail-closed regressions
         shell: bash
         run: |
@@ -114,6 +117,9 @@ jobs:
 
       - name: PostgreSQL runtime roles
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/tests/0002_runtime_roles.test.sql
+
+      - name: PostgreSQL individual operator identity constraints
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/tests/0003_operator_identity.test.sql
 
       - name: Build Vercel application and backend runtime
         run: npm run build:vercel

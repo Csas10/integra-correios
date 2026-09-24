@@ -6,13 +6,20 @@ import {
   renderPfUpdateCampaignMail,
 } from "../src/index.js";
 
-function decodeSubject(mime: string): string {
+function encodedSubjectWords(mime: string): string[] {
   const header = mime.split("\r\n").find((line) => line.startsWith("Subject: "));
   if (!header) throw new Error("Subject ausente");
-  const value = header.slice("Subject: ".length);
-  const match = /^=\?UTF-8\?B\?([^?]+)\?=$/.exec(value);
-  if (!match?.[1]) throw new Error("Subject não está em RFC 2047 Base64 UTF-8");
-  return Buffer.from(match[1], "base64").toString("utf8");
+  return header.slice("Subject: ".length).split(/\s+/);
+}
+
+function decodeSubject(mime: string): string {
+  return encodedSubjectWords(mime)
+    .map((word) => {
+      const match = /^=\?UTF-8\?B\?([^?]+)\?=$/.exec(word);
+      if (!match?.[1]) throw new Error("Subject não está em RFC 2047 Base64 UTF-8");
+      return Buffer.from(match[1], "base64").toString("utf8");
+    })
+    .join("");
 }
 
 describe("Campanha PF — template de atualização cadastral", () => {
@@ -49,9 +56,12 @@ describe("Campanha PF — template de atualização cadastral", () => {
     expect(message.htmlBody).not.toContain("<script");
   });
 
-  it("MIME codifica Subject em RFC 2047 e decodifica exatamente para UTF-8", () => {
+  it("MIME divide Subject UTF-8 em encoded-words RFC 2047 de até 75 caracteres", () => {
     const mime = composeMimeMessage(message);
-    expect(mime).toMatch(/^Subject: =\?UTF-8\?B\?/m);
+    const words = encodedSubjectWords(mime);
+    expect(words.length).toBeGreaterThan(1);
+    expect(words.every((word) => word.length <= 75)).toBe(true);
+    expect(words.every((word) => /^=\?UTF-8\?B\?[^?]+\?=$/.test(word))).toBe(true);
     expect(decodeSubject(mime)).toBe(PF_UPDATE_CAMPAIGN_SUBJECT);
     expect(mime).toContain("Content-Type: text/plain; charset=UTF-8");
     expect(mime).toContain("Content-Type: text/html; charset=UTF-8");

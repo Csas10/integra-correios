@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import * as XLSX from "xlsx";
 import {
   AvaliacaoInvalidaError,
@@ -14,7 +14,24 @@ import {
   carregarPoliticaCampanhaAtualizacao,
   hashAprovacaoCampanha,
 } from "../src/campaigns.js";
-import { despachar } from "../src/server.js";
+import { despachar as despacharSemBanco } from "../src/server.js";
+
+// O pool de PostgreSQL é criado UMA única vez dentro do módulo do servidor
+// (requireDb cacheia em escopo de módulo). O beforeAll do arquivo remove
+// DATABASE_URL para os testes fail-closed; se o servidor já materializou o
+// pool nesse estado, o pool ficaria envenenado (connectionString undefined).
+// O bloco DB-gated recarrega o módulo DEPOIS de restaurar DATABASE_URL e
+// este proxy seleciona a instância ativa a cada chamada.
+type Despachar = typeof despacharSemBanco;
+let despacharAtivo: Despachar = despacharSemBanco;
+
+async function despachar(
+  metodo: string,
+  caminho: string,
+  opcoes: { headers?: Record<string, string | undefined>; corpo?: Buffer } = {},
+): ReturnType<Despachar> {
+  return despacharAtivo(metodo, caminho, opcoes);
+}
 
 // ---------------------------------------------------------------------------
 // Ambiente: os testes HTTP sem banco exigem DATABASE_URL ausente (fail-closed
@@ -475,10 +492,15 @@ describeDb("CAMPAIGN_READ_ROUTES — papéis, contratos HTTP e zero-escrita (Pos
     return { operatorId, cookie: firstCookie(login.headers["set-cookie"]) };
   }
 
-  beforeAll(() => {
+  beforeAll(async () => {
     // O bloco DB-gated restaura o ambiente capturado (beforeAll do arquivo
-    // removeu DATABASE_URL para os testes fail-closed sem banco).
+    // removeu DATABASE_URL para os testes fail-closed sem banco) e RECARREGA
+    // o módulo do servidor: requireDb cacheia o pool em escopo de módulo e o
+    // pool criado sem DATABASE_URL não pode ser reaproveitado com banco.
     process.env.DATABASE_URL = DB_URL_AMBIENTE;
+    vi.resetModules();
+    const servidor = await import("../src/server.js");
+    despacharAtivo = servidor.despachar;
   });
 
   it("matriz de papéis: PREPARADOR opera etapas 3–5, APROVADOR só autoriza, EXECUTOR nada aqui", async () => {

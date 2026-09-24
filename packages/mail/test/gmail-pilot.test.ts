@@ -227,6 +227,23 @@ describe("Transporte Gmail real — MIME e messages.send (sem rede)", () => {
     expect(mime).toMatch(/^Subject: =\?UTF-8\?B\?/m);
   });
 
+  it("encoded-words do compositor compartilhado respeitam 75 caracteres e fronteiras UTF-8", () => {
+    const subject = "Confirmação dos dados para envio da Carteira Profissional — atualização cadastral ✓";
+    const mime = composeMimeMessage({ ...mensagem, subject });
+    const header = mime.split("\r\n").find((line) => line.startsWith("Subject: "));
+    expect(header).toBeDefined();
+    const words = (header ?? "").slice("Subject: ".length).split(/\s+/);
+    expect(words.length).toBeGreaterThan(1);
+    expect(words.every((word) => word.length <= 75)).toBe(true);
+
+    const decoded = words.map((word) => {
+      const match = /^=\?UTF-8\?B\?([^?]+)\?=$/.exec(word);
+      expect(match?.[1]).toBeDefined();
+      return Buffer.from(match?.[1] ?? "", "base64").toString("utf8");
+    }).join("");
+    expect(decoded).toBe(subject);
+  });
+
   async function comFetchFake(
     implementacao: (url: string, init: RequestInit) => Promise<Response>,
     acao: (transporte: GmailHttpTransport) => Promise<unknown>,

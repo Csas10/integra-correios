@@ -79,6 +79,29 @@ describe("Campanha PF — importação e pré-voo", () => {
     expect(report.registros[2]?.motivo_bloqueio).toContain("IDENTIFICADOR_INSTITUCIONAL_DUPLICADO");
   });
 
+  it("bloqueia local-part com ponto inicial, final ou consecutivo", () => {
+    const report = analisarCampanhaAtualizacaoPf(
+      {
+        sha256: "d".repeat(64),
+        folha: folha(
+          ["REGISTRO", "NOME", "EMAIL"],
+          [
+            ["2001", "Ponto Inicial", ".inicio@example.com"],
+            ["2002", "Ponto Final", "final.@example.com"],
+            ["2003", "Ponto Duplo", "a..b@example.com"],
+            ["2004", "Valido", "a.b@example.com"],
+          ],
+        ),
+      },
+      { colunaIdentificadorInstitucional: "REGISTRO" },
+    );
+
+    expect(report.registros[0]?.motivo_bloqueio).toContain("EMAIL_INVALIDO");
+    expect(report.registros[1]?.motivo_bloqueio).toContain("EMAIL_INVALIDO");
+    expect(report.registros[2]?.motivo_bloqueio).toContain("EMAIL_INVALIDO");
+    expect(report.registros[3]?.status_validacao).toBe("APTO");
+  });
+
   it("não aceita nome ou e-mail como identidade definitiva", () => {
     expect(() =>
       analisarCampanhaAtualizacaoPf(

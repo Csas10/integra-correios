@@ -3,7 +3,7 @@
 Esta branch cria uma superfície operacional nova e independente, preservando
 integralmente o piloto Gmail controlado e o lote `CONTROLLED_GMAIL_TEST`.
 
-## Hard gates
+## Hard gates da campanha
 
 - `PF_CAMPAIGN_ENABLED` nasce desabilitada;
 - `REAL_SEND_ENABLED=false` permanece obrigatório durante a construção;
@@ -11,83 +11,125 @@ integralmente o piloto Gmail controlado e o lote `CONTROLLED_GMAIL_TEST`.
 - nenhum lote de campanha é criado;
 - nenhum worker de campanha é executado;
 - nenhuma chamada ao Gmail é feita;
-- `OPERATOR_TOKEN` não representa identidade humana da campanha;
 - `canPersistImport=false`, `canCreateBatch=false` e `canExecute=false`.
 
-## Importação
+## Importação e comunicação
 
 O importador trabalha sobre a leitura XLSX segura existente. Ele preserva o
 e-mail original, produz `email_normalizado`, exige identificador institucional,
 bloqueia e-mails/identificadores duplicados e nunca usa nome/e-mail como chave
 definitiva.
 
-Estados de pré-voo: `APTO`, `BLOQUEADO` e `EXCLUIDO_DO_LOTE` (este último
-reservado à decisão humana).
-
-## Comunicação
-
-Template: `pf-atualizacao-cadastral-2026-v1`.
-
-Assunto semântico: `Confirmação dos dados para envio da Carteira Profissional`.
-
-O MIME codifica assunto não-ASCII em RFC 2047 Base64 UTF-8 e mantém
-`text/plain; charset=UTF-8` e `text/html; charset=UTF-8`.
-
-A mensagem pede resposta com telefone/WhatsApp, CEP, logradouro, número,
-complemento, bairro, cidade, UF e protocolo não sensível. A rota de confirmação
-existente permanece, mas o template desta campanha não depende dela.
+O template `pf-atualizacao-cadastral-2026-v1` mantém o assunto
+`Confirmação dos dados para envio da Carteira Profissional` codificado em
+RFC 2047 UTF-8. Nenhuma dessas estruturas está autorizada a persistir campanha
+nesta fase.
 
 ## Identidade operacional individual
 
-A identidade foi implementada sem abrir capacidade de campanha:
+A identidade homologada permanece fail-closed:
 
 - `operator_id` persistente, nome, código e status `ATIVO | SUSPENSO`;
 - papéis `PREPARADOR`, `REVISOR`, `APROVADOR`, `EXECUTOR`,
   `SUPERVISOR` e `ADMIN_TECNICO`;
-- token individual armazenado somente como SHA-256;
-- sessão opaca armazenada somente como SHA-256;
-- vínculo obrigatório no PostgreSQL entre sessão, token e o mesmo operador;
+- token individual e sessão persistidos somente como SHA-256;
+- vínculo obrigatório PostgreSQL `sessão → token → mesmo operador`;
 - cookie `__Host-ic_campaign_operator_session` com `HttpOnly`, `Secure`,
   `SameSite=Strict` e `Path=/`;
-- `GET /api/operator/me` expõe apenas identidade, papéis e expiração;
-- suspensão revoga tokens e sessões na mesma transação;
-- logout responde sucesso somente quando a revogação da sessão é confirmada;
-- falha ou ausência de confirmação da revogação não limpa o cookie e retorna
-  resposta fail-closed;
+- `GET /api/operator/me` expõe somente identidade, papéis e expiração;
+- logout só limpa o cookie após revogação confirmada;
 - as rotas da campanha não aceitam `OPERATOR_TOKEN` nem a sessão compartilhada
-  do piloto como fallback;
-- auditoria append-only recebe vínculo `operator_id`.
+  do piloto como fallback.
 
 ### Histórico da migration 0006
 
-Dentro desta PR, a migration `0006_operator_identity.sql` foi executada apenas
+Dentro da PR #12, a migration `0006_operator_identity.sql` foi executada apenas
 no PostgreSQL 16 efêmero do quality-gate. Não houve execução identificada em
-banco Preview ou outro ambiente persistente. Por isso o vínculo
-`sessão → token → mesmo operador` foi corrigido diretamente na `0006`, antes
-de qualquer promoção da PR.
+banco Preview ou outro ambiente persistente; por isso os corretivos desta fase
+foram incorporados diretamente à `0006`.
 
-Se houver evidência externa posterior de que uma versão anterior da `0006`
-foi aplicada em ambiente persistente, essa premissa deve ser reavaliada antes
-do merge e a correção deverá ser promovida por migration aditiva.
+Se surgir evidência externa de aplicação persistente de uma versão anterior,
+essa premissa deve ser reavaliada antes do merge e a evolução deverá ocorrer
+por migration aditiva.
 
-## Gates ainda obrigatórios antes da persistência da campanha
+## Ciclo administrativo individual
 
-A identidade operacional não libera a próxima fase. Permanecem pendentes:
+As ações administrativas normais exigem sessão individual com papel
+`ADMIN_TECNICO`. O `OPERATOR_TOKEN` compartilhado não autoriza
+provisionamento, suspensão, rotação ou recuperação de credencial.
 
-- eliminar `TECH_ADMIN_LEGACY` como autoria administrativa genérica;
-- gerar credenciais individuais fortes por mecanismo controlado, em vez de
-  recebê-las como segredo escolhido no provisionamento;
-- atribuir toda ação administrativa a uma identidade individual autenticada;
-- homologar provisionamento, rotação, suspensão e recuperação administrativa;
-- somente depois disso considerar tabelas/persistência/aprovação da campanha.
+Cada ação grava na auditoria append-only:
 
-Os gates executáveis continuam fechados:
+- `operator_id`: operador alvo;
+- `ator_operator_id`: administrador individual autenticado;
+- `ator_id`: o mesmo UUID do administrador, para compatibilidade com o
+  contrato histórico de auditoria.
+
+Cada token também registra `emitido_por_operator_id`.
+
+### Provisionamento
+
+O endpoint administrativo recebe somente o SHA-256 de uma credencial forte.
+O `operator_id` do novo operador é criado no servidor e a autoria é o
+`ADMIN_TECNICO` autenticado.
+
+A API não aceita segredo bruto em provisionamento.
+
+### Geração forte de credencial
+
+O repositório inclui um gerador local CSPRNG de 256 bits:
+
+```bash
+npm run operator:credential -- --out operador-001.operator-credential.json
+```
+
+O artefato é criado com permissão `0600`, não sobrescreve arquivo existente e
+é ignorado pelo Git. O terminal recebe apenas o SHA-256 e o caminho do arquivo;
+a credencial bruta não é impressa em stdout/stderr.
+
+O arquivo contém material secreto e deve ser entregue ao operador somente por
+canal institucional aprovado. Apenas o SHA-256 é enviado à API administrativa.
+
+### Rotação
+
+`POST /api/operator/admin/credentials/rotate` exige `ADMIN_TECNICO`
+individual. A operação:
+
+1. revoga credenciais ativas do operador;
+2. revoga sessões ativas;
+3. persiste somente o novo hash;
+4. registra o administrador individual como emissor e ator;
+5. nunca devolve o segredo bruto.
+
+### Recuperação
+
+`POST /api/operator/admin/credentials/recover` não recupera a credencial antiga.
+Credenciais são hash-only e, portanto, não são reversíveis. Recuperação significa
+substituição controlada: gerar nova credencial, revogar o estado anterior e
+persistir apenas o novo hash, com autoria individual.
+
+### Suspensão
+
+A suspensão também exige `ADMIN_TECNICO` individual, revoga tokens e sessões
+e registra a identidade do administrador executor.
+
+### Bootstrap inicial
+
+Não há fallback HTTP para `TECH_ADMIN_LEGACY`. O primeiro `ADMIN_TECNICO` de
+um ambiente novo deve ser criado em um gate de implantação controlado, usando
+credencial gerada pelo mecanismo acima e autoria autoidentificada no registro
+inicial. Esse bootstrap não autoriza campanha, lote, outbox, worker ou Gmail.
+
+## Gate restante
+
+Este incremento fecha o ciclo administrativo básico em código, mas a PR #12
+deve permanecer Draft até homologação independente desse ciclo. Persistência da
+campanha continua proibida.
+
+Os gates executáveis permanecem:
 
 ```
 canPersistImport = false
 canCreateBatch   = false
 canExecute       = false
 ```
-
-O próximo incremento não deve materializar campanha, lote ou outbox enquanto
-os gates administrativos acima não estiverem homologados.

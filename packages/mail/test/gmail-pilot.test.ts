@@ -202,8 +202,14 @@ describe("Transporte Gmail real — MIME e messages.send (sem rede)", () => {
     expect(mime).toContain(`To: profissional@exemplo.test`);
     const subjectHeader = mime.split("\r\n").find((line) => line.startsWith("Subject: "));
     expect(subjectHeader).toMatch(/^Subject: =\?UTF-8\?B\?/);
-    const subjectMatch = /^Subject: =\?UTF-8\?B\?([^?]+)\?=$/.exec(subjectHeader ?? "");
-    expect(Buffer.from(subjectMatch?.[1] ?? "", "base64").toString("utf8")).toBe(PILOT_SUBJECT);
+    const subjectWords = (subjectHeader ?? "").slice("Subject: ".length).split(/\s+/);
+    expect(subjectWords.every((word) => word.length <= 75)).toBe(true);
+    const decodedSubject = subjectWords.map((word) => {
+      const match = /^=\?UTF-8\?B\?([^?]+)\?=$/.exec(word);
+      expect(match?.[1]).toBeDefined();
+      return Buffer.from(match?.[1] ?? "", "base64").toString("utf8");
+    }).join("");
+    expect(decodedSubject).toBe(PILOT_SUBJECT);
     expect(mime).toContain("MIME-Version: 1.0");
     expect(mime).toContain("multipart/alternative");
     expect(mime).toContain("text/plain");

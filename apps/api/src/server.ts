@@ -149,6 +149,8 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "GET /api/campaigns/status",
   "GET /api/operator/workspace/status",
   "POST /api/operator/admin/provision",
+  "POST /api/operator/admin/credentials/rotate",
+  "POST /api/operator/admin/credentials/recover",
   "POST /api/operator/admin/suspend",
 ]);
 
@@ -452,6 +454,10 @@ function tokenIndividualValido(token: string): boolean {
   return CAMPAIGN_TOKEN_PATTERN.test(token);
 }
 
+function credentialHashValido(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
 function operatorIdentityRepository(): PostgresOperatorIdentityRepository {
   return new PostgresOperatorIdentityRepository(requireDb().pool);
 }
@@ -497,17 +503,6 @@ async function exigirOperadorCampanha(
     return undefined;
   }
   return identity;
-}
-
-function exigirAdminTecnicoLegado(req: IncomingMessage, res: ServerResponse): boolean {
-  // Somente Bearer técnico explícito. Nem a sessão legada nem a sessão
-  // individual são fallback para provisionamento/suspensão.
-  if (verificarOperador(req)) return true;
-  json(res, 401, {
-    erro: "Autenticação técnica exigida.",
-    codigo: "TECH_ADMIN_AUTH_REQUIRED",
-  });
-  return false;
 }
 
 function autenticacaoDeSessao(req: IncomingMessage): boolean {
@@ -729,13 +724,14 @@ const ROTAS: readonly Rota[] = [
     metodo: "POST",
     caminhoExato: "/api/operator/admin/provision",
     handler: async (req, res, _url, corpo) => {
-      if (!exigirAdminTecnicoLegado(req, res)) return;
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
       let body: {
-        operatorId?: unknown;
         code?: unknown;
         displayName?: unknown;
         roles?: unknown;
-        token?: unknown;
+        credentialHash?: unknown;
         tokenExpiresAt?: unknown;
       };
       try {
@@ -744,18 +740,17 @@ const ROTAS: readonly Rota[] = [
         json(res, 400, { erro: "JSON inválido." });
         return;
       }
-      let token = typeof body.token === "string" ? body.token.trim() : "";
+
       const roles = Array.isArray(body.roles) ? body.roles : [];
       const rolesValid = roles.length > 0 && roles.every(
         (role) => typeof role === "string" &&
           ["PREPARADOR","REVISOR","APROVADOR","EXECUTOR","SUPERVISOR","ADMIN_TECNICO"].includes(role),
       );
       if (
-        typeof body.operatorId !== "string" ||
         typeof body.code !== "string" ||
         typeof body.displayName !== "string" ||
         !rolesValid ||
-        !tokenIndividualValido(token)
+        !credentialHashValido(body.credentialHash)
       ) {
         json(res, 422, {
           erro: "Dados de provisionamento inválidos.",
@@ -763,22 +758,26 @@ const ROTAS: readonly Rota[] = [
         });
         return;
       }
-      const tokenHash = hashSegredoOpaco(token);
-      token = "";
+
+      const operatorId = randomUUID();
       try {
         await operatorIdentityRepository().provisionOperator({
-          operatorId: body.operatorId,
+          actorOperatorId: admin.operatorId,
+          operatorId,
           code: body.code,
           displayName: body.displayName,
           roles: roles as OperatorRole[],
-          tokenHash,
+          tokenHash: body.credentialHash,
           now: new Date().toISOString(),
-          ...(typeof body.tokenExpiresAt === "string" ? { tokenExpiresAt: body.tokenExpiresAt } : {}),
+          ...(typeof body.tokenExpiresAt === "string"
+            ? { tokenExpiresAt: body.tokenExpiresAt }
+            : {}),
         });
         json(res, 201, {
-          operatorId: body.operatorId,
+          operatorId,
           status: "ATIVO",
           roles: [...new Set(roles as string[])].sort(),
+          provisionedBy: admin.operatorId,
         });
       } catch (error) {
         if ((error as { code?: unknown })?.code === "23505") {
@@ -797,9 +796,127 @@ const ROTAS: readonly Rota[] = [
   },
   {
     metodo: "POST",
+    caminhoExato: "/api/operator/admin/credentials/rotate",
+    handler: async (req, res, _url, corpo) => {
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
+      let body: {
+        operatorId?: unknown;
+        credentialHash?: unknown;
+        tokenExpiresAt?: unknown;
+      };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      if (typeof body.operatorId !== "string" || !credentialHashValido(body.credentialHash)) {
+        json(res, 422, {
+          erro: "Dados de rotação inválidos.",
+          codigo: "OPERATOR_CREDENTIAL_ROTATION_INVALID",
+        });
+        return;
+      }
+
+      try {
+        const replaced = await operatorIdentityRepository().replaceCredential({
+          actorOperatorId: admin.operatorId,
+          operatorId: body.operatorId,
+          tokenHash: body.credentialHash,
+          reason: "ROTACAO",
+          now: new Date().toISOString(),
+          ...(typeof body.tokenExpiresAt === "string"
+            ? { tokenExpiresAt: body.tokenExpiresAt }
+            : {}),
+        });
+        if (!replaced) {
+          json(res, 404, {
+            erro: "Operador ativo não encontrado.",
+            codigo: "OPERATOR_NOT_ACTIVE",
+          });
+          return;
+        }
+        json(res, 200, {
+          operatorId: body.operatorId,
+          status: "CREDENTIAL_ROTATED",
+          sessionsRevoked: true,
+          performedBy: admin.operatorId,
+        });
+      } catch {
+        json(res, 503, {
+          erro: "Rotação de credencial indisponível.",
+          codigo: "OPERATOR_CREDENTIAL_ROTATION_UNAVAILABLE",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/admin/credentials/recover",
+    handler: async (req, res, _url, corpo) => {
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
+      let body: {
+        operatorId?: unknown;
+        credentialHash?: unknown;
+        tokenExpiresAt?: unknown;
+      };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      if (typeof body.operatorId !== "string" || !credentialHashValido(body.credentialHash)) {
+        json(res, 422, {
+          erro: "Dados de recuperação inválidos.",
+          codigo: "OPERATOR_CREDENTIAL_RECOVERY_INVALID",
+        });
+        return;
+      }
+
+      try {
+        const replaced = await operatorIdentityRepository().replaceCredential({
+          actorOperatorId: admin.operatorId,
+          operatorId: body.operatorId,
+          tokenHash: body.credentialHash,
+          reason: "RECUPERACAO",
+          now: new Date().toISOString(),
+          ...(typeof body.tokenExpiresAt === "string"
+            ? { tokenExpiresAt: body.tokenExpiresAt }
+            : {}),
+        });
+        if (!replaced) {
+          json(res, 404, {
+            erro: "Operador ativo não encontrado.",
+            codigo: "OPERATOR_NOT_ACTIVE",
+          });
+          return;
+        }
+        json(res, 200, {
+          operatorId: body.operatorId,
+          status: "CREDENTIAL_RECOVERED",
+          sessionsRevoked: true,
+          performedBy: admin.operatorId,
+        });
+      } catch {
+        json(res, 503, {
+          erro: "Recuperação de credencial indisponível.",
+          codigo: "OPERATOR_CREDENTIAL_RECOVERY_UNAVAILABLE",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
     caminhoExato: "/api/operator/admin/suspend",
     handler: async (req, res, _url, corpo) => {
-      if (!exigirAdminTecnicoLegado(req, res)) return;
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
       let operatorId = "";
       try {
         const body = JSON.parse(corpo.toString("utf8") || "{}") as { operatorId?: unknown };
@@ -811,13 +928,19 @@ const ROTAS: readonly Rota[] = [
       try {
         const suspended = await operatorIdentityRepository().suspendOperator(
           operatorId,
+          admin.operatorId,
           new Date().toISOString(),
         );
         if (!suspended) {
           json(res, 404, { erro: "Operador ativo não encontrado.", codigo: "OPERATOR_NOT_ACTIVE" });
           return;
         }
-        json(res, 200, { operatorId, status: "SUSPENSO", sessionsRevoked: true });
+        json(res, 200, {
+          operatorId,
+          status: "SUSPENSO",
+          sessionsRevoked: true,
+          performedBy: admin.operatorId,
+        });
       } catch {
         json(res, 503, {
           erro: "Suspensão operacional indisponível.",

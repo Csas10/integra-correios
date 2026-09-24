@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   NodePostgresPool,
   OperatorAdminAuthorizationError,
+  OperatorAdminContinuityError,
   PostgresOperatorIdentityRepository,
 } from "../src/index.js";
 
@@ -196,6 +197,32 @@ describeDb("Identidade operacional individual — PostgreSQL 16", () => {
         "OPERADOR_CREDENCIAL_RECUPERADA",
       ]);
       expect(audit.rows.every((row) => row.ator_operator_id === adminId)).toBe(true);
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("bloqueia auto-suspensão de administrador técnico dentro da transação", async () => {
+    const pool = new NodePostgresPool({ connectionString: DATABASE_URL! });
+    const repo = new PostgresOperatorIdentityRepository(pool);
+    const adminId = randomUUID();
+    const otherAdminId = randomUUID();
+
+    try {
+      await seedOperator(pool, { operatorId: adminId, role: "ADMIN_TECNICO" });
+      await seedOperator(pool, { operatorId: otherAdminId, role: "ADMIN_TECNICO" });
+
+      await expect(repo.suspendOperator(
+        adminId,
+        adminId,
+        new Date().toISOString(),
+      )).rejects.toBeInstanceOf(OperatorAdminContinuityError);
+
+      const state = await pool.query<{ status: string }>(
+        "SELECT status FROM operador WHERE id = $1",
+        [adminId],
+      );
+      expect(state.rows[0]?.status).toBe("ATIVO");
     } finally {
       await pool.close();
     }

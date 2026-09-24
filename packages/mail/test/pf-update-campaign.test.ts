@@ -6,10 +6,26 @@ import {
   renderPfUpdateCampaignMail,
 } from "../src/index.js";
 
+function subjectPhysicalLines(mime: string): string[] {
+  const lines = mime.split("\r\n");
+  const start = lines.findIndex((line) => line.startsWith("Subject: "));
+  if (start < 0) throw new Error("Subject ausente");
+
+  const headerLines = [lines[start]!];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (!line.startsWith(" ")) break;
+    headerLines.push(line);
+  }
+  return headerLines;
+}
+
 function encodedSubjectWords(mime: string): string[] {
-  const header = mime.split("\r\n").find((line) => line.startsWith("Subject: "));
-  if (!header) throw new Error("Subject ausente");
-  return header.slice("Subject: ".length).split(/\s+/);
+  const lines = subjectPhysicalLines(mime);
+  const unfolded = lines
+    .map((line, index) => index === 0 ? line.slice("Subject: ".length) : line.trimStart())
+    .join(" ");
+  return unfolded.split(/\s+/);
 }
 
 function decodeSubject(mime: string): string {
@@ -56,9 +72,13 @@ describe("Campanha PF — template de atualização cadastral", () => {
     expect(message.htmlBody).not.toContain("<script");
   });
 
-  it("MIME divide Subject UTF-8 em encoded-words RFC 2047 de até 75 caracteres", () => {
+  it("MIME faz folding do Subject RFC 2047 em linhas físicas de até 76 caracteres", () => {
     const mime = composeMimeMessage(message);
+    const lines = subjectPhysicalLines(mime);
     const words = encodedSubjectWords(mime);
+
+    expect(lines.length).toBeGreaterThan(1);
+    expect(lines.every((line) => line.length <= 76)).toBe(true);
     expect(words.length).toBeGreaterThan(1);
     expect(words.every((word) => word.length <= 75)).toBe(true);
     expect(words.every((word) => /^=\?UTF-8\?B\?[^?]+\?=$/.test(word))).toBe(true);

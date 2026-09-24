@@ -75,6 +75,52 @@ beforeAll(criarBancoEfemero);
 afterAll(destruirBancoEfemero);
 
 d("bootstrap produtivo do primeiro ADMIN_TECNICO", () => {
+  it("rejeita flag como valor antes de criar operador, evento ou artefato secreto", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "integra-bootstrap-invalid-"));
+    const invalidArtifact = join(dir, "invalid.operator-credential.json");
+    const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+
+    const invalid = spawnSync(
+      npmCommand,
+      [
+        "run",
+        "operator:bootstrap-admin",
+        "--",
+        "--code",
+        "--name",
+        "Administrador Inválido",
+        "--out",
+        invalidArtifact,
+      ],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, DATABASE_URL: databaseUrlTeste },
+        encoding: "utf8",
+        timeout: 120000,
+      },
+    );
+
+    expect(invalid.status).not.toBe(0);
+    expect(existsSync(invalidArtifact)).toBe(false);
+    expect(invalid.stdout).not.toContain("credential_hash=");
+    expect(invalid.stdout).not.toContain("operator_id=");
+    expect(invalid.stderr).toContain("Uso:");
+
+    const pool = new NodePostgresPool({ connectionString: databaseUrlTeste });
+    try {
+      const totals = await pool.query<{ operators: number; bootstrap_events: number }>(
+        `SELECT
+          (SELECT count(*)::int FROM operador) AS operators,
+          (SELECT count(*)::int FROM evento_auditoria
+            WHERE tipo = 'ADMIN_BOOTSTRAP_INICIAL') AS bootstrap_events`,
+      );
+      expect(totals.rows[0]?.operators).toBe(0);
+      expect(totals.rows[0]?.bootstrap_events).toBe(0);
+    } finally {
+      await pool.close();
+    }
+  }, 30000);
+
   it("cria exatamente um administrador auditado e recusa definitivamente a segunda execução", async () => {
     const dir = mkdtempSync(join(tmpdir(), "integra-bootstrap-admin-"));
     const firstArtifact = join(dir, "first.operator-credential.json");

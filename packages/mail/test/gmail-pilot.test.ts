@@ -200,7 +200,10 @@ describe("Transporte Gmail real — MIME e messages.send (sem rede)", () => {
     expect(mime).toContain(`From: ${PILOT_SENDER.name} <${PILOT_SENDER.address}>`);
     expect(mime).toContain(`Reply-To: ${PILOT_SENDER.address}`);
     expect(mime).toContain(`To: profissional@exemplo.test`);
-    expect(mime).toContain(`Subject: ${PILOT_SUBJECT}`);
+    const subjectHeader = mime.split("\r\n").find((line) => line.startsWith("Subject: "));
+    expect(subjectHeader).toMatch(/^Subject: =\?UTF-8\?B\?/);
+    const subjectMatch = /^Subject: =\?UTF-8\?B\?([^?]+)\?=$/.exec(subjectHeader ?? "");
+    expect(Buffer.from(subjectMatch?.[1] ?? "", "base64").toString("utf8")).toBe(PILOT_SUBJECT);
     expect(mime).toContain("MIME-Version: 1.0");
     expect(mime).toContain("multipart/alternative");
     expect(mime).toContain("text/plain");

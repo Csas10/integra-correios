@@ -417,7 +417,7 @@ export function composeMimeMessage(message: OutboundMail): string {
   const replyTo = headerSanitize(message.replyTo);
   const to = headerSanitize(message.to);
   const subject = headerSanitize(message.subject);
-  const subjectEncoded = /^[-\w .,:;()!\u00C0-\u024F]*$/.test(subject)
+  const subjectEncoded = /^[\x20-\x7E]*$/.test(subject)
     ? subject
     : `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
   const boundary = `ic-${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}-${randomBytes(8).toString("hex")}`;

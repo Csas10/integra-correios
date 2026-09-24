@@ -79,6 +79,7 @@ export function emailCampanhaValido(value: string): boolean {
   if (!match) return false;
   const [, local, domain] = match;
   if (!local || !domain || local.length > 64) return false;
+  if (local.startsWith(".") || local.endsWith(".") || local.includes("..")) return false;
   if (!domain.includes(".") || domain.startsWith(".") || domain.endsWith(".")) return false;
   if (domain.split(".").some((label) => !label || label.startsWith("-") || label.endsWith("-"))) {
     return false;

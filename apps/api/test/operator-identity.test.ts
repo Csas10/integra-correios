@@ -1,9 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  NodePostgresPool,
-  PostgresOperatorIdentityRepository,
-} from "@integra-correios/persistence";
+import { NodePostgresPool } from "@integra-correios/persistence";
 import { despachar } from "../src/server.js";
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -23,20 +20,29 @@ async function bootstrapAdmin(): Promise<{
   cookie: string;
 }> {
   const operatorId = randomUUID();
+  const tokenId = randomUUID();
   const suffix = operatorId.replace(/-/g, "").slice(0, 12);
   const rawCredential = `AdminIndividual_abcdefghijklmnopqrstuvwxyz0123456789${suffix}`;
+  const now = new Date().toISOString();
   const pool = new NodePostgresPool({ connectionString: DATABASE_URL! });
   try {
-    const repository = new PostgresOperatorIdentityRepository(pool);
-    await repository.provisionOperator({
-      actorOperatorId: operatorId,
-      operatorId,
-      code: `ADMIN-${suffix}`,
-      displayName: "Administrador Individual Sintético",
-      roles: ["ADMIN_TECNICO"],
-      tokenHash: sha(rawCredential),
-      now: new Date().toISOString(),
-    });
+    await pool.query(
+      `INSERT INTO operador (
+        id, codigo, nome_exibicao, status, criado_em, atualizado_em
+      ) VALUES ($1, $2, $3, 'ATIVO', $4, $4)`,
+      [operatorId, `ADMIN-${suffix}`, "Administrador Individual Sintético", now],
+    );
+    await pool.query(
+      `INSERT INTO operador_papel (operator_id, papel, ativo, concedido_em)
+       VALUES ($1, 'ADMIN_TECNICO', true, $2)`,
+      [operatorId, now],
+    );
+    await pool.query(
+      `INSERT INTO operador_token (
+        id, operator_id, token_hash, emitido_por_operator_id, status, criado_em
+      ) VALUES ($1, $2, $3, $2, 'ATIVO', $4)`,
+      [tokenId, operatorId, sha(rawCredential), now],
+    );
   } finally {
     await pool.close();
   }

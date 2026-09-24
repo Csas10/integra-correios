@@ -87,7 +87,7 @@ GRANT USAGE, SELECT ON SEQUENCE evento_auditoria_sequencia_seq TO integra_runtim
 -- que pode ser aplicada antes OU depois desta re-execução (o REVOKE ALL
 -- acima zera TODAS as tabelas): o grant é condicional à existência para que
 -- qualquer ordem de aplicação/restauração reconverja para o estado válido.
-DO $
+DO $oauth_grant$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.tables
@@ -96,12 +96,12 @@ BEGIN
     GRANT SELECT, INSERT, UPDATE ON oauth_flow TO integra_runtime;
   END IF;
 END
-$;
+$oauth_grant$;
 
 
 -- 0006 — identidade operacional individual. Condicional porque 0002 é
 -- aplicada antes de 0006 em instalações novas e reaplicada depois na CI.
-DO $
+DO $operator_grant$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.tables
@@ -115,7 +115,7 @@ BEGIN
     TO integra_runtime;
   END IF;
 END
-$;
+$operator_grant$;
 
 -- Provisionamento fora do Git (exemplo sem credencial):
 --   CREATE ROLE integra_app_login LOGIN ...;

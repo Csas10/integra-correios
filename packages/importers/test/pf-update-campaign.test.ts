@@ -30,7 +30,7 @@ describe("Campanha PF — importação e pré-voo", () => {
           ["REGISTRO", "NOME", "E- MAIL"],
           [
             ["1001", "  Ana\nSilva  ", " ANA@\nEXEMPLO.COM "],
-            ["1002", "Bruna Souza", "ana@example.com"],
+            ["1002", "Bruna Souza", "ana@exemplo.com"],
             ["1003", "Carlos Lima", "email-invalido"],
             ["1004", "Daniel Costa", "daniel@example.com"],
           ],

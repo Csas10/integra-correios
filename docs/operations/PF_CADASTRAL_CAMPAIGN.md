@@ -58,6 +58,11 @@ As ações administrativas normais exigem sessão individual com papel
 `ADMIN_TECNICO`. O `OPERATOR_TOKEN` compartilhado não autoriza
 provisionamento, suspensão, rotação ou recuperação de credencial.
 
+A autorização é verificada duas vezes: na borda HTTP e novamente **dentro da
+mesma transação PostgreSQL da mutação**, com lock do operador executor e do
+papel `ADMIN_TECNICO`. Se o executor estiver suspenso, não tiver o papel ou
+o papel tiver sido revogado, a transação falha sem alterar o alvo.
+
 Cada ação grava na auditoria append-only:
 
 - `operator_id`: operador alvo;
@@ -83,9 +88,16 @@ O repositório inclui um gerador local CSPRNG de 256 bits:
 npm run operator:credential -- --out operador-001.operator-credential.json
 ```
 
-O artefato é criado com permissão `0600`, não sobrescreve arquivo existente e
+Em sistemas POSIX, o artefato é criado com permissão `0600`, a permissão é
+verificada após a gravação, o arquivo existente nunca é sobrescrito e o padrão
 é ignorado pelo Git. O terminal recebe apenas o SHA-256 e o caminho do arquivo;
 a credencial bruta não é impressa em stdout/stderr.
+
+No Windows, `mode/chmod` do Node não garante ACL equivalente. Enquanto uma
+política ACL explícita não for implementada, o gerador e o bootstrap **falham
+fechado antes de criar o arquivo secreto**, retornando
+`WINDOWS_ACL_UNSUPPORTED`. Portanto, a geração atual deve ser executada apenas
+em ambiente POSIX controlado.
 
 O arquivo contém material secreto e deve ser entregue ao operador somente por
 canal institucional aprovado. Apenas o SHA-256 é enviado à API administrativa.
@@ -115,10 +127,29 @@ e registra a identidade do administrador executor.
 
 ### Bootstrap inicial
 
-Não há fallback HTTP para `TECH_ADMIN_LEGACY`. O primeiro `ADMIN_TECNICO` de
-um ambiente novo deve ser criado em um gate de implantação controlado, usando
-credencial gerada pelo mecanismo acima e autoria autoidentificada no registro
-inicial. Esse bootstrap não autoriza campanha, lote, outbox, worker ou Gmail.
+Não há fallback HTTP para `TECH_ADMIN_LEGACY`. O bootstrap é um comando de
+implantação não HTTP:
+
+```bash
+DATABASE_URL=... npm run operator:bootstrap-admin -- \
+  --code ADMIN-INICIAL \
+  --name "Administrador Inicial" \
+  --out admin-inicial.operator-credential.json
+```
+
+O comando:
+
+1. exige PostgreSQL configurado e plataforma com artefato secreto suportado;
+2. gera uma credencial CSPRNG de 256 bits;
+3. cria o artefato local protegido;
+4. abre uma transação e bloqueia a tabela de operadores;
+5. exige **exatamente zero operadores**;
+6. cria operador, papel `ADMIN_TECNICO`, somente o hash da credencial e o
+   evento append-only `ADMIN_BOOTSTRAP_INICIAL`;
+7. recusa qualquer segunda execução; em falha, remove o artefato recém-criado.
+
+O bootstrap não usa Bearer compartilhado e não autoriza campanha, lote, outbox,
+worker ou Gmail.
 
 ## Gate restante
 

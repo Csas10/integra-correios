@@ -47,7 +47,7 @@ describe("Campanha PF — importação e pré-voo", () => {
 
     const ana = report.registros[0]!;
     expect(ana.nome_exibicao).toBe("Ana Silva");
-    expect(ana.email).toBe(" ANA@\nEXEMPLO.COM ");
+    expect(ana.email).toBe(" ANA@EXEMPLO.COM ");
     expect(ana.email_normalizado).toBe("ana@exemplo.com");
     expect(ana.motivo_bloqueio).toContain("EMAIL_DUPLICADO");
     expect(ana.normalizacoes_aplicadas).toEqual(

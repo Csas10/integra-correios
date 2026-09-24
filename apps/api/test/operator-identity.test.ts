@@ -80,6 +80,78 @@ describeDb("Identidade operacional — API E2E sem campanha/lote", () => {
     expect((await despachar("GET", "/api/operator/me", { headers: { cookie } })).status).toBe(401);
   });
 
+  it("logout só fecha a interface após revogação confirmada", async () => {
+    process.env.OPERATOR_TOKEN = "admin-tecnico-sintetico-identidade";
+    const operatorId = randomUUID();
+    const suffix = operatorId.replace(/-/g, "").slice(0, 8);
+    const individualToken = `LogoutOk_abcdefghijklmnopqrstuvwxyz0123456789${suffix}`;
+
+    expect((await despachar("POST", "/api/operator/admin/provision", {
+      headers: {
+        authorization: "Bearer admin-tecnico-sintetico-identidade",
+        "content-type": "application/json",
+      },
+      corpo: Buffer.from(JSON.stringify({
+        operatorId,
+        code: `LOG-${suffix}`,
+        displayName: "Operador Logout Sintético",
+        roles: ["PREPARADOR"],
+        token: individualToken,
+      })),
+    })).status).toBe(201);
+
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: individualToken })),
+    });
+    const cookie = firstCookie(login.headers["set-cookie"]);
+
+    const logout = await despachar("DELETE", "/api/operator/identity/session", {
+      headers: { cookie },
+    });
+    expect(logout.status).toBe(200);
+    expect(logout.headers["set-cookie"]).toContain("Max-Age=0");
+    expect((await despachar("GET", "/api/operator/me", { headers: { cookie } })).status).toBe(401);
+  });
+
+  it("logout retorna 503 e não limpa cookie quando a revogação não é confirmada", async () => {
+    process.env.OPERATOR_TOKEN = "admin-tecnico-sintetico-identidade";
+    const operatorId = randomUUID();
+    const suffix = operatorId.replace(/-/g, "").slice(0, 8);
+    const individualToken = `LogoutFail_abcdefghijklmnopqrstuvwxyz0123456789${suffix}`;
+
+    expect((await despachar("POST", "/api/operator/admin/provision", {
+      headers: {
+        authorization: "Bearer admin-tecnico-sintetico-identidade",
+        "content-type": "application/json",
+      },
+      corpo: Buffer.from(JSON.stringify({
+        operatorId,
+        code: `LGF-${suffix}`,
+        displayName: "Operador Logout Falha",
+        roles: ["PREPARADOR"],
+        token: individualToken,
+      })),
+    })).status).toBe(201);
+
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: individualToken })),
+    });
+    const cookie = firstCookie(login.headers["set-cookie"]);
+
+    expect((await despachar("DELETE", "/api/operator/identity/session", {
+      headers: { cookie },
+    })).status).toBe(200);
+
+    const semConfirmacao = await despachar("DELETE", "/api/operator/identity/session", {
+      headers: { cookie },
+    });
+    expect(semConfirmacao.status).toBe(503);
+    expect(semConfirmacao.corpo).toContain("OPERATOR_SESSION_REVOCATION_UNCONFIRMED");
+    expect(semConfirmacao.headers["set-cookie"]).toBeUndefined();
+  });
+
   it("papel exclusivamente técnico vê /me mas recebe 403 no workspace", async () => {
     process.env.OPERATOR_TOKEN = "admin-tecnico-sintetico-identidade";
     const operatorId = randomUUID();

@@ -648,17 +648,34 @@ const ROTAS: readonly Rota[] = [
     caminhoExato: "/api/operator/identity/session",
     handler: async (req, res) => {
       const sessionSecret = cookiesDo(req)[CAMPAIGN_OPERATOR_SESSION_COOKIE];
-      if (sessionSecret && CAMPAIGN_TOKEN_PATTERN.test(sessionSecret)) {
-        try {
-          await operatorIdentityRepository().revokeSession(
-            hashSegredoOpaco(sessionSecret),
-            new Date().toISOString(),
-          );
-        } catch {
-          // O cookie ainda é removido. Sem sessão válida, ações futuras
-          // continuam fail-closed.
-        }
+      if (!sessionSecret || !CAMPAIGN_TOKEN_PATTERN.test(sessionSecret)) {
+        json(res, 401, {
+          erro: "Sessão individual ausente ou inválida.",
+          codigo: "INDIVIDUAL_OPERATOR_AUTH_REQUIRED",
+        });
+        return;
       }
+
+      try {
+        const revoked = await operatorIdentityRepository().revokeSession(
+          hashSegredoOpaco(sessionSecret),
+          new Date().toISOString(),
+        );
+        if (!revoked) {
+          json(res, 503, {
+            erro: "Não foi possível confirmar a revogação da sessão.",
+            codigo: "OPERATOR_SESSION_REVOCATION_UNCONFIRMED",
+          });
+          return;
+        }
+      } catch {
+        json(res, 503, {
+          erro: "Não foi possível confirmar a revogação da sessão.",
+          codigo: "OPERATOR_SESSION_REVOCATION_UNCONFIRMED",
+        });
+        return;
+      }
+
       json(
         res,
         200,

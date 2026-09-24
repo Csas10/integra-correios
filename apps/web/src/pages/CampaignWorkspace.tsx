@@ -82,16 +82,23 @@ export function CampaignWorkspace() {
   }
 
   async function logout() {
+    setFeedback("");
     setLoading(true);
     try {
-      await fetch("/api/operator/identity/session", {
+      const response = await fetch("/api/operator/identity/session", {
         method: "DELETE",
         credentials: "same-origin",
         cache: "no-store",
       });
-    } finally {
+      if (!response.ok) {
+        setFeedback("Não foi possível confirmar a saída. Sua sessão permanece exibida como ativa.");
+        return;
+      }
       setMe(null);
       setToken("");
+    } catch {
+      setFeedback("Não foi possível confirmar a saída. Sua sessão permanece exibida como ativa.");
+    } finally {
       setLoading(false);
     }
   }
@@ -161,6 +168,7 @@ export function CampaignWorkspace() {
           <div className="campaign-session-actions">
             <span>Sessão até {new Date(me.sessionExpiresAt).toLocaleString("pt-BR")}</span>
             <button type="button" onClick={logout} disabled={loading}>Sair</button>
+            {feedback ? <span className="campaign-session-error" role="status">{feedback}</span> : null}
           </div>
         </section>
 

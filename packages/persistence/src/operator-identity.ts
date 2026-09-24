@@ -105,9 +105,17 @@ async function insertOperatorAudit(
     `INSERT INTO evento_auditoria (
       id, agregado_tipo, agregado_id, tipo, ator_id, operator_id, ator_operator_id,
       ocorreu_em, metadados, hash_evento
-    ) VALUES ($1, 'OPERADOR', $2, $3, $4, $2, $4::uuid, $5, $6::jsonb, $7)`,
-    [eventId, operatorId, type, actorId, occurredAt, JSON.stringify(metadata),
-      eventHash(eventId, operatorId, type, occurredAt)],
+    ) VALUES ($1, 'OPERADOR', $2, $3, $4, $2, $5, $6, $7::jsonb, $8)`,
+    [
+      eventId,
+      operatorId,
+      type,
+      actorId,
+      actorId,
+      occurredAt,
+      JSON.stringify(metadata),
+      eventHash(eventId, operatorId, type, occurredAt),
+    ],
   );
 }
 

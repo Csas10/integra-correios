@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { AppHeader } from "../components/AppHeader";
+import { campaignLogoutDisposition } from "./campaign-logout-state";
 
 type OperatorMe = {
   operatorId: string;
@@ -90,12 +91,12 @@ export function CampaignWorkspace() {
         credentials: "same-origin",
         cache: "no-store",
       });
-      if (!response.ok) {
-        setFeedback("Não foi possível confirmar a saída. Sua sessão permanece exibida como ativa.");
+      if (campaignLogoutDisposition(response.status) === "SIGNED_OUT") {
+        setMe(null);
+        setToken("");
         return;
       }
-      setMe(null);
-      setToken("");
+      setFeedback("Não foi possível confirmar a saída. Sua sessão permanece exibida como ativa.");
     } catch {
       setFeedback("Não foi possível confirmar a saída. Sua sessão permanece exibida como ativa.");
     } finally {

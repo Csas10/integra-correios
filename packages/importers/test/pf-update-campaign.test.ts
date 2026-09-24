@@ -127,6 +127,35 @@ describe("Campanha PF — importação e pré-voo", () => {
     expect(report.registros[3]?.status_validacao).toBe("APTO");
   });
 
+  it("respeita limite DNS de 63 bytes por rótulo de domínio", () => {
+    const label63 = "a".repeat(63);
+    const label64 = "b".repeat(64);
+    const report = analisarCampanhaAtualizacaoPf(
+      {
+        sha256: "f".repeat(64),
+        folha: folha(
+          ["REGISTRO", "NOME", "EMAIL"],
+          [
+            ["4001", "Limite Válido", `ana@${label63}.com`],
+            ["4002", "Limite Inválido", `bia@${label64}.com`],
+          ],
+        ),
+      },
+      { colunaIdentificadorInstitucional: "REGISTRO" },
+    );
+
+    expect(report.registros[0]?.status_validacao).toBe("APTO");
+    expect(report.registros[0]?.motivo_bloqueio).not.toContain("EMAIL_INVALIDO");
+    expect(report.registros[1]?.status_validacao).toBe("BLOQUEADO");
+    expect(report.registros[1]?.motivo_bloqueio).toContain("EMAIL_INVALIDO");
+    expect(
+      report.registros.filter((row) =>
+        row.motivo_bloqueio.includes("EMAIL_INVALIDO") &&
+        row.status_validacao === "APTO"
+      ),
+    ).toHaveLength(0);
+  });
+
   it("não aceita nome ou e-mail como identidade definitiva", () => {
     expect(() =>
       analisarCampanhaAtualizacaoPf(

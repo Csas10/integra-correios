@@ -18,6 +18,36 @@ import {
 } from "../src/index.js";
 import type { OutboundMail } from "../src/index.js";
 
+function subjectHeaderLines(mime: string): string[] {
+  const lines = mime.split("\r\n");
+  const start = lines.findIndex((line) => line.startsWith("Subject: "));
+  if (start < 0) throw new Error("Subject ausente");
+
+  const headerLines = [lines[start]!];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (!line.startsWith(" ")) break;
+    headerLines.push(line);
+  }
+  return headerLines;
+}
+
+function subjectEncodedWords(mime: string): string[] {
+  const lines = subjectHeaderLines(mime);
+  const unfolded = lines
+    .map((line, index) => index === 0 ? line.slice("Subject: ".length) : line.trimStart())
+    .join(" ");
+  return unfolded.split(/\s+/);
+}
+
+function decodeRfc2047Subject(mime: string): string {
+  return subjectEncodedWords(mime).map((word) => {
+    const match = /^=\?UTF-8\?B\?([^?]+)\?=$/.exec(word);
+    if (!match?.[1]) throw new Error("Encoded-word inválido");
+    return Buffer.from(match[1], "base64").toString("utf8");
+  }).join("");
+}
+
 describe("OAuth Gmail — config e state/CSRF", () => {
   it("CONFIGURATION_REQUIRED quando credenciais ausentes", () => {
     expect(loadGmailOauthConfig({})).toBeUndefined();
@@ -200,16 +230,11 @@ describe("Transporte Gmail real — MIME e messages.send (sem rede)", () => {
     expect(mime).toContain(`From: ${PILOT_SENDER.name} <${PILOT_SENDER.address}>`);
     expect(mime).toContain(`Reply-To: ${PILOT_SENDER.address}`);
     expect(mime).toContain(`To: profissional@exemplo.test`);
-    const subjectHeader = mime.split("\r\n").find((line) => line.startsWith("Subject: "));
-    expect(subjectHeader).toMatch(/^Subject: =\?UTF-8\?B\?/);
-    const subjectWords = (subjectHeader ?? "").slice("Subject: ".length).split(/\s+/);
-    expect(subjectWords.every((word) => word.length <= 75)).toBe(true);
-    const decodedSubject = subjectWords.map((word) => {
-      const match = /^=\?UTF-8\?B\?([^?]+)\?=$/.exec(word);
-      expect(match?.[1]).toBeDefined();
-      return Buffer.from(match?.[1] ?? "", "base64").toString("utf8");
-    }).join("");
-    expect(decodedSubject).toBe(PILOT_SUBJECT);
+    const subjectLines = subjectHeaderLines(mime);
+    expect(subjectLines[0]).toMatch(/^Subject: =\?UTF-8\?B\?/);
+    expect(subjectLines.every((line) => line.length <= 76)).toBe(true);
+    expect(subjectEncodedWords(mime).every((word) => word.length <= 75)).toBe(true);
+    expect(decodeRfc2047Subject(mime)).toBe(PILOT_SUBJECT);
     expect(mime).toContain("MIME-Version: 1.0");
     expect(mime).toContain("multipart/alternative");
     expect(mime).toContain("text/plain");
@@ -233,21 +258,17 @@ describe("Transporte Gmail real — MIME e messages.send (sem rede)", () => {
     expect(mime).toMatch(/^Subject: =\?UTF-8\?B\?/m);
   });
 
-  it("encoded-words do compositor compartilhado respeitam 75 caracteres e fronteiras UTF-8", () => {
+  it("compositor compartilhado faz folding físico e preserva UTF-8", () => {
     const subject = "Confirmação dos dados para envio da Carteira Profissional — atualização cadastral ✓";
     const mime = composeMimeMessage({ ...mensagem, subject });
-    const header = mime.split("\r\n").find((line) => line.startsWith("Subject: "));
-    expect(header).toBeDefined();
-    const words = (header ?? "").slice("Subject: ".length).split(/\s+/);
+    const lines = subjectHeaderLines(mime);
+    const words = subjectEncodedWords(mime);
+
+    expect(lines.length).toBeGreaterThan(1);
+    expect(lines.every((line) => line.length <= 76)).toBe(true);
     expect(words.length).toBeGreaterThan(1);
     expect(words.every((word) => word.length <= 75)).toBe(true);
-
-    const decoded = words.map((word) => {
-      const match = /^=\?UTF-8\?B\?([^?]+)\?=$/.exec(word);
-      expect(match?.[1]).toBeDefined();
-      return Buffer.from(match?.[1] ?? "", "base64").toString("utf8");
-    }).join("");
-    expect(decoded).toBe(subject);
+    expect(decodeRfc2047Subject(mime)).toBe(subject);
   });
 
   async function comFetchFake(

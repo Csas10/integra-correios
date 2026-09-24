@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import {
+  assertCredentialArtifactPlatform,
   generateCredentialMaterial,
   writeCredentialArtifact,
 } from "./operator-credential-lib.mjs";
@@ -16,6 +17,7 @@ if (!outArg) {
 }
 
 try {
+  assertCredentialArtifactPlatform();
   const material = generateCredentialMaterial();
   const outputPath = writeCredentialArtifact(outArg, material);
   process.stdout.write(`credential_hash=${material.credentialHash}\n`);

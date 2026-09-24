@@ -14,7 +14,10 @@ import {
 
 function valueAfter(args, flag) {
   const index = args.indexOf(flag);
-  return index >= 0 ? args[index + 1] : undefined;
+  if (index < 0) return undefined;
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith("-")) return undefined;
+  return value;
 }
 
 const args = process.argv.slice(2);

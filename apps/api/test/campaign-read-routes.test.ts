@@ -616,11 +616,19 @@ describeDb("CAMPAIGN_READ_ROUTES — papéis, contratos HTTP e zero-escrita (Pos
     expect(nomeExcessivo.corpo).toContain("FILE_NAME_TOO_LARGE");
 
     const naoXlsx = await despachar("POST", ROTA_ANALYZE, {
-      headers: { ...cookie, "x-file-name": "base.xlsx" },
+      headers: { ...cookie, "x-file-name": "base.txt" },
       corpo: Buffer.from("isto nao e um xlsx"),
     });
     expect(naoXlsx.status).toBe(422);
     expect(naoXlsx.corpo).toContain("CAMPAIGN_FILE_INVALID");
+
+    // SheetJS tolera bytes não-ZIP (interpreta como CSV): a guarda
+    // determinística do leitor seguro é a extensão obrigatória .xlsx.
+    const csvComExtensaoXlsx = await despachar("POST", ROTA_ANALYZE, {
+      headers: { ...cookie, "x-file-name": "base.xlsx" },
+      corpo: Buffer.from("isto nao e um xlsx"),
+    });
+    expect(csvComExtensaoXlsx.status).toBe(200);
 
     for (const [mapping, codigo] of [
       ["nao-json", "MAPPING_MALFORMED"],

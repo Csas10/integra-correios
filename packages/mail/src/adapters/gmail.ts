@@ -411,10 +411,11 @@ export interface GmailTokenRefreshResponse {
 function encodeRfc2047Utf8Base64(value: string): string {
   if (/^[\x20-\x7E]*$/.test(value)) return value;
 
-  // RFC 2047 limita cada encoded-word a 75 caracteres, incluindo
-  // "=?UTF-8?B?" e "?=". Com Base64 em múltiplos de 4, 60 caracteres
-  // codificados permitem no máximo 45 bytes UTF-8 por segmento.
-  const maxPayloadBytes = 45;
+  // RFC 2047 limita cada encoded-word a 75 caracteres e a linha física
+  // contendo encoded-word deve permanecer <= 76 caracteres.
+  // "Subject: " (9) + overhead RFC 2047 (12) + Base64 de 39 bytes (52) = 73.
+  // Linhas de continuação usam um único espaço de folding + encoded-word.
+  const maxPayloadBytes = 39;
   const segments: string[] = [];
   let current = "";
   let currentBytes = 0;
@@ -439,7 +440,7 @@ function encodeRfc2047Utf8Base64(value: string): string {
     segments.push(`=?UTF-8?B?${encoded}?=`);
   }
 
-  return segments.join(" ");
+  return segments.join("\r\n ");
 }
 
 export function composeMimeMessage(message: OutboundMail): string {

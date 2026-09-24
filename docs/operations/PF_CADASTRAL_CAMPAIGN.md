@@ -42,3 +42,31 @@ existente permanece, mas o template desta campanha não depende dela.
 Identidade individual + papéis, tabelas de campanha/aprovação, auditoria
 append-only, resolução humana das duplicidades, materialização imutável em
 PREPARACAO/APROVADO e só então integração com a outbox homologada.
+
+
+## Identidade operacional individual
+
+O primeiro gate após a integração do piloto introduz identidade persistente sem
+abrir qualquer capacidade de campanha:
+
+- `operator_id` persistente, nome, código e status ATIVO/SUSPENSO;
+- papéis PREPARADOR, REVISOR, APROVADOR, EXECUTOR, SUPERVISOR e ADMIN_TECNICO;
+- token individual base64url com mínimo equivalente a 256 bits; somente SHA-256
+  é persistido;
+- sessão opaca aleatória de 256 bits; somente SHA-256 é persistido;
+- cookie `__Host-ic_campaign_operator_session` com HttpOnly, Secure,
+  SameSite=Strict e Path=/;
+- `GET /api/operator/me` expõe identidade/papéis/expiração e nenhum segredo;
+- suspensão revoga tokens e sessões na mesma transação;
+- as rotas da campanha não aceitam `OPERATOR_TOKEN` nem sessão compartilhada
+  do piloto como fallback;
+- provisionamento/suspensão permanecem ações técnicas separadas;
+- auditoria append-only recebe vínculo `operator_id`.
+
+Os gates continuam fechados:
+
+```
+canPersistImport = false
+canCreateBatch   = false
+canExecute       = false
+```

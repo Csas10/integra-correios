@@ -220,6 +220,88 @@ describeDb("Ciclo administrativo individual — API E2E", () => {
     })).status).toBe(200);
   });
 
+  it("logout é idempotente para sessão já revogada e sempre remove o cookie", async () => {
+    const admin = await bootstrapAdmin();
+
+    const first = await despachar("DELETE", "/api/operator/identity/session", {
+      headers: { cookie: admin.cookie },
+    });
+    expect(first.status).toBe(200);
+    expect(first.headers["set-cookie"]).toContain("Max-Age=0");
+
+    const second = await despachar("DELETE", "/api/operator/identity/session", {
+      headers: { cookie: admin.cookie },
+    });
+    expect(second.status).toBe(200);
+    expect(second.headers["set-cookie"]).toContain("Max-Age=0");
+  });
+
+  it("dados administrativos inválidos são rejeitados com 422 antes da persistência", async () => {
+    const admin = await bootstrapAdmin();
+    const headers = { cookie: admin.cookie, "content-type": "application/json" };
+
+    const codeLongo = await despachar("POST", "/api/operator/admin/provision", {
+      headers,
+      corpo: Buffer.from(JSON.stringify({
+        code: "X".repeat(81),
+        displayName: "Operador",
+        roles: ["PREPARADOR"],
+        credentialHash: "a".repeat(64),
+      })),
+    });
+    expect(codeLongo.status).toBe(422);
+
+    const nomeLongo = await despachar("POST", "/api/operator/admin/provision", {
+      headers,
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-VALIDO",
+        displayName: "N".repeat(161),
+        roles: ["PREPARADOR"],
+        credentialHash: "a".repeat(64),
+      })),
+    });
+    expect(nomeLongo.status).toBe(422);
+
+    const uuidInvalido = await despachar("POST", "/api/operator/admin/credentials/rotate", {
+      headers,
+      corpo: Buffer.from(JSON.stringify({
+        operatorId: "nao-e-uuid",
+        credentialHash: "b".repeat(64),
+      })),
+    });
+    expect(uuidInvalido.status).toBe(422);
+
+    const expiracaoPassada = await despachar("POST", "/api/operator/admin/credentials/recover", {
+      headers,
+      corpo: Buffer.from(JSON.stringify({
+        operatorId: randomUUID(),
+        credentialHash: "c".repeat(64),
+        tokenExpiresAt: "2000-01-01T00:00:00.000Z",
+      })),
+    });
+    expect(expiracaoPassada.status).toBe(422);
+
+    const suspensaoUuidInvalido = await despachar("POST", "/api/operator/admin/suspend", {
+      headers,
+      corpo: Buffer.from(JSON.stringify({ operatorId: "invalido" })),
+    });
+    expect(suspensaoUuidInvalido.status).toBe(422);
+  });
+
+  it("auto-suspensão de ADMIN_TECNICO é bloqueada com 409", async () => {
+    const admin = await bootstrapAdmin();
+    const response = await despachar("POST", "/api/operator/admin/suspend", {
+      headers: { cookie: admin.cookie, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ operatorId: admin.operatorId })),
+    });
+    expect(response.status).toBe(409);
+    expect(response.corpo).toContain("OPERATOR_ADMIN_CONTINUITY_REQUIRED");
+
+    expect((await despachar("GET", "/api/operator/me", {
+      headers: { cookie: admin.cookie },
+    })).status).toBe(200);
+  });
+
   it("operador sem ADMIN_TECNICO recebe 403 nas ações administrativas", async () => {
     const admin = await bootstrapAdmin();
     const rawCredential = `PrepOnly_abcdefghijklmnopqrstuvwxyz0123456789${randomUUID().slice(0, 8)}`;

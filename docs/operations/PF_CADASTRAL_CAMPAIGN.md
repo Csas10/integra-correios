@@ -151,6 +151,24 @@ O comando:
 O bootstrap não usa Bearer compartilhado e não autoriza campanha, lote, outbox,
 worker ou Gmail.
 
+## Corretivos da revisão manual
+
+A revisão manual do CodeRabbit sobre o HEAD `677614c64ea375a0f3afca5a5e375fdbae0eeb12`
+originou cinco corretivos obrigatórios, sem abrir capacidades da campanha:
+
+- o compositor MIME compartilhado divide assuntos UTF-8 em múltiplos
+  `encoded-word` RFC 2047, cada um com no máximo 75 caracteres e sem cortar
+  caracteres UTF-8;
+- logout individual é idempotente: sessão já inativa remove o cookie e retorna
+  sucesso; erro de persistência continua retornando `503`;
+- rotas administrativas validam UUID, limites de tamanho e expiração antes do
+  repositório e retornam `422` para entrada inválida;
+- o pré-voo rejeita local-part de e-mail iniciado/terminado por ponto ou com
+  pontos consecutivos;
+- suspensão administrativa é transacionalmente protegida contra auto-suspensão
+  e preserva administração técnica ativa, bloqueando o conjunto de
+  `ADMIN_TECNICO` ativos durante a decisão.
+
 ## Gate restante
 
 Este incremento fecha o ciclo administrativo básico em código, mas a PR #12

@@ -9,7 +9,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { NodePostgresPool } from "../src/index.js";
+import {
+  NodePostgresPool,
+  OperatorAdminContinuityError,
+  PostgresOperatorIdentityRepository,
+} from "../src/index.js";
 
 const temBanco = Boolean(process.env.DATABASE_URL);
 const d = temBanco && process.platform !== "win32" ? describe : describe.skip;
@@ -133,6 +137,20 @@ d("bootstrap produtivo do primeiro ADMIN_TECNICO", () => {
       expect(state.rows[0]?.papel).toBe("ADMIN_TECNICO");
       expect(state.rows[0]?.token_hash).toBe(artifact.credentialHash);
       expect(state.rows[0]?.audit_type).toBe("ADMIN_BOOTSTRAP_INICIAL");
+
+      const initialAdminId = state.rows[0]!.operator_id;
+      const repository = new PostgresOperatorIdentityRepository(pool);
+      await expect(repository.suspendOperator(
+        initialAdminId,
+        initialAdminId,
+        new Date().toISOString(),
+      )).rejects.toBeInstanceOf(OperatorAdminContinuityError);
+
+      const stillActive = await pool.query<{ status: string }>(
+        "SELECT status FROM operador WHERE id = $1",
+        [initialAdminId],
+      );
+      expect(stillActive.rows[0]?.status).toBe("ATIVO");
     } finally {
       await pool.close();
     }

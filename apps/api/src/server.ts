@@ -15,6 +15,7 @@ import {
   HmacSha256Fingerprinter,
   PostgresOperatorIdentityRepository,
   OperatorAdminAuthorizationError,
+  OperatorAdminContinuityError,
   type OperatorIdentity,
   type OperatorRole,
 } from "@integra-correios/persistence";
@@ -459,6 +460,24 @@ function credentialHashValido(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
+function operatorUuidValido(value: unknown): value is string {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function textoOperadorValido(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.trim().length <= maxLength;
+}
+
+function expiracaoTokenValida(value: unknown, now: Date): boolean {
+  if (value === undefined) return true;
+  if (typeof value !== "string" || value.trim() === "") return false;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && epoch > now.getTime();
+}
+
 function operatorIdentityRepository(): PostgresOperatorIdentityRepository {
   return new PostgresOperatorIdentityRepository(requireDb().pool);
 }
@@ -653,17 +672,13 @@ const ROTAS: readonly Rota[] = [
       }
 
       try {
-        const revoked = await operatorIdentityRepository().revokeSession(
+        // Idempotente: false significa que a sessão já não está ATIVA.
+        // O cookie local pode e deve ser removido; somente falha de persistência
+        // (exceção) impede confirmar o logout.
+        await operatorIdentityRepository().revokeSession(
           hashSegredoOpaco(sessionSecret),
           new Date().toISOString(),
         );
-        if (!revoked) {
-          json(res, 503, {
-            erro: "Não foi possível confirmar a revogação da sessão.",
-            codigo: "OPERATOR_SESSION_REVOCATION_UNCONFIRMED",
-          });
-          return;
-        }
       } catch {
         json(res, 503, {
           erro: "Não foi possível confirmar a revogação da sessão.",
@@ -747,11 +762,13 @@ const ROTAS: readonly Rota[] = [
         (role) => typeof role === "string" &&
           ["PREPARADOR","REVISOR","APROVADOR","EXECUTOR","SUPERVISOR","ADMIN_TECNICO"].includes(role),
       );
+      const now = new Date();
       if (
-        typeof body.code !== "string" ||
-        typeof body.displayName !== "string" ||
+        !textoOperadorValido(body.code, 80) ||
+        !textoOperadorValido(body.displayName, 160) ||
         !rolesValid ||
-        !credentialHashValido(body.credentialHash)
+        !credentialHashValido(body.credentialHash) ||
+        !expiracaoTokenValida(body.tokenExpiresAt, now)
       ) {
         json(res, 422, {
           erro: "Dados de provisionamento inválidos.",
@@ -769,7 +786,7 @@ const ROTAS: readonly Rota[] = [
           displayName: body.displayName,
           roles: roles as OperatorRole[],
           tokenHash: body.credentialHash,
-          now: new Date().toISOString(),
+          now: now.toISOString(),
           ...(typeof body.tokenExpiresAt === "string"
             ? { tokenExpiresAt: body.tokenExpiresAt }
             : {}),
@@ -820,7 +837,12 @@ const ROTAS: readonly Rota[] = [
         json(res, 400, { erro: "JSON inválido." });
         return;
       }
-      if (typeof body.operatorId !== "string" || !credentialHashValido(body.credentialHash)) {
+      const now = new Date();
+      if (
+        !operatorUuidValido(body.operatorId) ||
+        !credentialHashValido(body.credentialHash) ||
+        !expiracaoTokenValida(body.tokenExpiresAt, now)
+      ) {
         json(res, 422, {
           erro: "Dados de rotação inválidos.",
           codigo: "OPERATOR_CREDENTIAL_ROTATION_INVALID",
@@ -834,7 +856,7 @@ const ROTAS: readonly Rota[] = [
           operatorId: body.operatorId,
           tokenHash: body.credentialHash,
           reason: "ROTACAO",
-          now: new Date().toISOString(),
+          now: now.toISOString(),
           ...(typeof body.tokenExpiresAt === "string"
             ? { tokenExpiresAt: body.tokenExpiresAt }
             : {}),
@@ -885,7 +907,12 @@ const ROTAS: readonly Rota[] = [
         json(res, 400, { erro: "JSON inválido." });
         return;
       }
-      if (typeof body.operatorId !== "string" || !credentialHashValido(body.credentialHash)) {
+      const now = new Date();
+      if (
+        !operatorUuidValido(body.operatorId) ||
+        !credentialHashValido(body.credentialHash) ||
+        !expiracaoTokenValida(body.tokenExpiresAt, now)
+      ) {
         json(res, 422, {
           erro: "Dados de recuperação inválidos.",
           codigo: "OPERATOR_CREDENTIAL_RECOVERY_INVALID",
@@ -899,7 +926,7 @@ const ROTAS: readonly Rota[] = [
           operatorId: body.operatorId,
           tokenHash: body.credentialHash,
           reason: "RECUPERACAO",
-          now: new Date().toISOString(),
+          now: now.toISOString(),
           ...(typeof body.tokenExpiresAt === "string"
             ? { tokenExpiresAt: body.tokenExpiresAt }
             : {}),
@@ -947,6 +974,13 @@ const ROTAS: readonly Rota[] = [
         json(res, 400, { erro: "JSON inválido." });
         return;
       }
+      if (!operatorUuidValido(operatorId)) {
+        json(res, 422, {
+          erro: "Identificador do operador inválido.",
+          codigo: "OPERATOR_SUSPEND_INVALID",
+        });
+        return;
+      }
       try {
         const suspended = await operatorIdentityRepository().suspendOperator(
           operatorId,
@@ -968,6 +1002,13 @@ const ROTAS: readonly Rota[] = [
           json(res, 403, {
             erro: "Administrador técnico individual não está mais autorizado.",
             codigo: "OPERATOR_ADMIN_AUTH_STALE",
+          });
+          return;
+        }
+        if (error instanceof OperatorAdminContinuityError) {
+          json(res, 409, {
+            erro: "Suspensão recusada para preservar administração técnica ativa.",
+            codigo: "OPERATOR_ADMIN_CONTINUITY_REQUIRED",
           });
           return;
         }

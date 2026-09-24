@@ -635,7 +635,6 @@ describeDb("CAMPAIGN_READ_ROUTES — papéis, contratos HTTP e zero-escrita (Pos
       ["[1,2]", "MAPPING_INVALID_SCHEMA"],
       [JSON.stringify({ nome: -1 }), "MAPPING_INVALID_SCHEMA"],
       [JSON.stringify({ nome: 1024 }), "MAPPING_INVALID_SCHEMA"],
-      [JSON.stringify({ intruso: 0 }), "MAPPING_INVALID_SCHEMA"],
     ] as const) {
       const resposta = await despachar("POST", ROTA_EVALUATE, {
         headers: { ...cookie, "x-file-name": "base.xlsx", "x-mapping": mapping },
@@ -644,6 +643,16 @@ describeDb("CAMPAIGN_READ_ROUTES — papéis, contratos HTTP e zero-escrita (Pos
       expect(resposta.status).toBe(400);
       expect(resposta.corpo).toContain(codigo);
     }
+
+    // Chave sintaticamente válida no header, mas campo fora do domínio:
+    // rejeitada na avaliação (contrato 400 CAMPO_DESCONHECIDO), não no
+    // parse estrutural do header.
+    const campoIntruso = await despachar("POST", ROTA_EVALUATE, {
+      headers: { ...cookie, "x-file-name": "base.xlsx", "x-mapping": JSON.stringify({ intruso: 0 }) },
+      corpo: xlsx(),
+    });
+    expect(campoIntruso.status).toBe(400);
+    expect(campoIntruso.corpo).toContain("CAMPO_DESCONHECIDO");
 
     const mapeamentoIncompleto = await despachar("POST", ROTA_EVALUATE, {
       headers: { ...cookie, "x-file-name": "base.xlsx", "x-mapping": JSON.stringify({ nome: 1 }) },

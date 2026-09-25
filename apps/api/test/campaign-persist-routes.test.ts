@@ -322,6 +322,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
               AND o.estado IN ('PENDING','READY','ENFILEIRADO')) AS outbox_aberta,
            (SELECT count(*)::text FROM evento_auditoria
             WHERE agregado_tipo = 'CAMPANHA_PERSISTIDA' AND agregado_id = $1) AS eventos_campanha`,
+        [corpoPersist.campanhaId],
       );
       const c = contagens.rows[0]!;
       expect(Number(c.outbox_hold)).toBe(3);

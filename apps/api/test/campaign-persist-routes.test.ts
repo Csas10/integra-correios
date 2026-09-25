@@ -168,6 +168,18 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
     const pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE! });
     const fingerprint = sha(`fingerprint-sintetico-${randomUUID()}`);
     const decisoesTeste = [{ linha: 99, profissional_id: "PF-P-0009", tipo: "EXCLUSAO_HUMANA", motivo: "TESTE" }];
+    // Delta da fila produtiva (padrão zero-escrita do repo): a CI compartilha
+    // o banco entre suítes — a prova é antes/depois, não contagem absoluta.
+    const contagemFila = async (): Promise<Record<string, string>> => {
+      const resultado = await pool.query<{ tabela: string; total: string }>(
+        `SELECT 'outbox_email' AS tabela, count(*)::text AS total FROM outbox_email
+         UNION ALL SELECT 'comunicacao', count(*)::text FROM comunicacao
+         UNION ALL SELECT 'lote_comunicacao', count(*)::text FROM lote_comunicacao
+         UNION ALL SELECT 'item_lote_comunicacao', count(*)::text FROM item_lote_comunicacao`,
+      );
+      return Object.fromEntries(resultado.rows.map((r) => [r.tabela, r.total]));
+    };
+    const antesFila = await contagemFila();
     try {
       const adminCookie = await bootstrapAdmin();
       const preparador = await provisionOperator(adminCookie, ["PREPARADOR"]);
@@ -298,24 +310,27 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
       const contagens = await pool.query<{
         outbox_hold: string;
         outbox_aberta: string;
-        outbox_email_total: string;
-        comunicacao_total: string;
         eventos_campanha: string;
       }>(
         `SELECT
-           (SELECT count(*)::text FROM outbox_campanha WHERE estado = 'HOLD') AS outbox_hold,
-           (SELECT count(*)::text FROM outbox_campanha WHERE estado IN ('PENDING','READY','ENFILEIRADO')) AS outbox_aberta,
-           (SELECT count(*)::text FROM outbox_email) AS outbox_email_total,
-           (SELECT count(*)::text FROM comunicacao) AS comunicacao_total,
-           (SELECT count(*)::text FROM evento_auditoria WHERE agregado_tipo = 'CAMPANHA_PERSISTIDA') AS eventos_campanha`,
+           (SELECT count(*)::text FROM outbox_campanha o
+             JOIN lote_campanha lc ON lc.id = o.lote_campanha_id
+            WHERE lc.campanha_id = $1 AND o.estado = 'HOLD') AS outbox_hold,
+           (SELECT count(*)::text FROM outbox_campanha o
+             JOIN lote_campanha lc ON lc.id = o.lote_campanha_id
+            WHERE lc.campanha_id = $1
+              AND o.estado IN ('PENDING','READY','ENFILEIRADO')) AS outbox_aberta,
+           (SELECT count(*)::text FROM evento_auditoria
+            WHERE agregado_tipo = 'CAMPANHA_PERSISTIDA' AND agregado_id = $1) AS eventos_campanha`,
       );
       const c = contagens.rows[0]!;
-      expect(Number(c.outbox_hold)).toBeGreaterThanOrEqual(3);
+      expect(Number(c.outbox_hold)).toBe(3);
       expect(Number(c.outbox_aberta)).toBe(0);
-      // fila produtiva INTOCADA (ponte de execução pertence a outro gate)
-      expect(Number(c.outbox_email_total)).toBe(0);
-      expect(Number(c.comunicacao_total)).toBe(0);
-      expect(Number(c.eventos_campanha)).toBeGreaterThanOrEqual(2);
+      expect(Number(c.eventos_campanha)).toBe(2); // PERSISTIDA + LOTE_CRIADO
+
+      // fila produtiva INTOCADA pela jornada inteira (delta antes/depois)
+      const depoisFila = await contagemFila();
+      expect(depoisFila).toEqual(antesFila);
 
       const repository = new PostgresOperationalRepository(pool);
       const claimed = await repository.claimOutbox("worker-teste-slice02", 10, new Date().toISOString());

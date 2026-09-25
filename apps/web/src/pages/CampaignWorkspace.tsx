@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import { AppHeader } from "../components/AppHeader";
 import { campaignLogoutDisposition } from "./campaign-logout-state";
+import { visaoEtapa8 } from "./campaign-step8-presentation";
 
 type OperatorMe = {
   operatorId: string;
@@ -779,10 +780,27 @@ export function CampaignWorkspace() {
     ? []
     : ["Seu papel ativo não autoriza aprovar (APROVADOR exigido)."];
   const podePersistir = (status?.campaign.canPersistImport ?? false) && podeAprovar && !!aprovacao;
-  const podeCriarLote =
-    (status?.campaign.canCreateBatch ?? false) &&
-    acoesAtivas.has("EXECUTAR_LOTE") &&
-    !!campanha;
+  // Etapa 08: capacidades separadas — persistir depende da aprovação da
+  // sessão; criar lote depende da CAMPANHA PERSISTIDA reconstruída
+  // (válido também após reload/logout/login com base=null e aprovacao=null).
+  const visaoEtapa = useMemo(
+    () =>
+      visaoEtapa8({
+        basePresente: base !== null,
+        aprovacaoPresente: aprovacao !== null,
+        canPersistImport: status?.campaign.canPersistImport ?? false,
+        canCreateBatch: status?.campaign.canCreateBatch ?? false,
+        acaoExecutarLote: acoesAtivas.has("EXECUTAR_LOTE"),
+        campanha: campanha
+          ? {
+              campanhaId: campanha.campanhaId,
+              hashAprovacao: campanha.hashAprovacao,
+              loteId: campanha.loteId,
+            }
+          : null,
+      }),
+    [base, aprovacao, status, campanha],
+  );
 
   function alternarExclusao(linha: number) {
     setExcluidos((atual) =>
@@ -1421,7 +1439,7 @@ export function CampaignWorkspace() {
                 <p>{aprovacao.aviso}</p>
               </div>
             ) : null}
-            {aprovacao && status?.campaign.canPersistImport ? (
+            {visaoEtapa.mostrarCtaPersistencia ? (
               <div className="campaign-persist-cta">
                 <p>
                   Aprovação congelada. Próxima ação: <strong>persistir a campanha</strong> no
@@ -1443,7 +1461,7 @@ export function CampaignWorkspace() {
                   <button
                     type="button"
                     onClick={criarLoteCampanha}
-                    disabled={criandoLote || !podeCriarLote || !campanha}
+                    disabled={criandoLote || !visaoEtapa.mostrarCtaCriarLote}
                   >
                     {criandoLote
                       ? "Criando lote…"
@@ -1457,7 +1475,7 @@ export function CampaignWorkspace() {
                     </button>
                   ) : null}
                 </div>
-                {campanha && !campanha.loteId && !podeCriarLote ? (
+                {campanha && !campanha.loteId && !visaoEtapa.mostrarCtaCriarLote ? (
                   <small role="status">
                     Criação de lote exige papel EXECUTOR ativo e o gate canCreateBatch habilitado.
                   </small>
@@ -1489,11 +1507,68 @@ export function CampaignWorkspace() {
             </div>
           </section>
         )}
-        {etapa === 8 && !base ? (
+        {etapa === 8 && visaoEtapa.mostrarFallbackImportacao ? (
           <section className="campaign-panel">
             <h2>8 · Aprovação</h2>
             <p>Nenhuma base avaliada nesta sessão.</p>
             <button type="button" onClick={() => setEtapa(3)}>Ir para a importação</button>
+          </section>
+        ) : null}
+
+        {/* Etapa 8 — campanha persistida reconstruída do PostgreSQL:
+            painel próprio, independe de base/aprovacao da sessão. */}
+        {etapa === 8 && campanha ? (
+          <section className="campaign-panel" aria-labelledby="etapa-campanha-reconstruida">
+            <h2 id="etapa-campanha-reconstruida">8 · Campanha reconstruída do PostgreSQL</h2>
+            <ul className="campaign-flow-stats">
+              <li>Campanha: <code>{campanha.campanhaId}</code></li>
+              <li>Estado: {campanha.estado}</li>
+              <li>Hash congelado: <code>{campanha.hashAprovacao}</code></li>
+              <li>Itens aprovados: {campanha.totalAprovados}</li>
+              <li>
+                Lote:{" "}
+                {campanha.loteId
+                  ? `${campanha.loteCodigo ?? ""} · ${campanha.loteEstado ?? ""}`.trim()
+                  : "não criado"}
+              </li>
+              <li>
+                Outbox: {campanha.outboxTotal} item(ns) · não executáveis:{" "}
+                {campanha.outboxNaoExecutavel}
+              </li>
+            </ul>
+            {visaoEtapa.mostrarCtaCriarLote ? (
+              <div className="campaign-persist-cta">
+                <p>
+                  Lote ainda não criado para esta campanha. Próxima ação:{" "}
+                  <strong>criar o lote controlado</strong> (outbox em HOLD — não
+                  executável, Gmail não é chamado).
+                </p>
+                <div className="campaign-panel-actions">
+                  <button
+                    type="button"
+                    onClick={criarLoteCampanha}
+                    disabled={criandoLote || !visaoEtapa.mostrarCtaCriarLote}
+                  >
+                    {criandoLote ? "Criando lote…" : "Criar lote controlado (HOLD)"}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+            {!campanha.loteId && !visaoEtapa.mostrarCtaCriarLote ? (
+              <small role="status">
+                Criação de lote exige papel EXECUTOR ativo e o gate canCreateBatch habilitado.
+              </small>
+            ) : null}
+            {visaoEtapa.mostrarLoteExistente ? (
+              <p>Lote já criado — nenhuma segunda ação de criação é oferecida.</p>
+            ) : null}
+            {visaoEtapa.mostrarAcompanharCampanha ? (
+              <div className="campaign-panel-actions">
+                <button type="button" onClick={() => setEtapa(10)}>
+                  Acompanhar campanha →
+                </button>
+              </div>
+            ) : null}
           </section>
         ) : null}
 

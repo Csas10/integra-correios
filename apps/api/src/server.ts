@@ -1167,19 +1167,22 @@ const ROTAS: readonly Rota[] = [
         });
         return;
       }
+      // Recuperação por hash (jornada pós-reload da UI) OU por fingerprint.
+      const hashConsulta = url.searchParams.get("hash")?.trim().toLowerCase() ?? "";
       const fingerprintArquivo = url.searchParams.get("fingerprint")?.trim().toLowerCase() ?? "";
-      if (!/^[0-9a-f]{64}$/.test(fingerprintArquivo)) {
+      const hashValido = /^[0-9a-f]{64}$/.test(hashConsulta);
+      const fingerprintValido = /^[0-9a-f]{64}$/.test(fingerprintArquivo);
+      if (!hashValido && !fingerprintValido) {
         json(res, 422, {
-          erro: "Fingerprint do arquivo ausente ou inválido.",
+          erro: "Informe hash (SHA-256) e/ou fingerprint (SHA-256) para recuperação.",
           codigo: "CAMPAIGN_PERSIST_INVALID",
         });
         return;
       }
       try {
-        const hashConsulta = url.searchParams.get("hash")?.trim().toLowerCase() || "";
         const estado = await recuperarEstadoCampanha(requireDbPool(), {
-          fingerprintArquivo,
-          ...(hashConsulta ? { hashAprovacao: hashConsulta } : {}),
+          ...(fingerprintValido ? { fingerprintArquivo } : {}),
+          ...(hashValido ? { hashAprovacao: hashConsulta } : {}),
         });
         if (!estado) {
           json(res, 404, {

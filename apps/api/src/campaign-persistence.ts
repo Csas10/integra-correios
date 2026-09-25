@@ -282,21 +282,35 @@ export async function persistirCampanhaAprovada(
  */
 export async function recuperarEstadoCampanha(
   pool: CampanhaPool,
-  consulta: { readonly fingerprintArquivo: string; readonly hashAprovacao?: string; readonly operatorId?: string },
+  consulta: {
+    readonly fingerprintArquivo?: string;
+    readonly hashAprovacao?: string;
+    readonly operatorId?: string;
+  },
 ): Promise<EstadoCampanhaPersistida | undefined> {
-  const fingerprint = consulta.fingerprintArquivo.trim().toLowerCase();
-  assertFingerprint(fingerprint);
-
-  const params: unknown[] = [fingerprint];
-  let filtro = "c.fingerprint_arquivo = $1";
+  const params: unknown[] = [];
+  const filtros: string[] = [];
+  if (consulta.fingerprintArquivo) {
+    const fingerprint = consulta.fingerprintArquivo.trim().toLowerCase();
+    assertFingerprint(fingerprint);
+    params.push(fingerprint);
+    filtros.push(`c.fingerprint_arquivo = $${params.length}`);
+  }
   if (consulta.hashAprovacao) {
     params.push(consulta.hashAprovacao.trim().toLowerCase());
-    filtro += ` AND c.hash_aprovacao = $${params.length}`;
+    filtros.push(`c.hash_aprovacao = $${params.length}`);
   }
   if (consulta.operatorId) {
     params.push(consulta.operatorId);
-    filtro += ` AND c.operator_id = $${params.length}`;
+    filtros.push(`c.operator_id = $${params.length}`);
   }
+  if (filtros.length === 0) {
+    throw new CampaignPersistenceError(
+      "CAMPAIGN_INPUT_INVALID",
+      "Informe ao menos um critério de recuperação (hash e/ou fingerprint).",
+    );
+  }
+  const filtro = filtros.join(" AND ");
 
   const resultado = await pool.query(
     `SELECT c.id AS campanha_id, c.operator_id, c.fingerprint_arquivo,

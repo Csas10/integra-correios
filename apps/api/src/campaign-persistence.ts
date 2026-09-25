@@ -21,7 +21,7 @@
  * capturável enquanto canExecute=false. Nenhum e-mail é enviado neste fluxo.
  */
 
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
   CAMPAIGN_TEMPLATE_VERSAO_PADRAO,
   codigoLoteCampanha,

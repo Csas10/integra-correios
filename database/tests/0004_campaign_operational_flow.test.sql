@@ -364,23 +364,21 @@ $zero_claim$;
 --    testes HTTP), e o banco prova as constraints estruturais.
 -- ---------------------------------------------------------------------------
 
-BEGIN
-  INSERT INTO evento_auditoria (
-    id, agregado_tipo, agregado_id, tipo, operator_id, ator_operator_id,
-    ocorreu_em, metadados, hash_anterior, hash_evento
-  ) VALUES (
-    '89000000-0000-4000-8000-000000000001',
-    'CAMPANHA_PERSISTIDA',
-    '84000000-0000-4000-8000-000000000001',
-    'CAMPAIGN_PERSISTIDA',
-    '81000000-0000-4000-8000-000000000002',
-    '81000000-0000-4000-8000-000000000002',
-    now(), '{"total_aprovados":3}'::jsonb, NULL, repeat('7',64)
-  );
-EXCEPTION WHEN OTHERS THEN
-  RAISE EXCEPTION 'auditoria da campanha deveria ser aceita: %', SQLERRM;
-END;
+-- INSERT aceito (fail-fast: qualquer erro aborta a suíte via ON_ERROR_STOP).
+INSERT INTO evento_auditoria (
+  id, agregado_tipo, agregado_id, tipo, operator_id, ator_operator_id,
+  ocorreu_em, metadados, hash_anterior, hash_evento
+) VALUES (
+  '89000000-0000-4000-8000-000000000001',
+  'CAMPANHA_PERSISTIDA',
+  '84000000-0000-4000-8000-000000000001',
+  'CAMPAIGN_PERSISTIDA',
+  '81000000-0000-4000-8000-000000000002',
+  '81000000-0000-4000-8000-000000000002',
+  now(), '{"total_aprovados":3}'::jsonb, NULL, repeat('7',64)
+);
 
+DO $append_only$
 BEGIN
   UPDATE evento_auditoria SET tipo = 'MUTADO'
    WHERE id = '89000000-0000-4000-8000-000000000001';
@@ -388,14 +386,17 @@ BEGIN
 EXCEPTION
   WHEN raise_exception THEN
     IF SQLERRM <> 'evento_auditoria é append-only' THEN RAISE; END IF;
-END;
+END
+$append_only$;
 
+DO $append_only2$
 BEGIN
   DELETE FROM evento_auditoria WHERE id = '89000000-0000-4000-8000-000000000001';
   RAISE EXCEPTION 'DELETE de auditoria foi aceito';
 EXCEPTION
   WHEN raise_exception THEN
     IF SQLERRM <> 'evento_auditoria é append-only' THEN RAISE; END IF;
-END;
+END
+$append_only2$;
 
 ROLLBACK;

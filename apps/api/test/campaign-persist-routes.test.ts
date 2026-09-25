@@ -298,19 +298,23 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
       const contagens = await pool.query<{
         outbox_hold: string;
         outbox_aberta: string;
-        processando: string;
+        outbox_email_total: string;
+        comunicacao_total: string;
         eventos_campanha: string;
       }>(
         `SELECT
            (SELECT count(*)::text FROM outbox_campanha WHERE estado = 'HOLD') AS outbox_hold,
            (SELECT count(*)::text FROM outbox_campanha WHERE estado IN ('PENDING','READY','ENFILEIRADO')) AS outbox_aberta,
-           (SELECT count(*)::text FROM item_lote_comunicacao WHERE status = 'PROCESSANDO') AS processando,
+           (SELECT count(*)::text FROM outbox_email) AS outbox_email_total,
+           (SELECT count(*)::text FROM comunicacao) AS comunicacao_total,
            (SELECT count(*)::text FROM evento_auditoria WHERE agregado_tipo = 'CAMPANHA_PERSISTIDA') AS eventos_campanha`,
       );
       const c = contagens.rows[0]!;
       expect(Number(c.outbox_hold)).toBeGreaterThanOrEqual(3);
       expect(Number(c.outbox_aberta)).toBe(0);
-      expect(Number(c.processando)).toBe(0);
+      // fila produtiva INTOCADA (ponte de execução pertence a outro gate)
+      expect(Number(c.outbox_email_total)).toBe(0);
+      expect(Number(c.comunicacao_total)).toBe(0);
       expect(Number(c.eventos_campanha)).toBeGreaterThanOrEqual(2);
 
       const repository = new PostgresOperationalRepository(pool);

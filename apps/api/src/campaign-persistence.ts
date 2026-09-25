@@ -3,9 +3,12 @@
  *
  * Duas ações transacionais ÚNICAS e fail-fast:
  *   1. persistirCampanhaAprovada: campanha + decisões humanas + auditoria;
- *   2. persistirLoteCampanha (papel EXECUTOR): lote produtivo (PREPARACAO) +
- *      vínculo campanha→lote + outbox própria em HOLD (NÃO capturável pelo
- *      worker) + auditoria.
+ *   2. persistirLoteCampanha (papel EXECUTOR): lote_campanha em HOLD +
+ *      outbox própria em HOLD (NÃO capturável pelo worker) + auditoria.
+ *
+ * A ponte para a fila produtiva (lote_comunicacao/comunicacao — que exigem
+ * profissional e confirmação reais) pertence ao FUTURO fluxo de execução;
+ * aqui NENHUMA linha é criada em profissional/comunicacao/outbox_email.
  * Qualquer falha = ROLLBACK integral — nada fica parcialmente persistido.
  *
  * Idempotência por (fingerprint_arquivo, hash_aprovacao): repetir a chamada
@@ -374,6 +377,8 @@ export interface LoteCampanhaResultado {
  * worker. Idempotente: lote já existente é devolvido sem duplicar nada.
  * O hash submetido é confrontado com o hash CONGELADO da campanha (409 stale
  * em caso de divergência); operator_id vem da sessão autenticada.
+ * Nenhum item é criado nas filas produtivas: outbox_email/comunicacao
+ * permanecem intocadas (a ponte de execução é outro gate).
  */
 export async function persistirLoteCampanha(
   pool: CampanhaPool,
@@ -447,16 +452,9 @@ export async function persistirLoteCampanha(
     }
 
     const agora = new Date().toISOString();
-    const loteProdutivoId = randomUUID();
     const loteCampanhaId = randomUUID();
     const loteCodigo = codigoLoteCampanha(campanhaLinha.fingerprint_arquivo);
 
-    await transaction.query(
-      `INSERT INTO lote_comunicacao (
-        id, origem, codigo, template_versao, status, criado_por, criado_em
-      ) VALUES ($1, 'PF', $2, $3, 'PREPARACAO', $4, $5)`,
-      [loteProdutivoId, loteCodigo, campanhaLinha.template_versao, command.operatorId, agora],
-    );
     await transaction.query(
       `INSERT INTO lote_campanha (
         id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em
@@ -470,36 +468,8 @@ export async function persistirLoteCampanha(
         agora,
       ],
     );
-    await transaction.query(
-      `INSERT INTO campanha_lote (campanha_id, lote_comunicacao_id, origem, criado_em)
-       VALUES ($1, $2, 'PF', $3)`,
-      [command.campanhaId, loteProdutivoId, agora],
-    );
-
     for (let ordem = 1; ordem <= registrosAptos.length; ordem += 1) {
       const registro = registrosAptos[ordem - 1]!;
-      const comunicacaoId = randomUUID();
-      await transaction.query(
-        `INSERT INTO comunicacao (
-          id, profissional_id, confirmacao_id, lote_comunicacao_id, origem, provider,
-          destinatario_fingerprint, template_versao, idempotency_key, status, fonte_registro, criada_em
-        ) VALUES ($1, $2, $1, $3, 'PF', 'PENDING', $4, $5, $6, 'QUEUED', 'CAMPANHA_PF', $7)`,
-        [
-          comunicacaoId,
-          registro.profissional_id,
-          loteProdutivoId,
-          campanhaLinha.hash_aprovacao,
-          campanhaLinha.template_versao,
-          `${campanhaLinha.hash_aprovacao}:${ordem}`,
-          agora,
-        ],
-      );
-      await transaction.query(
-        `INSERT INTO item_lote_comunicacao (
-          lote_comunicacao_id, profissional_id, comunicacao_id, origem, status, criado_em, atualizado_em
-        ) VALUES ($1, $2, $3, 'PF', 'RESERVADO', $4, $4)`,
-        [loteProdutivoId, registro.profissional_id, comunicacaoId, agora],
-      );
       await transaction.query(
         `INSERT INTO outbox_campanha (
           id, lote_campanha_id, ordem, destinatario_fingerprint, payload_snapshot, estado, criada_em

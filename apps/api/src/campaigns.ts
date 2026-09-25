@@ -84,12 +84,18 @@ export type PfCampaignBlockedActionReason =
   | "APPROVAL_INVALIDATED"
   | "EXECUTION_NOT_READY";
 
+/**
+ * Capability gates da campanha. Defaults FALSE: nenhum gate abre por ausência
+ * de configuração — somente flags explícitas de ambiente habilitam persistência
+ * e lote controlado no Preview. Execução NÃO tem flag: permanece fechada até
+ * gate dedicado futuro.
+ */
 export interface PfUpdateCampaignPolicy {
   readonly enabled: boolean;
-  readonly phase: "FOUNDATION";
+  readonly phase: "FOUNDATION" | "PERSISTENCE";
   readonly individualOperatorIdentityRequired: true;
-  readonly canPersistImport: false;
-  readonly canCreateBatch: false;
+  readonly canPersistImport: boolean;
+  readonly canCreateBatch: boolean;
   readonly canExecute: false;
   readonly realSendEnabled: boolean;
 }
@@ -101,10 +107,10 @@ export function carregarPoliticaCampanhaAtualizacao(
 ): PfUpdateCampaignPolicy {
   return {
     enabled: env.PF_CAMPAIGN_ENABLED === "true",
-    phase: "FOUNDATION",
+    phase: env.PF_CAMPAIGN_PERSIST_ENABLED === "true" ? "PERSISTENCE" : "FOUNDATION",
     individualOperatorIdentityRequired: true,
-    canPersistImport: false,
-    canCreateBatch: false,
+    canPersistImport: env.PF_CAMPAIGN_PERSIST_ENABLED === "true",
+    canCreateBatch: env.PF_CAMPAIGN_BATCH_ENABLED === "true",
     canExecute: false,
     realSendEnabled: env.REAL_SEND_ENABLED === "true",
   };
@@ -203,4 +209,78 @@ export function baseSinteticaCampanha(): readonly {
       motivo_bloqueio: [],
     },
   ];
+}
+
+
+// ---------------------------------------------------------------------------
+// SLICE-02 — Fluxo operacional persistente (migration 0007). O snapshot é
+// reconstruído NO SERVIDOR a partir do conteúdo re-submetido e validado;
+// o hash é sempre recalculado aqui — nada disso é confiado ao navegador.
+// ---------------------------------------------------------------------------
+
+export const CAMPAIGN_TEMPLATE_VERSAO_PADRAO =
+  "pf-atualizacao-cadastral-2026-v1" as const;
+
+export interface CampaignPersistRegistro {
+  readonly profissional_id: string;
+  readonly nome: string;
+  readonly email_normalizado: string;
+  readonly status_validacao: string;
+}
+
+export interface CampaignPersistDecisao {
+  readonly linha: number;
+  readonly profissional_id: string;
+  readonly tipo: "EXCLUSAO_HUMANA" | "INCONSISTENCIA_JULGADA";
+  readonly motivo: string;
+}
+
+export interface CampaignPersistInput {
+  readonly fingerprintArquivo: string;
+  readonly templateVersao: string;
+  readonly registros: readonly CampaignPersistRegistro[];
+  readonly decisoes: readonly CampaignPersistDecisao[];
+}
+
+export interface CampaignPersistSnapshot {
+  readonly template_versao: string;
+  readonly total_registros: number;
+  readonly total_aptos: number;
+  readonly total_bloqueados: number;
+  readonly total_aprovados: number;
+  readonly registros: readonly CampaignPersistRegistro[];
+  readonly decisoes_humanas: readonly CampaignPersistDecisao[];
+}
+
+/**
+ * Snapshot determinístico do conteúdo aprovado. `registros` contém APENAS os
+ * aptos (o aprovado); e-mails permanecem normalizados (sem valor bruto) e
+ * nenhuma credencial ou PII sensível entra no snapshot.
+ */
+export function snapshotCampanha(input: CampaignPersistInput): CampaignPersistSnapshot {
+  const registrosAptos = input.registros.filter(
+    (registro) => registro.status_validacao === "APTO",
+  );
+  return {
+    template_versao: input.templateVersao,
+    total_registros: input.registros.length,
+    total_aptos: registrosAptos.length,
+    total_bloqueados: input.registros.length - registrosAptos.length,
+    total_aprovados: registrosAptos.length - input.decisoes.length,
+    registros: registrosAptos,
+    decisoes_humanas: input.decisoes,
+  };
+}
+
+/** Recalcula o hash de aprovação a partir do snapshot congelado. */
+export function hashDoSnapshotCampanha(snapshot: CampaignPersistSnapshot): string {
+  return hashAprovacaoCampanha({
+    templateVersao: snapshot.template_versao,
+    registros: snapshot.registros,
+  });
+}
+
+/** Código operacional do lote controlado da campanha (determinístico). */
+export function codigoLoteCampanha(fingerprintArquivo: string): string {
+  return `CAMPANHA_PF_${fingerprintArquivo.slice(0, 12).toUpperCase()}`;
 }

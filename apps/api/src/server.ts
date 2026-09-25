@@ -78,6 +78,14 @@ import {
   avaliarArquivoCampanha,
   avaliarBaseCampanha,
 } from "./campaign-import.js";
+import {
+  CampaignPersistenceError,
+  recuperarEstadoCampanha,
+  persistirCampanhaAprovada,
+  persistirLoteCampanha,
+  type CampaignPersistDecisao,
+  type CampaignPersistRegistro,
+} from "./campaign-persistence.js";
 import { createWebTokenService } from "@integra-correios/pf-workflow";
 import {
   MapeamentoInvalidoError,
@@ -172,6 +180,10 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "POST /api/operator/admin/credentials/recover",
   "POST /api/operator/admin/suspend",
   "GET /api/operator/admin/operators",
+  "GET /api/campaigns/persisted",
+  "GET /api/campaigns/batch",
+  "POST /api/campaigns/persist",
+  "POST /api/campaigns/batch",
 ]);
 
 
@@ -186,6 +198,130 @@ const CAMPAIGN_WORKSPACE_ROLES: readonly OperatorRole[] = [
   "EXECUTOR",
   "SUPERVISOR",
 ];
+
+/**
+ * SLICE-02 — Papéis que autorizam o fluxo persistente de campanha.
+ * ADMIN_TECNICO administra identidade, NÃO campanha (sem poder implícito).
+ */
+const CAMPAIGN_OPERATIONAL_ROLES: readonly OperatorRole[] = [
+  "PREPARADOR",
+  "REVISOR",
+  "APROVADOR",
+  "EXECUTOR",
+  "SUPERVISOR",
+];
+
+/** Pool do banco operacional (mesma fonte do requireDb, sem repository). */
+function requireDbPool(): NodePostgresPool {
+  return requireDb().pool;
+}
+
+/** Validação server-side da submissão de aprovação (mesma regra do authorize). */
+function validarSubmissaoAprovacao(corpo: unknown): {
+  registros: CampaignPersistRegistro[];
+  templateVersao: string;
+} | undefined {
+  const entrada = corpo as {
+    templateVersao?: unknown;
+    registros?: unknown;
+  };
+  const templateVersao =
+    typeof entrada.templateVersao === "string" && entrada.templateVersao.trim() !== ""
+      ? entrada.templateVersao.trim()
+      : "pf-atualizacao-cadastral-2026-v1";
+  const registros = Array.isArray(entrada.registros) ? entrada.registros : [];
+  if (
+    templateVersao.length > 80 ||
+    registros.length === 0 ||
+    registros.length > 20_000 ||
+    !registros.every((registroBruto) => {
+      const registro = registroBruto as {
+        profissional_id?: unknown;
+        nome?: unknown;
+        email_normalizado?: unknown;
+        status_validacao?: unknown;
+      };
+      return (
+        typeof registro === "object" &&
+        registro !== null &&
+        typeof registro.profissional_id === "string" &&
+        registro.profissional_id.trim() !== "" &&
+        typeof registro.nome === "string" &&
+        registro.nome.trim() !== "" &&
+        typeof registro.email_normalizado === "string" &&
+        registro.email_normalizado.trim() !== "" &&
+        registro.status_validacao === "APTO"
+      );
+    })
+  ) {
+    return undefined;
+  }
+  return { registros: registros as CampaignPersistRegistro[], templateVersao };
+}
+
+/** Decisões humanas estruturadas (coerentes com as linhas dos registros). */
+function validarDecisoesHumanas(corpo: unknown): CampaignPersistDecisao[] | undefined {
+  const entrada = corpo as { decisoes?: unknown };
+  if (entrada.decisoes === undefined) return [];
+  if (!Array.isArray(entrada.decisoes) || entrada.decisoes.length > 20_000) return undefined;
+  const decisoes: CampaignPersistDecisao[] = [];
+  for (const item of entrada.decisoes) {
+    const candidata = item as {
+      linha?: unknown;
+      profissional_id?: unknown;
+      tipo?: unknown;
+      motivo?: unknown;
+    };
+    if (
+      typeof item !== "object" ||
+      item === null ||
+      !Number.isSafeInteger(candidata.linha) ||
+      (candidata.linha as number) < 1 ||
+      typeof candidata.profissional_id !== "string" ||
+      candidata.profissional_id.trim() === "" ||
+      (candidata.tipo !== "EXCLUSAO_HUMANA" && candidata.tipo !== "INCONSISTENCIA_JULGADA") ||
+      typeof candidata.motivo !== "string" ||
+      candidata.motivo.trim() === ""
+    ) {
+      return undefined;
+    }
+    const decisao = item as {
+      linha: number;
+      profissional_id: string;
+      tipo: "EXCLUSAO_HUMANA" | "INCONSISTENCIA_JULGADA";
+      motivo: string;
+    };
+    decisoes.push({
+      linha: decisao.linha,
+      profissional_id: decisao.profissional_id.trim(),
+      tipo: decisao.tipo,
+      motivo: decisao.motivo.trim().slice(0, 80),
+    });
+  }
+  return decisoes;
+}
+
+function erroPersistenciaCampanha(
+  res: ServerResponse,
+  error: unknown,
+): void {
+  if (error instanceof CampaignPersistenceError) {
+    const status =
+      error.code === "CAMPAIGN_INPUT_INVALID" ||
+      error.code === "CAMPAIGN_NOT_APPROVED" ||
+      error.code === "CAMPAIGN_BATCH_INVALID"
+        ? 422
+        : error.code === "CAMPAIGN_APPROVAL_STALE"
+          ? 409
+          : error.code === "CAMPAIGN_PERSISTED_NOT_FOUND"
+            ? 404
+            : 500;
+    json(res, status, { erro: error.message, codigo: error.code });
+    return;
+  }
+  const mensagem = error instanceof Error ? error.message : "Erro interno.";
+  json(res, 500, { erro: mensagem.slice(0, 200) });
+}
 
 /** F12 — TTL da sessão operacional (cookie HttpOnly; token NUNCA vai ao browser). */
 const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
@@ -920,6 +1056,284 @@ const ROTAS: readonly Rota[] = [
         aviso:
           "Aprovação calculada e devolvida para manifestação — NADA foi persistido nesta fase (canPersistImport=false, canCreateBatch=false).",
       });
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // SLICE-02 — PERSISTÊNCIA CONTROLADA (0007). Sessão individual +
+  // operador ATIVO + papel operacional + flags server-side + hash
+  // recalculado do conteúdo re-submetido. 409 CAMPAIGN_APPROVAL_STALE
+  // quando o conteúdo diverge da aprovação submetida. Idempotente.
+  // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/persist",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const politica = carregarPoliticaCampanhaAtualizacao();
+      if (!politica.canPersistImport) {
+        json(res, 403, {
+          erro: "Persistência da campanha desabilitada por política.",
+          codigo: "CAMPAIGN_PERSIST_DISABLED",
+        });
+        return;
+      }
+      if (identity.status !== "ATIVO") {
+        json(res, 403, {
+          erro: "Operador suspenso não pode persistir campanha.",
+          codigo: "OPERATOR_SUSPENDED",
+        });
+        return;
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as Record<string, unknown>;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_PERSIST_JSON_INVALID" });
+        return;
+      }
+      const submissao = validarSubmissaoAprovacao(body);
+      if (!submissao) {
+        json(res, 422, {
+          erro: "Dados de persistência inválidos: registros aptos são obrigatórios.",
+          codigo: "CAMPAIGN_PERSIST_INVALID",
+        });
+        return;
+      }
+      const decisoes = validarDecisoesHumanas(body);
+      if (!decisoes) {
+        json(res, 422, {
+          erro: "Decisões humanas inválidas.",
+          codigo: "CAMPAIGN_PERSIST_DECISIONS_INVALID",
+        });
+        return;
+      }
+      const fingerprintHash = hashAprovacaoCampanha({
+        templateVersao: submissao.templateVersao,
+        registros: submissao.registros,
+      });
+      const hashSubmetido =
+        typeof body.conteudoHash === "string" ? body.conteudoHash.trim().toLowerCase() : "";
+      if (hashSubmetido && hashSubmetido !== fingerprintHash) {
+        json(res, 409, {
+          erro: "Conteúdo divergiu da aprovação congelada — reprovar e reaprovar.",
+          codigo: "CAMPAIGN_APPROVAL_STALE",
+        });
+        return;
+      }
+      const fingerprintArquivo =
+        typeof body.fingerprintArquivo === "string" ? body.fingerprintArquivo.trim().toLowerCase() : "";
+      if (!/^[0-9a-f]{64}$/.test(fingerprintArquivo)) {
+        json(res, 422, {
+          erro: "Fingerprint do arquivo de origem ausente ou inválido.",
+          codigo: "CAMPAIGN_PERSIST_INVALID",
+        });
+        return;
+      }
+      try {
+        const resultado = await persistirCampanhaAprovada(requireDbPool(), {
+          operatorId: identity.operatorId,
+          fingerprintArquivo,
+          registros: submissao.registros,
+          decisoes,
+          templateVersao: submissao.templateVersao,
+        });
+        json(res, resultado.resultado === "CRIADA" ? 201 : 200, {
+          status: resultado.resultado === "CRIADA" ? "CAMPAIGN_PERSISTED" : "CAMPAIGN_ALREADY_PERSISTED",
+          campanhaId: resultado.campanhaId,
+          conteudoHash: resultado.hashAprovacao,
+          totalItens: submissao.registros.length,
+          aprovadaPor: identity.operatorId,
+          persistida: true,
+          aviso:
+            "Campanha persistida com hash recalculado no servidor. Lote e outbox ainda não foram criados (use /api/campaigns/batch).",
+        });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/persisted",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      if (!carregarPoliticaCampanhaAtualizacao().canPersistImport) {
+        json(res, 403, {
+          erro: "Persistência da campanha desabilitada por política.",
+          codigo: "CAMPAIGN_PERSIST_DISABLED",
+        });
+        return;
+      }
+      const fingerprintArquivo = url.searchParams.get("fingerprint")?.trim().toLowerCase() ?? "";
+      if (!/^[0-9a-f]{64}$/.test(fingerprintArquivo)) {
+        json(res, 422, {
+          erro: "Fingerprint do arquivo ausente ou inválido.",
+          codigo: "CAMPAIGN_PERSIST_INVALID",
+        });
+        return;
+      }
+      try {
+        const hashConsulta = url.searchParams.get("hash")?.trim().toLowerCase() || "";
+        const estado = await recuperarEstadoCampanha(requireDbPool(), {
+          fingerprintArquivo,
+          ...(hashConsulta ? { hashAprovacao: hashConsulta } : {}),
+        });
+        if (!estado) {
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este fingerprint/hash.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, 200, { campanha: estado });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/batch",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      if (!carregarPoliticaCampanhaAtualizacao().canCreateBatch) {
+        json(res, 403, {
+          erro: "Criação de lote desabilitada por política.",
+          codigo: "CAMPAIGN_BATCH_DISABLED",
+        });
+        return;
+      }
+      if (!identity.roles.includes("EXECUTOR")) {
+        json(res, 403, {
+          erro: "Criação de lote exige papel EXECUTOR.",
+          codigo: "OPERATOR_ROLE_FORBIDDEN",
+        });
+        return;
+      }
+      if (identity.status !== "ATIVO") {
+        json(res, 403, {
+          erro: "Operador suspenso não pode criar lote.",
+          codigo: "OPERATOR_SUSPENDED",
+        });
+        return;
+      }
+      let body: { campanhaId?: unknown; conteudoHash?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_BATCH_JSON_INVALID" });
+        return;
+      }
+      if (
+        !operatorUuidValido(body.campanhaId) ||
+        typeof body.conteudoHash !== "string" ||
+        !/^[0-9a-f]{64}$/.test(body.conteudoHash.trim().toLowerCase())
+      ) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) e conteudoHash (SHA-256) são obrigatórios.",
+          codigo: "CAMPAIGN_BATCH_INVALID",
+        });
+        return;
+      }
+      const campanhaId = body.campanhaId as string;
+      const hashSubmetido = body.conteudoHash.trim().toLowerCase();
+      try {
+        const lote = await persistirLoteCampanha(requireDbPool(), {
+          campanhaId,
+          operatorId: identity.operatorId,
+          hashSubmetido,
+        });
+        json(res, lote.resultado === "CRIADO" ? 201 : 200, {
+          status:
+            lote.resultado === "CRIADO"
+              ? "CAMPAIGN_BATCH_CREATED"
+              : "CAMPAIGN_BATCH_ALREADY_EXISTS",
+          campanhaId,
+          lote: {
+            id: lote.loteCampanhaId,
+            codigo: lote.loteCodigo,
+            estado: lote.estado,
+            totalItens: lote.totalItens,
+            outboxTotal: lote.outboxTotal,
+            outboxNaoExecutavel: lote.outboxNaoExecutavel,
+          },
+          executavel: false,
+          aviso:
+            lote.resultado === "CRIADO"
+              ? "Lote criado em HOLD e outbox NÃO capturável pelo worker (canExecute=false). Nenhuma chamada Gmail foi realizada."
+              : "Lote já existente — nenhuma duplicação (idempotência). Gmail não foi chamado.",
+        });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/batch",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      if (!carregarPoliticaCampanhaAtualizacao().canCreateBatch) {
+        json(res, 403, {
+          erro: "Criação de lote desabilitada por política.",
+          codigo: "CAMPAIGN_BATCH_DISABLED",
+        });
+        return;
+      }
+      const campanhaId = url.searchParams.get("campanhaId")?.trim() ?? "";
+      if (!operatorUuidValido(campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_BATCH_INVALID",
+        });
+        return;
+      }
+      try {
+        const estado = await requireDbPool().query<{
+          lote_id: string | null;
+          lote_codigo: string | null;
+          lote_estado: string | null;
+          total_itens: number | null;
+          outbox_total: string | null;
+          outbox_hold: string | null;
+        }>(
+          `SELECT lc.id AS lote_id, lc.codigo AS lote_codigo, lc.estado AS lote_estado,
+                  lc.total_itens,
+                  (SELECT count(*)::text FROM outbox_campanha o WHERE o.lote_campanha_id = lc.id) AS outbox_total,
+                  (SELECT count(*)::text FROM outbox_campanha o
+                    WHERE o.lote_campanha_id = lc.id AND o.estado IN ('HOLD','PREPARADO')) AS outbox_hold
+             FROM lote_campanha lc
+            WHERE lc.campanha_id = $1
+            LIMIT 1`,
+          [campanhaId],
+        );
+        const lote = estado.rows[0];
+        if (!lote?.lote_id) {
+          json(res, 404, {
+            erro: "Nenhum lote para esta campanha.",
+            codigo: "CAMPAIGN_BATCH_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, 200, {
+          lote: {
+            id: lote.lote_id,
+            codigo: lote.lote_codigo,
+            estado: lote.lote_estado,
+            totalItens: lote.total_itens,
+            outboxTotal: Number(lote.outbox_total ?? 0),
+            outboxNaoExecutavel: Number(lote.outbox_hold ?? 0),
+          },
+          executavel: false,
+        });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
     },
   },
   {

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import { AppHeader } from "../components/AppHeader";
 import { campaignLogoutDisposition } from "./campaign-logout-state";
+import { visaoEtapa8 } from "./campaign-step8-presentation";
 
 type OperatorMe = {
   operatorId: string;
@@ -14,12 +15,45 @@ type OperatorMe = {
 
 type CampaignPolicy = {
   enabled: boolean;
-  phase: "FOUNDATION";
+  phase: "FOUNDATION" | "PERSISTENCE";
   individualOperatorIdentityRequired: true;
-  canPersistImport: false;
-  canCreateBatch: false;
+  canPersistImport: boolean;
+  canCreateBatch: boolean;
   canExecute: false;
   realSendEnabled: boolean;
+};
+
+type RegistroAprovacao = {
+  profissional_id: string;
+  nome: string;
+  email_normalizado: string;
+  status_validacao: string;
+};
+
+type DecisaoHumana = {
+  linha: number;
+  profissional_id: string;
+  tipo: "EXCLUSAO_HUMANA" | "INCONSISTENCIA_JULGADA";
+  motivo: string;
+};
+
+type CampanhaPersistida = {
+  campanhaId: string;
+  operatorId: string;
+  fingerprintArquivo: string;
+  templateVersao: string;
+  hashAprovacao: string;
+  estado: string;
+  totalRegistros: number;
+  totalAptos: number;
+  totalBloqueados: number;
+  totalAprovados: number;
+  loteId: string | null;
+  loteCodigo: string | null;
+  loteEstado: string | null;
+  outboxTotal: number;
+  outboxNaoExecutavel: number;
+  criadaEm: string;
 };
 
 type WorkspaceStatus = {
@@ -180,6 +214,11 @@ function gerarCredencialIndividual(): Promise<{ credencial: string; hash: string
   }));
 }
 
+async function sha256Hex(valor: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(valor));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   const response = await fetch(input, { credentials: "same-origin", cache: "no-store", ...init });
   const texto = await response.text();
@@ -238,6 +277,10 @@ export function CampaignWorkspace() {
   const [credencialUnica, setCredencialUnica] = useState<{ operator: string; credencial: string } | null>(null);
   const [credencialSalvaConfirmada, setCredencialSalvaConfirmada] = useState(false);
   const [credencialExpiracaoDias, setCredencialExpiracaoDias] = useState(90);
+  const [persistindo, setPersistindo] = useState(false);
+  const [criandoLote, setCriandoLote] = useState(false);
+  const [campanha, setCampanha] = useState<CampanhaPersistida | null>(null);
+  const [hashSessao, setHashSessao] = useState(sessionStorage.getItem("ic_campanha_hash") ?? "");
 
   async function loadMe(): Promise<boolean> {
     try {
@@ -294,6 +337,30 @@ export function CampaignWorkspace() {
       ativo = false;
     };
   }, [me]);
+
+  // SLICE-02 — Recuperação do estado persistido (etapa 10 reconstrói do
+  // PostgreSQL): reload/logout/login não pode apagar a campanha. A busca usa
+  // o hash congelado desta sessão do navegador; sem hash, nada é consultado.
+  useEffect(() => {
+    if (!me || !hashSessao) {
+      setCampanha(null);
+      return;
+    }
+    let ativo = true;
+    void (async () => {
+      try {
+        const resposta = await fetchJson<{ campanha: CampanhaPersistida }>(
+          `/api/campaigns/persisted?hash=${encodeURIComponent(hashSessao)}`,
+        );
+        if (ativo) setCampanha(resposta.campanha);
+      } catch {
+        if (ativo) setCampanha(null);
+      }
+    })();
+    return () => {
+      ativo = false;
+    };
+  }, [me, hashSessao]);
 
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -525,6 +592,9 @@ export function CampaignWorkspace() {
       setBase(resultado);
       setExcluidos([]);
       setAprovacao(null);
+      setCampanha(null);
+      setHashSessao("");
+      sessionStorage.removeItem("ic_campanha_hash");
       setEtapa(5);
     } catch (error) {
       setErroEtapa(
@@ -564,6 +634,8 @@ export function CampaignWorkspace() {
         }),
       });
       setAprovacao(resultado);
+      setHashSessao(resultado.conteudoHash);
+      sessionStorage.setItem("ic_campanha_hash", resultado.conteudoHash);
       setEtapa(8);
     } catch (error) {
       setErroEtapa(
@@ -574,9 +646,95 @@ export function CampaignWorkspace() {
     }
   }
 
+  // SLICE-02 — persistir a campanha aprovada (hash + snapshot RECONSTRUÍDOS
+  // no servidor; o navegador envia apenas conteúdo, decisões e hash local).
+  async function persistirCampanha() {
+    if (!base || !aprovacao) return;
+    setErroEtapa("");
+    setPersistindo(true);
+    try {
+      const fingerprint = base.sha256 === "sintetico-dev" ? await sha256Hex("sintetico-dev") : base.sha256;
+      const resposta = await fetchJson<{
+        status: string;
+        campanhaId: string;
+        conteudoHash: string;
+      }>("/api/campaigns/persist", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_VERSAO_PADRAO,
+          conteudoHash: aprovacao.conteudoHash,
+          registros: aptosParaAprovacao.map((registro) => ({
+            profissional_id: registro.profissional_id,
+            nome: registro.nome,
+            email_normalizado: registro.email_normalizado,
+            status_validacao: registro.status_validacao,
+          })),
+          decisoes: excluidos.map((linha) => {
+            const registro = base.registros.find((item) => item.linha === linha);
+            return {
+              linha,
+              profissional_id: registro?.profissional_id ?? "",
+              tipo: "EXCLUSAO_HUMANA",
+              motivo: registro?.inconsistencias?.[0] ?? "EXCLUSAO_HUMANA_REVISAO",
+            } satisfies DecisaoHumana;
+          }),
+        }),
+      });
+      const detalhe = await fetchJson<{ campanha: CampanhaPersistida }>(
+        `/api/campaigns/persisted?hash=${encodeURIComponent(resposta.conteudoHash)}`,
+      );
+      setCampanha(detalhe.campanha);
+      setHashSessao(resposta.conteudoHash);
+      sessionStorage.setItem("ic_campanha_hash", resposta.conteudoHash);
+      setEtapa(10);
+    } catch (error) {
+      setErroEtapa(
+        error instanceof ApiCampanhaError ? error.message : "Persistência recusada pelo servidor.",
+      );
+    } finally {
+      setPersistindo(false);
+    }
+  }
+
+  // SLICE-02 — lote controlado (EXECUTOR): materializa outbox em HOLD; nada
+  // é executável e o Gmail não é chamado.
+  async function criarLoteCampanha() {
+    if (!campanha) return;
+    setErroEtapa("");
+    setCriandoLote(true);
+    try {
+      const resposta = await fetchJson<{ lote: CampanhaPersistida["loteId"] extends null ? never : { id: string; estado: string; totalItens: number; outboxTotal: number; outboxNaoExecutavel: number } }>(
+        "/api/campaigns/batch",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            campanhaId: campanha.campanhaId,
+            conteudoHash: campanha.hashAprovacao,
+          }),
+        },
+      );
+      const detalhe = await fetchJson<{ campanha: CampanhaPersistida }>(
+        `/api/campaigns/persisted?hash=${encodeURIComponent(campanha.hashAprovacao)}`,
+      );
+      setCampanha(detalhe.campanha);
+      void resposta;
+    } catch (error) {
+      setErroEtapa(
+        error instanceof ApiCampanhaError ? error.message : "Criação de lote recusada pelo servidor.",
+      );
+    } finally {
+      setCriandoLote(false);
+    }
+  }
+
   function alternativaSintetica() {
     setErroEtapa("");
     setAvaliando(true);
+    // A base sintética já nasce normalizada: o mapeamento é automático por
+    // construção (cabeçalhos canônicos) e não precisa de confirmação manual.
     void fetchJson<{ registros: readonly RegistroAvaliado[] }>("/api/campaigns/synthetic-base")
       .then((body) => {
         setBase({
@@ -597,6 +755,7 @@ export function CampaignWorkspace() {
         });
         setExcluidos([]);
         setAprovacao(null);
+        setCampanha(null);
         setEtapa(5);
       })
       .catch(() => setErroEtapa("Base sintética indisponível."))
@@ -620,12 +779,35 @@ export function CampaignWorkspace() {
   const motivosBloqueioAprovacao = podeAprovar
     ? []
     : ["Seu papel ativo não autoriza aprovar (APROVADOR exigido)."];
+  const podePersistir = (status?.campaign.canPersistImport ?? false) && podeAprovar && !!aprovacao;
+  // Etapa 08: capacidades separadas — persistir depende da aprovação da
+  // sessão; criar lote depende da CAMPANHA PERSISTIDA reconstruída
+  // (válido também após reload/logout/login com base=null e aprovacao=null).
+  const visaoEtapa = useMemo(
+    () =>
+      visaoEtapa8({
+        basePresente: base !== null,
+        aprovacaoPresente: aprovacao !== null,
+        canPersistImport: status?.campaign.canPersistImport ?? false,
+        canCreateBatch: status?.campaign.canCreateBatch ?? false,
+        acaoExecutarLote: acoesAtivas.has("EXECUTAR_LOTE"),
+        campanha: campanha
+          ? {
+              campanhaId: campanha.campanhaId,
+              hashAprovacao: campanha.hashAprovacao,
+              loteId: campanha.loteId,
+            }
+          : null,
+      }),
+    [base, aprovacao, status, campanha],
+  );
 
   function alternarExclusao(linha: number) {
     setExcluidos((atual) =>
       atual.includes(linha) ? atual.filter((item) => item !== linha) : [...atual, linha],
     );
     setAprovacao(null);
+    setCampanha(null);
   }
 
   if (!me) {
@@ -938,6 +1120,7 @@ export function CampaignWorkspace() {
                 setAvaliacaoArquivo(null);
                 setBase(null);
                 setAprovacao(null);
+                setCampanha(null);
                 setErroEtapa("");
               }}
               disabled={avaliando}
@@ -1046,6 +1229,12 @@ export function CampaignWorkspace() {
         ) : null}
 
         {/* Etapa 5 — Inconsistências */}
+        {etapa === 5 && base?.sha256 === "sintetico-dev" ? (
+          <p className="campaign-actions-note" role="status">
+            Base sintética: o mapeamento é automático por construção (cabeçalhos canônicos) — não
+            há etapa manual de mapeamento para esta base.
+          </p>
+        ) : null}
         {etapa === 5 && base && (
           <section className="campaign-panel" aria-labelledby="etapa-inconsistencias">
             <h2 id="etapa-inconsistencias">5 · Inconsistências aguardando decisão humana</h2>
@@ -1250,6 +1439,49 @@ export function CampaignWorkspace() {
                 <p>{aprovacao.aviso}</p>
               </div>
             ) : null}
+            {visaoEtapa.mostrarCtaPersistencia ? (
+              <div className="campaign-persist-cta">
+                <p>
+                  Aprovação congelada. Próxima ação: <strong>persistir a campanha</strong> no
+                  PostgreSQL e criar o lote controlado (outbox em HOLD — não executável, Gmail não
+                  é chamado).
+                </p>
+                <div className="campaign-panel-actions">
+                  <button
+                    type="button"
+                    onClick={persistirCampanha}
+                    disabled={persistindo || !podePersistir}
+                  >
+                    {persistindo
+                      ? "Persistindo…"
+                      : campanha
+                        ? "Campanha persistida ✓"
+                        : "Persistir campanha"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={criarLoteCampanha}
+                    disabled={criandoLote || !visaoEtapa.mostrarCtaCriarLote}
+                  >
+                    {criandoLote
+                      ? "Criando lote…"
+                      : campanha?.loteId
+                        ? "Lote criado ✓"
+                        : "Criar lote controlado (HOLD)"}
+                  </button>
+                  {campanha ? (
+                    <button type="button" onClick={() => setEtapa(10)}>
+                      Acompanhar campanha →
+                    </button>
+                  ) : null}
+                </div>
+                {campanha && !campanha.loteId && !visaoEtapa.mostrarCtaCriarLote ? (
+                  <small role="status">
+                    Criação de lote exige papel EXECUTOR ativo e o gate canCreateBatch habilitado.
+                  </small>
+                ) : null}
+              </div>
+            ) : null}
             <label className="campaign-decision">
               <input
                 type="checkbox"
@@ -1275,11 +1507,68 @@ export function CampaignWorkspace() {
             </div>
           </section>
         )}
-        {etapa === 8 && !base ? (
+        {etapa === 8 && visaoEtapa.mostrarFallbackImportacao ? (
           <section className="campaign-panel">
             <h2>8 · Aprovação</h2>
             <p>Nenhuma base avaliada nesta sessão.</p>
             <button type="button" onClick={() => setEtapa(3)}>Ir para a importação</button>
+          </section>
+        ) : null}
+
+        {/* Etapa 8 — campanha persistida reconstruída do PostgreSQL:
+            painel próprio, independe de base/aprovacao da sessão. */}
+        {etapa === 8 && campanha ? (
+          <section className="campaign-panel" aria-labelledby="etapa-campanha-reconstruida">
+            <h2 id="etapa-campanha-reconstruida">8 · Campanha reconstruída do PostgreSQL</h2>
+            <ul className="campaign-flow-stats">
+              <li>Campanha: <code>{campanha.campanhaId}</code></li>
+              <li>Estado: {campanha.estado}</li>
+              <li>Hash congelado: <code>{campanha.hashAprovacao}</code></li>
+              <li>Itens aprovados: {campanha.totalAprovados}</li>
+              <li>
+                Lote:{" "}
+                {campanha.loteId
+                  ? `${campanha.loteCodigo ?? ""} · ${campanha.loteEstado ?? ""}`.trim()
+                  : "não criado"}
+              </li>
+              <li>
+                Outbox: {campanha.outboxTotal} item(ns) · não executáveis:{" "}
+                {campanha.outboxNaoExecutavel}
+              </li>
+            </ul>
+            {visaoEtapa.mostrarCtaCriarLote ? (
+              <div className="campaign-persist-cta">
+                <p>
+                  Lote ainda não criado para esta campanha. Próxima ação:{" "}
+                  <strong>criar o lote controlado</strong> (outbox em HOLD — não
+                  executável, Gmail não é chamado).
+                </p>
+                <div className="campaign-panel-actions">
+                  <button
+                    type="button"
+                    onClick={criarLoteCampanha}
+                    disabled={criandoLote || !visaoEtapa.mostrarCtaCriarLote}
+                  >
+                    {criandoLote ? "Criando lote…" : "Criar lote controlado (HOLD)"}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+            {!campanha.loteId && !visaoEtapa.mostrarCtaCriarLote ? (
+              <small role="status">
+                Criação de lote exige papel EXECUTOR ativo e o gate canCreateBatch habilitado.
+              </small>
+            ) : null}
+            {visaoEtapa.mostrarLoteExistente ? (
+              <p>Lote já criado — nenhuma segunda ação de criação é oferecida.</p>
+            ) : null}
+            {visaoEtapa.mostrarAcompanharCampanha ? (
+              <div className="campaign-panel-actions">
+                <button type="button" onClick={() => setEtapa(10)}>
+                  Acompanhar campanha →
+                </button>
+              </div>
+            ) : null}
           </section>
         ) : null}
 
@@ -1300,17 +1589,43 @@ export function CampaignWorkspace() {
           </section>
         )}
 
-        {/* Etapa 10 — Acompanhamento */}
+        {/* Etapa 10 — Acompanhamento (estado persistido + sessão) */}
         {etapa === 10 && (
           <section className="campaign-panel" aria-labelledby="etapa-acompanhamento">
             <h2 id="etapa-acompanhamento">10 · Acompanhamento</h2>
-            <p>
-              Contadores operacionais consolidados da sessão. Nenhum envio foi realizado; os
-              contadores de envio permanecem zerados por construção.
-            </p>
+            {campanha ? (
+              <p>
+                Estado reconstruído do PostgreSQL — recarregar a página, sair e entrar novamente
+                não apaga a campanha persistida.
+              </p>
+            ) : (
+              <p>
+                Contadores operacionais consolidados da sessão. Nenhum envio foi realizado; os
+                contadores de envio permanecem zerados por construção.
+              </p>
+            )}
+            {campanha ? (
+              <table className="campaign-table">
+                <thead>
+                  <tr><th>Estado persistido</th><th>Valor</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Campanha</td><td><code>{campanha.campanhaId}</code></td></tr>
+                  <tr><td>Operador responsável</td><td><code>{campanha.operatorId}</code></td></tr>
+                  <tr><td>Hash de aprovação</td><td><code>{campanha.hashAprovacao.slice(0, 16)}…</code></td></tr>
+                  <tr><td>Estado</td><td>{campanha.estado}</td></tr>
+                  <tr><td>Registros</td><td>{campanha.totalRegistros}</td></tr>
+                  <tr><td>Aptos · Bloqueados</td><td>{campanha.totalAptos} · {campanha.totalBloqueados}</td></tr>
+                  <tr><td>Aprovados</td><td>{campanha.totalAprovados}</td></tr>
+                  <tr><td>Lote</td><td>{campanha.loteId ? `${campanha.loteCodigo ?? ""} · ${campanha.loteEstado}` : "não criado"}</td></tr>
+                  <tr><td>Outbox (HOLD · não executável)</td><td>{campanha.outboxNaoExecutavel} de {campanha.outboxTotal}</td></tr>
+                  <tr><td>Executável pelo worker</td><td>0 — Gmail não foi chamado</td></tr>
+                </tbody>
+              </table>
+            ) : null}
             <table className="campaign-table">
               <thead>
-                <tr><th>Indicador</th><th>Valor</th></tr>
+                <tr><th>Indicador da sessão</th><th>Valor</th></tr>
               </thead>
               <tbody>
                 <tr><td>Total classificado</td><td>{base?.total_registros ?? 0}</td></tr>
@@ -1323,15 +1638,21 @@ export function CampaignWorkspace() {
                 <tr><td>Falhas</td><td>0</td></tr>
               </tbody>
             </table>
+            <ul className="campaign-flow-stats">
+              <li>canPersistImport: {String(status?.campaign.canPersistImport ?? false)}</li>
+              <li>canCreateBatch: {String(status?.campaign.canCreateBatch ?? false)}</li>
+              <li>canExecute: false · envio real bloqueado · Gmail não chamado</li>
+            </ul>
           </section>
         )}
 
         <section className="campaign-guardrail" aria-label="Regras de segurança">
-          <strong>Nenhum lote pode ser criado ou enviado nesta fase.</strong>
+          <strong>Execução continua bloqueada: nada é enviado nesta fase.</strong>
           <p>
             A identidade individual e os papéis são verificados no servidor em cada mutação.
-            Importação persistente, criação de lote e execução continuam desabilitadas até o
-            próximo gate. CONTROLLED_GMAIL_TEST permanece exclusivo do piloto técnico.
+            Persistência e criação de lote dependem de flags server-side explícitas (default
+            fechado); a outbox nasce em HOLD, não capturável pelo worker. CONTROLLED_GMAIL_TEST
+            permanece exclusivo do piloto técnico.
           </p>
         </section>
       </main>

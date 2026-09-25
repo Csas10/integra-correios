@@ -88,6 +88,9 @@ jobs:
       - name: PostgreSQL individual operator identity migration
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0006_operator_identity.sql
 
+      - name: PostgreSQL campaign operational flow migration (SLICE-02)
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/0007_campaign_operational_flow.sql
+
       - name: PostgreSQL runtime role fail-closed regressions
         shell: bash
         run: |
@@ -120,6 +123,9 @@ jobs:
 
       - name: PostgreSQL individual operator identity constraints
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/tests/0003_operator_identity.test.sql
+
+      - name: PostgreSQL campaign operational flow constraints
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/tests/0004_campaign_operational_flow.test.sql
 
       - name: Build Vercel application and backend runtime
         run: npm run build:vercel

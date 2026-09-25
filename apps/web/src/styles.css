@@ -2289,3 +2289,19 @@ button:focus-visible {
   font-weight: 600;
   text-decoration: underline;
 }
+
+/* SLICE-02 — CTA de persistência pós-aprovação */
+.campaign-persist-cta {
+  margin-top: var(--space-4, 1rem);
+  padding: 0.9rem 1rem;
+  border: 1px solid rgba(23, 92, 63, 0.35);
+  border-radius: 10px;
+  background: rgba(23, 92, 63, 0.06);
+  display: grid;
+  gap: 0.6rem;
+}
+
+.campaign-persist-cta .campaign-panel-actions {
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}

@@ -198,20 +198,35 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
     expect(entry?.["credentialState"]).toBe("INDEFINIDA");
     expect(entry?.["activeSessions"]).toBe(0);
 
-    await despachar("POST", "/api/operator/admin/credentials/recover", {
+    // Contrato real: recover exige operador ATIVO — sobre SUSPENSO responde
+    // 404 OPERATOR_NOT_ACTIVE e não reativa (reativação é outra decisão).
+    const recuperacaoRecusada = await despachar("POST", "/api/operator/admin/credentials/recover", {
       headers: { cookie: adminCookie, "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({
         operatorId: alvo.operatorId,
         credentialHash: sha(`Rec_${randomUUID()}`),
       })),
     });
+    expect(recuperacaoRecusada.status).toBe(404);
+    expect(recuperacaoRecusada.corpo).toContain("OPERATOR_NOT_ACTIVE");
+
+    // Rotação em operador ATIVO troca a credencial mantendo o estado.
+    const rotacionada = await provisionar(adminCookie, "ui-temporario-2", ["EXECUTOR"]);
+    await despachar("POST", "/api/operator/admin/credentials/rotate", {
+      headers: { cookie: adminCookie, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        operatorId: rotacionada.operatorId,
+        credentialHash: sha(`Rot_${randomUUID()}`),
+      })),
+    });
     resposta = await despachar("GET", "/api/operator/admin/operators?limit=100", {
       headers: { cookie: adminCookie },
     });
     entry = (JSON.parse(resposta.corpo) as { operadores: Array<Record<string, unknown>> })
-      .operadores.find((o) => o["code"] === "ui-temporario");
+      .operadores.find((o) => o["code"] === "ui-temporario-2");
     expect(entry?.["status"]).toBe("ATIVO");
     expect(entry?.["credentialState"]).toBe("ATIVA");
+    expect(entry?.["activeSessions"]).toBe(0); // sessões revogadas na rotação
   });
 
   it("proteção do último administrador e da auto-suspensão → 409 OPERATOR_ADMIN_CONTINUITY_REQUIRED", async () => {

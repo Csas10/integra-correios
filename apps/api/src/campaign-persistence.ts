@@ -470,6 +470,10 @@ export async function persistirLoteCampanha(
     );
     for (let ordem = 1; ordem <= registrosAptos.length; ordem += 1) {
       const registro = registrosAptos[ordem - 1]!;
+      // Fingerprint SHA-256 do e-mail normalizado (NUNCA o valor bruto).
+      const fingerprintDestinatario = createHash("sha256")
+        .update(registro.email_normalizado)
+        .digest("hex");
       await transaction.query(
         `INSERT INTO outbox_campanha (
           id, lote_campanha_id, ordem, destinatario_fingerprint, payload_snapshot, estado, criada_em
@@ -478,7 +482,7 @@ export async function persistirLoteCampanha(
           randomUUID(),
           loteCampanhaId,
           ordem,
-          registro.email_normalizado,
+          fingerprintDestinatario,
           JSON.stringify({
             template_versao: campanhaLinha.template_versao,
             hash_aprovacao: campanhaLinha.hash_aprovacao,

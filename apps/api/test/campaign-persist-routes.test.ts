@@ -182,13 +182,13 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
     const antesFila = await contagemFila();
     try {
       const adminCookie = await bootstrapAdmin();
-      const preparador = await provisionOperator(adminCookie, ["PREPARADOR"]);
-      const executor = await provisionOperator(adminCookie, ["EXECUTOR"]);
+      const operador = await provisionOperator(adminCookie, ["PREPARADOR", "EXECUTOR"]);
+      const revisor = await provisionOperator(adminCookie, ["REVISOR"]);
 
       // RBAC de gate: com flags fechadas, persist recusa mesmo autenticado
       process.env.PF_CAMPAIGN_PERSIST_ENABLED = "false";
       const negado = await despachar("POST", "/api/campaigns/persist", {
-        headers: { cookie: preparador.cookie, "content-type": "application/json" },
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
           registros: REGISTROS,
@@ -199,9 +199,9 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
       expect(negado.corpo).toContain("CAMPAIGN_PERSIST_DISABLED");
       process.env.PF_CAMPAIGN_PERSIST_ENABLED = "true";
 
-      // 1. persist (PREPARADOR): 201 CRIADA
+      // 1. persist (identidade única PREPARADOR+EXECUTOR): 201 CRIADA
       const persistida = await despachar("POST", "/api/campaigns/persist", {
-        headers: { cookie: preparador.cookie, "content-type": "application/json" },
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
           registros: REGISTROS,
@@ -227,7 +227,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
 
       // 2. stale: conteúdo divergente com hash antigo → 409
       const stale = await despachar("POST", "/api/campaigns/persist", {
-        headers: { cookie: preparador.cookie, "content-type": "application/json" },
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: randomUUID().replace(/-/g, "").padEnd(64, "0"),
           registros: [{ ...REGISTROS[0]!, nome: "CONTEUDO DIVERGENTE" }],
@@ -240,7 +240,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
 
       // 3. idempotência: mesma submissão → 200 EXISTENTE, nada duplicado
       const repetida = await despachar("POST", "/api/campaigns/persist", {
-        headers: { cookie: preparador.cookie, "content-type": "application/json" },
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
           registros: REGISTROS,
@@ -254,7 +254,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
       const recuperada = await despachar(
         "GET",
         `/api/campaigns/persisted?hash=${encodeURIComponent(corpoPersist.conteudoHash)}`,
-        { headers: { cookie: preparador.cookie } },
+        { headers: { cookie: operador.cookie } },
       );
       expect(recuperada.status).toBe(200);
       const campanha = (JSON.parse(recuperada.corpo) as {
@@ -266,7 +266,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
 
       // 5. batch sem EXECUTOR → 403 ROLE
       const loteSemPapel = await despachar("POST", "/api/campaigns/batch", {
-        headers: { cookie: preparador.cookie, "content-type": "application/json" },
+        headers: { cookie: revisor.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           campanhaId: corpoPersist.campanhaId,
           conteudoHash: corpoPersist.conteudoHash,
@@ -275,9 +275,9 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
       expect(loteSemPapel.status).toBe(403);
       expect(loteSemPapel.corpo).toContain("OPERATOR_ROLE_FORBIDDEN");
 
-      // 6. batch por EXECUTOR → 201, lote HOLD + outbox NÃO capturável
+      // 6. batch pelo próprio operador (EXECUTOR) → 201, lote HOLD + outbox NÃO capturável
       const loteCriado = await despachar("POST", "/api/campaigns/batch", {
-        headers: { cookie: executor.cookie, "content-type": "application/json" },
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           campanhaId: corpoPersist.campanhaId,
           conteudoHash: corpoPersist.conteudoHash,
@@ -296,7 +296,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
 
       // 7. idempotência do lote → 200 EXISTENTE
       const loteRepetido = await despachar("POST", "/api/campaigns/batch", {
-        headers: { cookie: executor.cookie, "content-type": "application/json" },
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           campanhaId: corpoPersist.campanhaId,
           conteudoHash: corpoPersist.conteudoHash,
@@ -339,7 +339,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
 
       // 9. GET batch: estado sem segredos
       const loteGet = await despachar("GET", `/api/campaigns/batch?campanhaId=${corpoPersist.campanhaId}`, {
-        headers: { cookie: executor.cookie },
+        headers: { cookie: operador.cookie },
       });
       expect(loteGet.status).toBe(200);
       expect(loteGet.corpo).not.toMatch(/session_hash|token_hash|set-cookie/i);
@@ -348,7 +348,155 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
     }
   });
 
-  it("operador suspenso é recusado na persistência (RBAC + estado)", async () => {
+    it("isolamento por operador: terceiro EXECUTOR não lê nem materializa campanha/lote alheios (403/404, delta zero)", async () => {
+    const { NodePostgresPool } = await import("@integra-correios/persistence");
+    const pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE! });
+    const fingerprint = sha(`isolamento-${randomUUID()}`);
+    try {
+      const adminCookie = await bootstrapAdmin();
+      const dono = await provisionOperator(adminCookie, ["PREPARADOR", "EXECUTOR"]);
+      const outro = await provisionOperator(adminCookie, ["EXECUTOR"]);
+
+      // Proprietário persiste a campanha (hash congelado no servidor).
+      const persistida = await despachar("POST", "/api/campaigns/persist", {
+        headers: { cookie: dono.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          fingerprintArquivo: fingerprint,
+          registros: REGISTROS,
+          decisoes: [],
+        })),
+      });
+      expect(persistida.status).toBe(201);
+      const alvo = JSON.parse(persistida.corpo) as { campanhaId: string; conteudoHash: string };
+
+      // Delta escopado à campanha + fila produtiva (CI compartilhada): a prova
+      // de não-mutação é antes/depois em cada tentativa indevida.
+      const contagemIsolamento = async (): Promise<Record<string, string>> => {
+        const resultado = await pool.query<{ tabela: string; total: string }>(
+          `SELECT 'campanha_persistida' AS tabela, count(*)::text AS total FROM campanha_persistida WHERE id = $1
+           UNION ALL SELECT 'campanha_decisao', count(*)::text FROM campanha_decisao WHERE campanha_id = $1
+           UNION ALL SELECT 'lote_campanha', count(*)::text FROM lote_campanha WHERE campanha_id = $1
+           UNION ALL SELECT 'outbox_campanha', count(*)::text FROM outbox_campanha o
+             JOIN lote_campanha lc ON lc.id = o.lote_campanha_id WHERE lc.campanha_id = $1
+           UNION ALL SELECT 'evento_auditoria', count(*)::text FROM evento_auditoria
+             WHERE agregado_tipo = 'CAMPANHA_PERSISTIDA' AND agregado_id = $1
+           UNION ALL SELECT 'outbox_email', count(*)::text FROM outbox_email
+           UNION ALL SELECT 'comunicacao', count(*)::text FROM comunicacao
+           UNION ALL SELECT 'lote_comunicacao', count(*)::text FROM lote_comunicacao`,
+          [alvo.campanhaId],
+        );
+        return Object.fromEntries(resultado.rows.map((r) => [r.tabela, r.total]));
+      };
+      const antes = await contagemIsolamento();
+
+      // 1. hash CORRETO de campanha alheia → 403 ANTES da validação operacional
+      const loteHashCorreto = await despachar("POST", "/api/campaigns/batch", {
+        headers: { cookie: outro.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          campanhaId: alvo.campanhaId,
+          conteudoHash: alvo.conteudoHash,
+        })),
+      });
+      expect(loteHashCorreto.status).toBe(403);
+      expect(loteHashCorreto.corpo).toContain("CAMPAIGN_OPERATOR_FORBIDDEN");
+
+      // 2. hash INCORRETO de campanha alheia → mesmo 403, sem revelar stale
+      const loteHashErrado = await despachar("POST", "/api/campaigns/batch", {
+        headers: { cookie: outro.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          campanhaId: alvo.campanhaId,
+          conteudoHash: "b".repeat(64),
+        })),
+      });
+      expect(loteHashErrado.status).toBe(403);
+      expect(loteHashErrado.corpo).toContain("CAMPAIGN_OPERATOR_FORBIDDEN");
+      expect(loteHashErrado.corpo).not.toContain("CAMPAIGN_APPROVAL_STALE");
+
+      // 3. leitura por terceiro: 404 sanitizado (sem revelar existência)
+      const lidaPorTerceiro = await despachar(
+        "GET",
+        `/api/campaigns/persisted?hash=${encodeURIComponent(alvo.conteudoHash)}`,
+        { headers: { cookie: outro.cookie } },
+      );
+      expect(lidaPorTerceiro.status).toBe(404);
+      expect(lidaPorTerceiro.corpo).toContain("CAMPAIGN_PERSISTED_NOT_FOUND");
+
+      const loteDeTerceiro = await despachar(
+        "GET",
+        `/api/campaigns/batch?campanhaId=${alvo.campanhaId}`,
+        { headers: { cookie: outro.cookie } },
+      );
+      expect(loteDeTerceiro.status).toBe(404);
+      expect(loteDeTerceiro.corpo).toContain("CAMPAIGN_BATCH_NOT_FOUND");
+
+      // 4. persist idempotente de terceiro → 403 sem devolver campanhaId
+      const persistTerceiro = await despachar("POST", "/api/campaigns/persist", {
+        headers: { cookie: outro.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          fingerprintArquivo: fingerprint,
+          registros: REGISTROS,
+          decisoes: [],
+        })),
+      });
+      expect(persistTerceiro.status).toBe(403);
+      expect(persistTerceiro.corpo).toContain("CAMPAIGN_OPERATOR_FORBIDDEN");
+      expect(persistTerceiro.corpo).not.toContain(alvo.campanhaId);
+
+      // Delta ZERO em todas as tentativas indevidas.
+      const depoisTentativas = await contagemIsolamento();
+      expect(depoisTentativas).toEqual(antes);
+
+      // Proprietário segue plenamente operante: recupera e materializa o lote.
+      const recuperadaDono = await despachar(
+        "GET",
+        `/api/campaigns/persisted?hash=${encodeURIComponent(alvo.conteudoHash)}`,
+        { headers: { cookie: dono.cookie } },
+      );
+      expect(recuperadaDono.status).toBe(200);
+
+      const loteDono = await despachar("POST", "/api/campaigns/batch", {
+        headers: { cookie: dono.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          campanhaId: alvo.campanhaId,
+          conteudoHash: alvo.conteudoHash,
+        })),
+      });
+      expect(loteDono.status).toBe(201);
+      expect((JSON.parse(loteDono.corpo) as { lote: { estado: string } }).lote.estado).toBe("HOLD");
+
+      const loteGetDono = await despachar(
+        "GET",
+        `/api/campaigns/batch?campanhaId=${alvo.campanhaId}`,
+        { headers: { cookie: dono.cookie } },
+      );
+      expect(loteGetDono.status).toBe(200);
+
+      // 5. idempotência NÃO serve a terceiros: lote já existente → 403
+      const loteTerceiroPos = await despachar("POST", "/api/campaigns/batch", {
+        headers: { cookie: outro.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          campanhaId: alvo.campanhaId,
+          conteudoHash: alvo.conteudoHash,
+        })),
+      });
+      expect(loteTerceiroPos.status).toBe(403);
+      expect(loteTerceiroPos.corpo).toContain("CAMPAIGN_OPERATOR_FORBIDDEN");
+
+      // Estado final escopado: HOLD ×3, 2 eventos, fila produtiva intocada.
+      const final = await contagemIsolamento();
+      expect(Number(final.campanha_persistida)).toBe(1);
+      expect(Number(final.lote_campanha)).toBe(1);
+      expect(Number(final.outbox_campanha)).toBe(3);
+      expect(Number(final.evento_auditoria)).toBe(2);
+      expect(final.outbox_email).toBe(antes.outbox_email);
+      expect(final.comunicacao).toBe(antes.comunicacao);
+      expect(final.lote_comunicacao).toBe(antes.lote_comunicacao);
+    } finally {
+      await pool.close();
+    }
+  });
+
+it("operador suspenso é recusado na persistência (RBAC + estado)", async () => {
     const adminCookie = await bootstrapAdmin();
     const preparador = await provisionOperator(adminCookie, ["PREPARADOR"]);
     const { NodePostgresPool } = await import("@integra-correios/persistence");

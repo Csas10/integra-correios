@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CampaignPersistenceError,
   persistirCampanhaAprovada,
+  persistirLoteCampanha,
   type CampanhaPool,
 } from "../src/campaign-persistence.js";
 import {
@@ -133,6 +134,70 @@ describe("CAMPAIGN_PERSISTENCE — snapshot, hash e validação de entrada (unit
       }),
     ).rejects.toThrow("falha simulada de banco");
     expect(sqls().at(-1)).toBe("ROLLBACK");
+  });
+
+  it("isolamento: lote de campanha alheia é recusado ANTES da validação do hash (403, não 409)", async () => {
+    const poolScript: CampanhaPool = {
+      connect: async () => ({
+        query: async (text: string) => {
+          if (/FROM campanha_persistida/.test(text)) {
+            return {
+              rows: [{
+                id: "campanha-1",
+                operator_id: "op-dono",
+                hash_aprovacao: "a".repeat(64),
+                fingerprint_arquivo: "f".repeat(64),
+                template_versao: "v1",
+                estado: "APROVADA",
+                snapshot_registros: {},
+              }],
+              rowCount: 1,
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+        release: () => {},
+      }),
+      query: async () => ({ rows: [], rowCount: 0 }),
+    };
+    await expect(
+      persistirLoteCampanha(poolScript, {
+        campanhaId: "campanha-1",
+        operatorId: "op-outro",
+        hashSubmetido: "b".repeat(64),
+      }),
+    ).rejects.toMatchObject({ code: "CAMPAIGN_OPERATOR_FORBIDDEN" });
+  });
+
+  it("isolamento: idempotência do persist não revela campanha a operador diferente", async () => {
+    const emitidos: string[] = [];
+    const poolScript: CampanhaPool = {
+      connect: async () => ({
+        query: async (text: string) => {
+          emitidos.push(text);
+          if (/FROM campanha_persistida/.test(text)) {
+            return {
+              rows: [{ id: "campanha-1", operator_id: "op-dono", hash_aprovacao: "h".repeat(64) }],
+              rowCount: 1,
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+        release: () => {},
+      }),
+      query: async () => ({ rows: [], rowCount: 0 }),
+    };
+    await expect(
+      persistirCampanhaAprovada(poolScript, {
+        operatorId: "op-outro",
+        fingerprintArquivo: "a".repeat(64),
+        registros: REGISTROS,
+        decisoes: [],
+      }),
+    ).rejects.toMatchObject({ code: "CAMPAIGN_OPERATOR_FORBIDDEN" });
+    const seq = emitidos.map((linha) => linha.trim().split(/\s+/)[0]);
+    expect(seq).toContain("COMMIT");
+    expect(seq).not.toContain("INSERT");
   });
 });
 

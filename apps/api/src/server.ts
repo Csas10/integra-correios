@@ -315,7 +315,9 @@ function erroPersistenciaCampanha(
           ? 409
           : error.code === "CAMPAIGN_PERSISTED_NOT_FOUND"
             ? 404
-            : 500;
+            : error.code === "CAMPAIGN_OPERATOR_FORBIDDEN"
+              ? 403
+              : 500;
     json(res, status, { erro: error.message, codigo: error.code });
     return;
   }
@@ -1183,8 +1185,11 @@ const ROTAS: readonly Rota[] = [
         const estado = await recuperarEstadoCampanha(requireDbPool(), {
           ...(fingerprintValido ? { fingerprintArquivo } : {}),
           ...(hashValido ? { hashAprovacao: hashConsulta } : {}),
+          operatorId: identity.operatorId,
         });
         if (!estado) {
+          // Isolamento por operador: campanha de terceiro é indistinguível de
+          // inexistente (404 sanitizado, sem revelar existência/proprietário).
           json(res, 404, {
             erro: "Nenhuma campanha persistida para este fingerprint/hash.",
             codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
@@ -1312,11 +1317,17 @@ const ROTAS: readonly Rota[] = [
                     WHERE o.lote_campanha_id = lc.id AND o.estado IN ('HOLD','PREPARADO')) AS outbox_hold
              FROM lote_campanha lc
             WHERE lc.campanha_id = $1
+              AND EXISTS (
+                SELECT 1 FROM campanha_persistida c
+                 WHERE c.id = lc.campanha_id AND c.operator_id = $2
+              )
             LIMIT 1`,
-          [campanhaId],
+          [campanhaId, identity.operatorId],
         );
         const lote = estado.rows[0];
         if (!lote?.lote_id) {
+          // Isolamento por operador: lote inexistente ou de terceiro é
+          // indistinguível (404 sanitizado, sem revelar estado/contadores).
           json(res, 404, {
             erro: "Nenhum lote para esta campanha.",
             codigo: "CAMPAIGN_BATCH_NOT_FOUND",

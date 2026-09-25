@@ -190,12 +190,22 @@ export async function persistirCampanhaAprovada(
     // Idempotência estrutural: mesmo (fingerprint, hash) devolve o estado
     // existente sem duplicar lote/outbox/auditoria.
     const existente = await transaction.query(
-      `SELECT id, hash_aprovacao FROM campanha_persistida
+      `SELECT id, operator_id, hash_aprovacao FROM campanha_persistida
        WHERE fingerprint_arquivo = $1 AND hash_aprovacao = $2
        FOR UPDATE`,
       [fingerprint, hashAprovacao],
     );
     if (existente.rows[0]) {
+      // Isolamento por operador: submissão idêntica de um terceiro NÃO recebe
+      // campanhaId/hash/estado e NÃO cria campanha, decisão nem evento (403
+      // estável e sanitizado — sem revelar existência detalhada ao chamador).
+      if (existente.rows[0].operator_id !== command.operatorId) {
+        await transaction.query("COMMIT");
+        throw new CampaignPersistenceError(
+          "CAMPAIGN_OPERATOR_FORBIDDEN",
+          "Campanha pertence a outro operador.",
+        );
+      }
       await transaction.query("COMMIT");
       return {
         resultado: "EXISTENTE",
@@ -376,7 +386,9 @@ export interface LoteCampanhaResultado {
  * autorizada na rota) e materializa a outbox em HOLD — NÃO capturável pelo
  * worker. Idempotente: lote já existente é devolvido sem duplicar nada.
  * O hash submetido é confrontado com o hash CONGELADO da campanha (409 stale
- * em caso de divergência); operator_id vem da sessão autenticada.
+ * em caso de divergência); operator_id vem da sessão autenticada. A campanha
+ * só é manipulada pelo operador proprietário (403 CAMPAIGN_OPERATOR_FORBIDDEN
+ * antes da validação do hash, do caminho idempotente e de qualquer escrita).
  * Nenhum item é criado nas filas produtivas: outbox_email/comunicacao
  * permanecem intocadas (a ponte de execução é outro gate).
  */
@@ -408,6 +420,16 @@ export async function persistirLoteCampanha(
       throw new CampaignPersistenceError(
         "CAMPAIGN_PERSISTED_NOT_FOUND",
         "Campanha persistida não encontrada.",
+      );
+    }
+    // Isolamento por operador: a propriedade é verificada ANTES da validação
+    // do hash — um executor que não é o proprietário não pode usar a rota
+    // para descobrir se um hash submetido corresponde ao hash congelado
+    // (nem alcançar o caminho idempotente de lote já existente).
+    if (campanhaLinha.operator_id !== command.operatorId) {
+      throw new CampaignPersistenceError(
+        "CAMPAIGN_OPERATOR_FORBIDDEN",
+        "Campanha pertence a outro operador.",
       );
     }
     if (campanhaLinha.hash_aprovacao !== hashSubmetido) {

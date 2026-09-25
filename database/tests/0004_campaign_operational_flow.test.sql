@@ -321,24 +321,38 @@ $outbox_ready$;
 
 DO $zero_claim$
 DECLARE
-  fila_produtiva integer;
-  itens_processando integer;
+  capturavel_do_meu_lote integer;
+  comunicacao_da_campanha integer;
+  outbox_aberta_do_meu_lote integer;
 BEGIN
-  SELECT count(*) INTO fila_produtiva
+  -- Nenhuma linha produtiva (outbox_email/comunicacao) pertence à campanha:
+  -- a ponte de execução não é criada neste fluxo.
+  SELECT count(*) INTO comunicacao_da_campanha
+    FROM comunicacao
+   WHERE fonte_registro = 'CAMPANHA_PF';
+
+  -- Nenhum item capturável (worker) derivado do lote controlado em HOLD.
+  SELECT count(*) INTO capturavel_do_meu_lote
     FROM outbox_email o
     JOIN comunicacao c ON c.id = o.comunicacao_id
     JOIN lote_comunicacao l ON l.id = c.lote_comunicacao_id
-   WHERE l.status = 'ATIVO'
+   WHERE l.codigo = 'LOTE-CAMPANHA-SQL-001'
      AND (o.status = 'PENDING' OR o.status = 'PROCESSING');
 
-  SELECT count(*) INTO itens_processando
-    FROM item_lote_comunicacao WHERE status = 'PROCESSANDO';
+  SELECT count(*) INTO outbox_aberta_do_meu_lote
+    FROM outbox_campanha o
+    JOIN lote_campanha lc ON lc.id = o.lote_campanha_id
+   WHERE lc.codigo = 'LOTE-CAMPANHA-SQL-001'
+     AND o.estado IN ('PENDING','READY','ENFILEIRADO');
 
-  IF fila_produtiva <> 0 THEN
-    RAISE EXCEPTION 'outbox_email capturavel pelo worker deveria ser zero';
+  IF comunicacao_da_campanha <> 0 THEN
+    RAISE EXCEPTION 'comunicacao da campanha deveria ser zero';
   END IF;
-  IF itens_processando <> 0 THEN
-    RAISE EXCEPTION 'itens PROCESSANDO deveriam ser zero';
+  IF capturavel_do_meu_lote <> 0 THEN
+    RAISE EXCEPTION 'outbox_email capturavel do lote da campanha deveria ser zero';
+  END IF;
+  IF outbox_aberta_do_meu_lote <> 0 THEN
+    RAISE EXCEPTION 'outbox da campanha em estado capturavel deveria ser zero';
   END IF;
 END
 $zero_claim$;

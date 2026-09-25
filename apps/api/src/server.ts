@@ -67,9 +67,22 @@ import {
   ConfirmationInvalidaError,
   type ConfirmationDecisionInput,
 } from "./confirmation.js";
-import { carregarPoliticaCampanhaAtualizacao } from "./campaigns.js";
+import {
+  acoesCampanhaPorPapeis,
+  baseSinteticaCampanha,
+  carregarPoliticaCampanhaAtualizacao,
+  hashAprovacaoCampanha,
+} from "./campaigns.js";
+import {
+  AvaliacaoInvalidaError,
+  avaliarArquivoCampanha,
+  avaliarBaseCampanha,
+} from "./campaign-import.js";
 import { createWebTokenService } from "@integra-correios/pf-workflow";
-import { MapeamentoInvalidoError } from "@integra-correios/importers";
+import {
+  MapeamentoInvalidoError,
+  PfUpdateCampaignImportError,
+} from "@integra-correios/importers";
 import {
   loadGmailOauthConfig,
   oauthStatusFromEnvironment,
@@ -149,11 +162,16 @@ const ROTAS_PUBLICAS = new Set([
 const ROTAS_AUTH_PROPRIA = new Set([
   "GET /api/operator/me",
   "GET /api/campaigns/status",
+  "GET /api/campaigns/synthetic-base",
+  "POST /api/campaigns/analyze",
+  "POST /api/campaigns/evaluate",
+  "POST /api/campaigns/authorize",
   "GET /api/operator/workspace/status",
   "POST /api/operator/admin/provision",
   "POST /api/operator/admin/credentials/rotate",
   "POST /api/operator/admin/credentials/recover",
   "POST /api/operator/admin/suspend",
+  "GET /api/operator/admin/operators",
 ]);
 
 
@@ -370,6 +388,44 @@ export function parseFileNameHeader(bruto: string | undefined): string {
     throw new ContratoInvalidoError("FILE_NAME_INVALID", "Nome de arquivo contém caracteres proibidos.");
   }
   return decodificado;
+}
+
+/**
+ * Header x-mapping da campanha (opcional): JSON { campo: coluna }.
+ * Formato inválido, campo vazio/excessivo ou coluna fora de 0..1023 →
+ * erro 400 sanitizado (nunca 500).
+ */
+export function parseCampaignMappingHeader(
+  bruto: string | undefined,
+): Record<string, number> | undefined {
+  const cru = bruto?.trim();
+  if (!cru) return undefined;
+  if (cru.length > 4096) {
+    throw new ContratoInvalidoError("MAPPING_TOO_LARGE", "Header x-mapping excede o limite de tamanho.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cru);
+  } catch {
+    throw new ContratoInvalidoError("MAPPING_MALFORMED", "Header x-mapping não contém JSON válido.");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ContratoInvalidoError(
+      "MAPPING_INVALID_SCHEMA",
+      "Header x-mapping deve ser um objeto { campo: coluna }.",
+    );
+  }
+  const mapeamento: Record<string, number> = {};
+  for (const [campo, coluna] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!campo.trim() || campo.length > 64) {
+      throw new ContratoInvalidoError("MAPPING_INVALID_SCHEMA", "Campo do mapeamento inválido.");
+    }
+    if (typeof coluna !== "number" || !Number.isInteger(coluna) || coluna < 0 || coluna > 1023) {
+      throw new ContratoInvalidoError("MAPPING_INVALID_SCHEMA", "Coluna do mapeamento inválida.");
+    }
+    mapeamento[campo.trim()] = coluna;
+  }
+  return mapeamento;
 }
 
 async function lerCorpo(req: IncomingMessage, limite = MAX_UPLOAD_BYTES): Promise<Buffer> {
@@ -731,8 +787,138 @@ const ROTAS: readonly Rota[] = [
         operatorIdentity: "INDIVIDUAL_ACTIVE",
         operatorId: identity.operatorId,
         roles: identity.roles,
+        availableActions: acoesCampanhaPorPapeis(identity.roles),
         queueAvailable: false,
         nextAction: "WAIT_FOR_CAMPAIGN_PERSISTENCE_GATE",
+      });
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // CAMPANHA PF — jornada operacional (etapas 3–5) e validade de
+  // aprovação. Somente leitura/avaliação EM MEMÓRIA: nada persiste
+  // (canPersistImport=false), nada envia (canExecute=false). As ações
+  // futuras de escrita revalidarão papel + estado no servidor, sempre.
+  // ------------------------------------------------------------------
+  {
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/synthetic-base",
+    handler: async (req, res) => {
+      const identity = await exigirOperadorCampanha(req, res, ["PREPARADOR"]);
+      if (!identity) return;
+      json(res, 200, {
+        registros: baseSinteticaCampanha(),
+        aviso:
+          "Base sintética de desenvolvimento da interface — NÃO representa destinatários reais.",
+      });
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/analyze",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, ["PREPARADOR"]);
+      if (!identity) return;
+      try {
+        const nome = parseFileNameHeader(req.headers["x-file-name"]?.toString());
+        json(res, 200, avaliarArquivoCampanha(nome, new Uint8Array(corpo)));
+      } catch (error) {
+        if (error instanceof ContratoInvalidoError) {
+          json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 422, {
+          erro: "Arquivo não pôde ser analisado (formato/estrutura inválida).",
+          codigo: "CAMPAIGN_FILE_INVALID",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/evaluate",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, ["PREPARADOR"]);
+      if (!identity) return;
+      try {
+        const nome = parseFileNameHeader(req.headers["x-file-name"]?.toString());
+        const mapeamento = parseCampaignMappingHeader(req.headers["x-mapping"]?.toString());
+        json(res, 200, avaliarBaseCampanha(nome, new Uint8Array(corpo), mapeamento ? { mapeamento } : {}));
+      } catch (error) {
+        if (error instanceof ContratoInvalidoError || error instanceof AvaliacaoInvalidaError) {
+          json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        if (error instanceof PfUpdateCampaignImportError) {
+          json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 422, {
+          erro: "Base não pôde ser avaliada (arquivo/mapeamento inválidos).",
+          codigo: "CAMPAIGN_EVALUATE_INVALID",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/authorize",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, ["APROVADOR"]);
+      if (!identity) return;
+      let body: {
+        templateVersao?: unknown;
+        registros?: unknown;
+        conteudoHash?: unknown;
+      };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_AUTH_JSON_INVALID" });
+        return;
+      }
+      const templateVersao = typeof body.templateVersao === "string" ? body.templateVersao.trim() : "";
+      const registros = Array.isArray(body.registros) ? body.registros : [];
+      if (
+        !templateVersao ||
+        templateVersao.length > 80 ||
+        registros.length === 0 ||
+        registros.length > 20_000 ||
+        !registros.every(
+          (registro) =>
+            typeof registro === "object" &&
+            registro !== null &&
+            typeof (registro as { profissional_id?: unknown }).profissional_id === "string" &&
+            typeof (registro as { nome?: unknown }).nome === "string" &&
+            typeof (registro as { email_normalizado?: unknown }).email_normalizado === "string" &&
+            typeof (registro as { status_validacao?: unknown }).status_validacao === "string",
+        )
+      ) {
+        json(res, 422, {
+          erro: "Dados de aprovação inválidos.",
+          codigo: "CAMPAIGN_AUTHORIZE_INVALID",
+        });
+        return;
+      }
+      const conteudoHash = hashAprovacaoCampanha({
+        templateVersao,
+        registros: registros as { profissional_id: string; nome: string; email_normalizado: string; status_validacao: string }[],
+      });
+      if (typeof body.conteudoHash === "string" && body.conteudoHash !== conteudoHash) {
+        json(res, 409, {
+          erro: "Conteúdo divergiu do hash submetido — reprovar e reaprovar.",
+          codigo: "CAMPAIGN_APPROVAL_STALE",
+        });
+        return;
+      }
+      json(res, 200, {
+        status: "CAMPAIGN_APPROVAL_FROZEN",
+        conteudoHash,
+        totalItens: registros.length,
+        aprovadaPor: identity.operatorId,
+        persistida: false,
+        aviso:
+          "Aprovação calculada e devolvida para manifestação — NADA foi persistido nesta fase (canPersistImport=false, canCreateBatch=false).",
       });
     },
   },
@@ -1015,6 +1201,46 @@ const ROTAS: readonly Rota[] = [
         json(res, 503, {
           erro: "Suspensão operacional indisponível.",
           codigo: "OPERATOR_SUSPEND_UNAVAILABLE",
+        });
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // ADMIN — listagem de operadores para a área administrativa da UI.
+  // Exige sessão individual ativa + ADMIN_TECNICO. Somente dados
+  // operacionais e estados agregados de credencial; nenhum segredo.
+  // ------------------------------------------------------------------
+  {
+    metodo: "GET",
+    caminhoExato: "/api/operator/admin/operators",
+    handler: async (req, res, url) => {
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
+      const limitBruto = Number(url.searchParams.get("limit") ?? "50");
+      const offsetBruto = Number(url.searchParams.get("offset") ?? "0");
+      const limit = Number.isSafeInteger(limitBruto) ? limitBruto : 0;
+      const offset = Number.isSafeInteger(offsetBruto) ? offsetBruto : -1;
+      if (limit < 1 || limit > 100 || offset < 0) {
+        json(res, 422, {
+          erro: "Parâmetros de paginação inválidos (limit 1–100, offset ≥ 0).",
+          codigo: "OPERATOR_LIST_INVALID_PAGINATION",
+        });
+        return;
+      }
+
+      try {
+        const operadores = await operatorIdentityRepository().listOperators(
+          limit,
+          offset,
+          new Date().toISOString(),
+        );
+        json(res, 200, { operadores });
+      } catch {
+        json(res, 503, {
+          erro: "Listagem de operadores indisponível.",
+          codigo: "OPERATOR_LIST_UNAVAILABLE",
         });
       }
     },

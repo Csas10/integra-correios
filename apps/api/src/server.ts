@@ -171,6 +171,7 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "POST /api/operator/admin/credentials/rotate",
   "POST /api/operator/admin/credentials/recover",
   "POST /api/operator/admin/suspend",
+  "GET /api/operator/admin/operators",
 ]);
 
 
@@ -1200,6 +1201,46 @@ const ROTAS: readonly Rota[] = [
         json(res, 503, {
           erro: "Suspensão operacional indisponível.",
           codigo: "OPERATOR_SUSPEND_UNAVAILABLE",
+        });
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // ADMIN — listagem de operadores para a área administrativa da UI.
+  // Exige sessão individual ativa + ADMIN_TECNICO. Somente dados
+  // operacionais e estados agregados de credencial; nenhum segredo.
+  // ------------------------------------------------------------------
+  {
+    metodo: "GET",
+    caminhoExato: "/api/operator/admin/operators",
+    handler: async (req, res, url) => {
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
+      const limitBruto = Number(url.searchParams.get("limit") ?? "50");
+      const offsetBruto = Number(url.searchParams.get("offset") ?? "0");
+      const limit = Number.isSafeInteger(limitBruto) ? limitBruto : 0;
+      const offset = Number.isSafeInteger(offsetBruto) ? offsetBruto : -1;
+      if (limit < 1 || limit > 100 || offset < 0) {
+        json(res, 422, {
+          erro: "Parâmetros de paginação inválidos (limit 1–100, offset ≥ 0).",
+          codigo: "OPERATOR_LIST_INVALID_PAGINATION",
+        });
+        return;
+      }
+
+      try {
+        const operadores = await operatorIdentityRepository().listOperators(
+          limit,
+          offset,
+          new Date().toISOString(),
+        );
+        json(res, 200, { operadores });
+      } catch {
+        json(res, 503, {
+          erro: "Listagem de operadores indisponível.",
+          codigo: "OPERATOR_LIST_UNAVAILABLE",
         });
       }
     },

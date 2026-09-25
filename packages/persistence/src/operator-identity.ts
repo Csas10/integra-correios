@@ -492,4 +492,109 @@ export class PostgresOperatorIdentityRepository {
       return true;
     });
   }
+
+  /**
+   * Listagem administrativa de operadores (somente leitura). Nunca expõe
+   * hashes, tokens, cookies ou segredos: apenas estados agregados de
+   * credencial (ATIVA/EXPIRADA/INDEFINIDA/AUSENTE) e contagem de sessões.
+   */
+  async listOperators(limit: number, offset: number, now: string): Promise<OperatorListEntry[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("Limite de listagem inválido (1–100)");
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new Error("Offset de listagem inválido");
+    }
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<{
+        operator_id: string;
+        codigo: string;
+        nome_exibicao: string;
+        status: OperatorStatus;
+        criado_em: Date;
+        atualizado_em: Date;
+        suspenso_em: Date | null;
+        token_estado: "ATIVO" | "REVOGADO" | null;
+        token_expira_em: Date | null;
+        sessoes_ativas: string;
+        roles: OperatorRole[] | null;
+      }>(
+        `SELECT o.id AS operator_id,
+                o.codigo,
+                o.nome_exibicao,
+                o.status,
+                o.criado_em,
+                o.atualizado_em,
+                o.suspenso_em,
+                t.status AS token_estado,
+                t.expira_em AS token_expira_em,
+                (SELECT count(*)::text
+                   FROM operador_sessao s
+                  WHERE s.operator_id = o.id
+                    AND s.status = 'ATIVA'
+                    AND s.expira_em > $3::timestamptz) AS sessoes_ativas,
+                (SELECT array_agg(p.papel ORDER BY p.papel)
+                   FROM operador_papel p
+                  WHERE p.operator_id = o.id
+                    AND p.ativo = true
+                    AND p.revogado_em IS NULL) AS roles
+           FROM operador o
+           LEFT JOIN LATERAL (
+             SELECT tt.status, tt.expira_em
+               FROM operador_token tt
+              WHERE tt.operator_id = o.id
+              ORDER BY (tt.status = 'ATIVO') DESC, tt.criado_em DESC
+              LIMIT 1
+           ) t ON true
+          ORDER BY o.criado_em, o.id
+          LIMIT $1 OFFSET $2`,
+        [limit, offset, now],
+      );
+      return result.rows.map((row) => {
+        let credentialState: OperatorListEntry["credentialState"] = "AUSENTE";
+        let credentialExpiresAt: string | null = null;
+        if (row.token_estado === "ATIVO") {
+          credentialExpiresAt = row.token_expira_em
+            ? new Date(row.token_expira_em).toISOString()
+            : null;
+          credentialState =
+            credentialExpiresAt === null || credentialExpiresAt > now ? "ATIVA" : "EXPIRADA";
+        } else if (row.token_estado === "REVOGADO") {
+          credentialState = "INDEFINIDA";
+        }
+        return {
+          operatorId: row.operator_id,
+          code: row.codigo,
+          displayName: row.nome_exibicao,
+          status: row.status,
+          roles: row.roles ?? [],
+          criadoEm: new Date(row.criado_em).toISOString(),
+          atualizadoEm: new Date(row.atualizado_em).toISOString(),
+          suspensoEm: row.suspenso_em ? new Date(row.suspenso_em).toISOString() : null,
+          credentialActive: credentialState === "ATIVA",
+          credentialExpiresAt,
+          credentialState,
+          activeSessions: Number(row.sessoes_ativas ?? "0"),
+        };
+      });
+    } finally {
+      client.release();
+    }
+  }
+}
+
+export interface OperatorListEntry {
+  readonly operatorId: string;
+  readonly code: string;
+  readonly displayName: string;
+  readonly status: OperatorStatus;
+  readonly roles: readonly OperatorRole[];
+  readonly criadoEm: string;
+  readonly atualizadoEm: string;
+  readonly suspensoEm: string | null;
+  readonly credentialActive: boolean;
+  readonly credentialExpiresAt: string | null;
+  readonly credentialState: "ATIVA" | "EXPIRADA" | "INDEFINIDA" | "AUSENTE";
+  readonly activeSessions: number;
 }

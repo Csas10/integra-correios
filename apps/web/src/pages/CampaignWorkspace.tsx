@@ -79,6 +79,23 @@ type Aprovacao = {
 
 type Etapa = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
 
+type OperatorListEntry = {
+  readonly operatorId: string;
+  readonly code: string;
+  readonly displayName: string;
+  readonly status: "ATIVO" | "SUSPENSO";
+  readonly roles: readonly string[];
+  readonly criadoEm: string;
+  readonly atualizadoEm: string;
+  readonly suspensoEm: string | null;
+  readonly credentialActive: boolean;
+  readonly credentialExpiresAt: string | null;
+  readonly credentialState: "ATIVA" | "EXPIRADA" | "INDEFINIDA" | "AUSENTE";
+  readonly activeSessions: number;
+};
+
+type AdminRoleOption = "PREPARADOR" | "REVISOR" | "APROVADOR" | "EXECUTOR" | "SUPERVISOR";
+
 const ETAPAS: readonly { readonly numero: Etapa; readonly titulo: string; readonly descricao: string }[] = [
   { numero: 1, titulo: "Identificação individual", descricao: "Credencial validada no servidor; sessão curta e auditada." },
   { numero: 2, titulo: "Campanha", descricao: "Estado e gates da campanha de atualização cadastral PF." },
@@ -143,6 +160,26 @@ function mascararEmail(email: string): string {
   return `${visivel}${"•".repeat(Math.max(local.length - 2, 2))}@${dominio}`;
 }
 
+/**
+ * Gera credencial individual com CSPRNG de 256 bits e devolve o par
+ * (credencial bruta, SHA-256 hex). Formato idêntico ao homologado:
+ * 32 bytes -> base64url de 43 caracteres -> SHA-256 UTF-8 hex.
+ * A credencial bruta existe APENAS em memória nesta tela; a API recebe
+ * somente o hash (contrato preservado).
+ */
+function gerarCredencialIndividual(): Promise<{ credencial: string; hash: string }> {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let binario = "";
+  for (const byte of bytes) binario += String.fromCharCode(byte);
+  const credencial = btoa(binario).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const digest = crypto.subtle.digest("SHA-256", new TextEncoder().encode(credencial));
+  return digest.then((ab) => ({
+    credencial,
+    hash: Array.from(new Uint8Array(ab), (b) => b.toString(16).padStart(2, "0")).join(""),
+  }));
+}
+
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   const response = await fetch(input, { credentials: "same-origin", cache: "no-store", ...init });
   const texto = await response.text();
@@ -191,6 +228,16 @@ export function CampaignWorkspace() {
   const [confirmacaoAprovacao, setConfirmacaoAprovacao] = useState("");
   const [previaIndice, setPreviaIndice] = useState(0);
   const [excluidos, setExcluidos] = useState<readonly number[]>([]);
+  const [painelAdmin, setPainelAdmin] = useState(false);
+  const [operadores, setOperadores] = useState<readonly OperatorListEntry[]>([]);
+  const [adminErro, setAdminErro] = useState("");
+  const [adminMensagem, setAdminMensagem] = useState("");
+  const [novoCodigo, setNovoCodigo] = useState("");
+  const [novoNome, setNovoNome] = useState("");
+  const [novosPapeis, setNovosPapeis] = useState<readonly AdminRoleOption[]>([]);
+  const [credencialUnica, setCredencialUnica] = useState<{ operator: string; credencial: string } | null>(null);
+  const [credencialSalvaConfirmada, setCredencialSalvaConfirmada] = useState(false);
+  const [credencialExpiracaoDias, setCredencialExpiracaoDias] = useState(90);
 
   async function loadMe(): Promise<boolean> {
     try {
@@ -231,6 +278,12 @@ export function CampaignWorkspace() {
       .catch((error: unknown) => {
         if (!ativo) return;
         setStatus(null);
+        if (error instanceof ApiCampanhaError && error.status === 403) {
+          setStatusErro(
+            "Identidade válida, mas a jornada de campanha requer papel operacional (PREPARADOR, APROVADOR, EXECUTOR ou SUPERVISOR). Use a área administrativa se você é ADMIN_TECNICO.",
+          );
+          return;
+        }
         setStatusErro(
           error instanceof ApiCampanhaError
             ? error.message
@@ -266,6 +319,129 @@ export function CampaignWorkspace() {
       setToken("");
       setFeedback("Identidade operacional indisponível.");
       setMe(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ------------- Administração (exclusiva de ADMIN_TECNICO) -------------
+  const souAdminTecnico = me?.roles.includes("ADMIN_TECNICO") ?? false;
+
+  async function carregarOperadores(): Promise<void> {
+    setAdminErro("");
+    try {
+      const resposta = await fetchJson<{ operadores: readonly OperatorListEntry[] }>(
+        "/api/operator/admin/operators?limit=100",
+      );
+      setOperadores(resposta.operadores);
+    } catch (error) {
+      setOperadores([]);
+      setAdminErro(
+        error instanceof ApiCampanhaError
+          ? error.message
+          : "Não foi possível carregar a lista de operadores.",
+      );
+    }
+  }
+
+  function abrirPainelAdmin(): void {
+    setPainelAdmin(true);
+    setAdminMensagem("");
+    setAdminErro("");
+    setOperadores([]);
+    void carregarOperadores();
+  }
+
+  async function provisionarOperador(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    setAdminErro("");
+    setAdminMensagem("");
+    if (novosPapeis.length === 0) {
+      setAdminErro("Selecione ao menos um papel para o novo operador.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const { credencial, hash } = await gerarCredencialIndividual();
+      const expiracao = new Date(Date.now() + credencialExpiracaoDias * 24 * 60 * 60 * 1000);
+      const resposta = await fetchJson<{ operatorId: string }>("/api/operator/admin/provision", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          code: novoCodigo.trim(),
+          displayName: novoNome.trim(),
+          roles: novosPapeis,
+          credentialHash: hash,
+          tokenExpiresAt: Number.isFinite(expiracao.getTime()) ? expiracao.toISOString() : undefined,
+        }),
+      });
+      const rotulo =
+        operadores.find((o) => o.operatorId === resposta.operatorId)?.code ?? novoCodigo.trim();
+      setCredencialUnica({ operator: rotulo, credencial });
+      setCredencialSalvaConfirmada(false);
+      setNovoCodigo("");
+      setNovoNome("");
+      setNovosPapeis([]);
+      setAdminMensagem(`Operador ${rotulo} provisionado com papel(éis): ${novosPapeis.join(", ")}.`);
+      await carregarOperadores();
+    } catch (error) {
+      setAdminErro(
+        error instanceof ApiCampanhaError ? error.message : "Provisionamento indisponível.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function suspender(entry: OperatorListEntry): Promise<void> {
+    setAdminErro("");
+    setAdminMensagem("");
+    setLoading(true);
+    try {
+      await fetchJson("/api/operator/admin/suspend", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ operatorId: entry.operatorId }),
+      });
+      setAdminMensagem(`Operador ${entry.code} suspenso e sessões revogadas.`);
+      await carregarOperadores();
+    } catch (error) {
+      setAdminErro(
+        error instanceof ApiCampanhaError ? error.message : "Suspensão indisponível.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function rotacionarCredencial(entry: OperatorListEntry, motivo: "ROTACAO" | "RECUPERACAO"): Promise<void> {
+    setAdminErro("");
+    setAdminMensagem("");
+    setLoading(true);
+    try {
+      const { credencial, hash } = await gerarCredencialIndividual();
+      const expiracao = new Date(Date.now() + credencialExpiracaoDias * 24 * 60 * 60 * 1000);
+      await fetchJson(`/api/operator/admin/credentials/${motivo === "ROTACAO" ? "rotate" : "recover"}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          operatorId: entry.operatorId,
+          credentialHash: hash,
+          tokenExpiresAt: Number.isFinite(expiracao.getTime()) ? expiracao.toISOString() : undefined,
+        }),
+      });
+      setCredencialUnica({ operator: entry.code, credencial });
+      setCredencialSalvaConfirmada(false);
+      setAdminMensagem(
+        motivo === "ROTACAO"
+          ? `Credencial rotacionada para ${entry.code}.`
+          : `Credencial de recuperação emitida para ${entry.code}.`,
+      );
+      await carregarOperadores();
+    } catch (error) {
+      setAdminErro(
+        error instanceof ApiCampanhaError ? error.message : "Rotação de credencial indisponível.",
+      );
     } finally {
       setLoading(false);
     }
@@ -516,9 +692,190 @@ export function CampaignWorkspace() {
           <div className="campaign-session-actions">
             <span>Sessão até {new Date(me.sessionExpiresAt).toLocaleString("pt-BR")}</span>
             <button type="button" onClick={logout} disabled={loading}>Sair</button>
+            {souAdminTecnico ? (
+              <button type="button" onClick={abrirPainelAdmin} disabled={loading}>
+                {painelAdmin ? "Fechar administração" : "Administração"}
+              </button>
+            ) : null}
             {feedback ? <span className="campaign-session-error" role="status">{feedback}</span> : null}
           </div>
         </section>
+
+        {painelAdmin && souAdminTecnico ? (
+          <section className="campaign-panel admin-panel" aria-labelledby="admin-panel-title">
+            <h2 id="admin-panel-title">Administração de operadores</h2>
+            <p className="campaign-actions-note">
+              Área exclusiva de ADMIN_TECNICO. Credenciais aparecem uma única vez e não são
+              armazenadas: enviamos apenas o SHA-256. Operadores não recebem segredo, hash ou
+              cookie nesta tela.
+            </p>
+            {adminMensagem ? <p role="status" className="campaign-actions-note">{adminMensagem}</p> : null}
+            {adminErro ? (
+              <p role="alert" className="campaign-session-error">
+                {adminErro}
+              </p>
+            ) : null}
+
+            <form onSubmit={(e) => { void provisionarOperador(e); }} className="admin-form">
+              <label>
+                Código
+                <input
+                  value={novoCodigo}
+                  onChange={(e) => setNovoCodigo(e.target.value)}
+                  required
+                  maxLength={80}
+                  placeholder="ui-preparador"
+                />
+              </label>
+              <label>
+                Nome de exibição
+                <input
+                  value={novoNome}
+                  onChange={(e) => setNovoNome(e.target.value)}
+                  required
+                  maxLength={160}
+                  placeholder="Operador de Homologação"
+                />
+              </label>
+              <fieldset className="admin-roles">
+                <legend>Papéis permitidos</legend>
+                {(["PREPARADOR", "REVISOR", "APROVADOR", "EXECUTOR", "SUPERVISOR"] as const).map(
+                  (papel) => (
+                    <label key={papel} className="admin-role-option">
+                      <input
+                        type="checkbox"
+                        checked={novosPapeis.includes(papel)}
+                        onChange={(e) =>
+                          setNovosPapeis(
+                            e.target.checked
+                              ? [...novosPapeis, papel]
+                              : novosPapeis.filter((p) => p !== papel),
+                          )
+                        }
+                      />
+                      {papel}
+                    </label>
+                  ),
+                )}
+              </fieldset>
+              <label>
+                Expiração da credencial (dias)
+                <input
+                  type="number"
+                  min={1}
+                  max={365}
+                  value={credencialExpiracaoDias}
+                  onChange={(e) => setCredencialExpiracaoDias(Number(e.target.value) || 90)}
+                />
+              </label>
+              <button type="submit" disabled={loading}>Provisionar operador</button>
+            </form>
+
+            <div className="campaign-table-wrap">
+              <table className="campaign-table admin-table">
+                <thead>
+                  <tr>
+                    <th>Código</th><th>Nome</th><th>Estado</th><th>Papéis</th>
+                    <th>Credencial</th><th>Expira em</th><th>Sessões ativas</th><th>Ações</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {operadores.length === 0 ? (
+                    <tr><td colSpan={8}>Nenhum operador listado.</td></tr>
+                  ) : (
+                    operadores.map((entry) => (
+                      <tr key={entry.operatorId}>
+                        <td>{entry.code}</td>
+                        <td>{entry.displayName}</td>
+                        <td>{entry.status}</td>
+                        <td>{entry.roles.join(", ") || "—"}</td>
+                        <td>{entry.credentialState}</td>
+                        <td>
+                          {entry.credentialExpiresAt
+                            ? new Date(entry.credentialExpiresAt).toLocaleDateString("pt-BR")
+                            : "—"}
+                        </td>
+                        <td>{entry.activeSessions}</td>
+                        <td className="admin-actions">
+                          <button
+                            type="button"
+                            onClick={() => { void suspender(entry); }}
+                            disabled={loading || entry.status !== "ATIVO" || entry.operatorId === me.operatorId}
+                          >
+                            Suspender
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => { void rotacionarCredencial(entry, "ROTACAO"); }}
+                            disabled={loading}
+                          >
+                            Rotacionar credencial
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => { void rotacionarCredencial(entry, "RECUPERACAO"); }}
+                            disabled={loading}
+                          >
+                            Emitir recuperação
+                          </button>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {credencialUnica ? (
+              <div
+                className="admin-credential-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="admin-credential-title"
+              >
+                <h3 id="admin-credential-title">Credencial de {credencialUnica.operator} — exibição única</h3>
+                <p>
+                  Copie e entregue por canal seguro. Ela não será exibida novamente e o servidor
+                  recebeu apenas o SHA-256.
+                </p>
+                <output className="admin-credential-value">{credencialUnica.credencial}</output>
+                <div className="admin-credential-actions">
+                  <button
+                    type="button"
+                    onClick={() => { void navigator.clipboard.writeText(credencialUnica.credencial); }}
+                  >
+                    Copiar
+                  </button>
+                  <a
+                    className="admin-credential-download"
+                    download={`credencial-${credencialUnica.operator}.txt`}
+                    href={URL.createObjectURL(new Blob([credencialUnica.credencial], { type: "text/plain" }))}
+                  >
+                    Baixar
+                  </a>
+                  <label className="admin-credential-confirm">
+                    <input
+                      type="checkbox"
+                      checked={credencialSalvaConfirmada}
+                      onChange={(e) => setCredencialSalvaConfirmada(e.target.checked)}
+                    />
+                    Confirmo que salvei esta credencial em local seguro
+                  </label>
+                  <button
+                    type="button"
+                    disabled={!credencialSalvaConfirmada}
+                    onClick={() => {
+                      setCredencialUnica(null);
+                      setCredencialSalvaConfirmada(false);
+                    }}
+                  >
+                    Encerrar
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
 
         <nav className="campaign-journey" aria-label="Etapas da jornada operacional">
           <ol>

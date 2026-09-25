@@ -9,13 +9,12 @@ BEGIN;
 -- Fixtures sintéticas de identidade (mesmo padrão de 0003_operator_identity).
 -- ---------------------------------------------------------------------------
 
-INSERT INTO operador (id, codigo, nome_exibicao, status, criado_em, atualizado_em)
+-- SUSPENSO exige suspenso_em preenchido (coerência temporal da 0006).
+INSERT INTO operador (id, codigo, nome_exibicao, status, criado_em, atualizado_em, suspenso_em)
 VALUES
-  ('81000000-0000-4000-8000-000000000001','ADMIN-SQL','Admin SQL','ATIVO',now(),now()),
-  ('81000000-0000-4000-8000-000000000002','OP-SQL','Operador SQL','ATIVO',now(),now()),
-  ('81000000-0000-4000-8000-000000000003','OP-SUSP','Operador Suspenso','SUSPENSO',now(),now());
-
-UPDATE operador SET suspenso_em = now() WHERE id = '81000000-0000-4000-8000-000000000003';
+  ('81000000-0000-4000-8000-000000000001','ADMIN-SQL','Admin SQL','ATIVO',now(),now(),NULL),
+  ('81000000-0000-4000-8000-000000000002','OP-SQL','Operador SQL','ATIVO',now(),now(),NULL),
+  ('81000000-0000-4000-8000-000000000003','OP-SUSP','Operador Suspenso','SUSPENSO',now(),now(),now());
 
 INSERT INTO operador_papel (operator_id, papel, ativo, concedido_em)
 VALUES

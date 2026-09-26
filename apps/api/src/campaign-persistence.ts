@@ -96,9 +96,13 @@ export interface EstadoCampanhaPersistida {
  * EstadoCampanhaPersistida (reuso do contrato, zero migration).
  */
 export interface ResumoCampanhaRetomavel {
+  /**
+   * UX-FLOW-01B (corretivo): resumo de descoberta SEM hash — o hash de
+   * aprovação não é necessário para renderizar a lista e sai somente pelo
+   * detail autenticado após seleção explícita.
+   */
   readonly campanhaId: string;
   readonly estado: string;
-  readonly hashAprovacao: string;
   readonly totalAprovados: number;
   readonly loteId: string | null;
   readonly loteCodigo: string | null;
@@ -110,7 +114,6 @@ export interface ResumoCampanhaRetomavel {
 
 export interface ConsultaRetomaveis {
   readonly operatorId: string;
-  readonly limite?: number;
 }
 
 function assertFingerprint(value: string): void {
@@ -406,7 +409,11 @@ function operatorUuidValido(value: string): boolean {
  * exclusivamente o operator_id da sessão. Sem mutação e sem evento de
  * auditoria — a leitura não altera nenhum agregado. Campanha alheia nunca
  * entra no resultado (isolamento: invisível e indistinguível de ausência).
- * Política multi-campanha: ordenação criada_em DESC, limite server-side.
+ * Corretivo UX-FLOW-01B: só entram na lista os estados retomáveis do
+ * contrato (APROVADA sem lote OU LOTE_CRIADO com lote HOLD) — CANCELADA,
+ * estados fora do contrato e lote fora de HOLD ficam fora. A lista é SEMPRE
+ * completa (nenhum limite do cliente): a cardinalidade EMPTY/SINGLE/MULTIPLE
+ * é decidida sobre a contagem total, ordenada por criada_em DESC.
  */
 export async function listarCampanhasRetomaveis(
   pool: CampanhaPool,
@@ -418,9 +425,8 @@ export async function listarCampanhasRetomaveis(
       "operatorId autenticado é obrigatório para a retomada.",
     );
   }
-  const limite = Math.max(1, Math.min(Math.floor(consulta.limite ?? 20), 100));
   const resultado = await pool.query(
-    `SELECT c.id AS campanha_id, c.estado, c.hash_aprovacao, c.total_aprovados,
+    `SELECT c.id AS campanha_id, c.estado, c.total_aprovados,
             lc.id AS lote_id, lc.codigo AS lote_codigo, lc.estado AS lote_estado,
             (SELECT count(*)::text FROM outbox_campanha o WHERE o.lote_campanha_id = lc.id) AS outbox_total,
             (SELECT count(*)::text FROM outbox_campanha o
@@ -429,14 +435,16 @@ export async function listarCampanhasRetomaveis(
        FROM campanha_persistida c
        LEFT JOIN lote_campanha lc ON lc.campanha_id = c.id
       WHERE c.operator_id = $1
-      ORDER BY c.criada_em DESC
-      LIMIT $2`,
-    [consulta.operatorId, limite],
+        AND (
+          (c.estado = 'APROVADA' AND lc.id IS NULL)
+          OR (c.estado = 'LOTE_CRIADO' AND lc.estado = 'HOLD')
+        )
+      ORDER BY c.criada_em DESC`,
+    [consulta.operatorId],
   );
   return (resultado.rows as {
     campanha_id: string;
     estado: string;
-    hash_aprovacao: string;
     total_aprovados: number;
     lote_id: string | null;
     lote_codigo: string | null;
@@ -447,7 +455,6 @@ export async function listarCampanhasRetomaveis(
   }[]).map((linha) => ({
     campanhaId: linha.campanha_id,
     estado: linha.estado,
-    hashAprovacao: linha.hash_aprovacao,
     totalAprovados: linha.total_aprovados,
     loteId: linha.lote_id,
     loteCodigo: linha.lote_codigo,

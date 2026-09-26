@@ -722,6 +722,21 @@ describeDb("CAMPAIGN_RESUMABLE_ROUTES — retomada real (PostgreSQL 16)", () => 
         [primeira.campanhaId, segunda.campanhaId].sort(),
       );
 
+      // Minimização do resumo (corretivo): NENHUM hash de aprovação na
+      // descoberta — hash sai somente do detail autenticado pós-seleção.
+      for (const resumo of corpoMulti.campaigns) {
+        expect(resumo).not.toHaveProperty("hashAprovacao");
+      }
+      expect(multipla.corpo).not.toContain("hashAprovacao");
+      const detalheHash = await despachar(
+        "GET",
+        `/api/campaigns/detail?campanhaId=${primeira.campanhaId}`,
+        { headers: { cookie: dono.cookie } },
+      );
+      expect(detalheHash.status).toBe(200);
+      expect((JSON.parse(detalheHash.corpo) as { campanha: { hashAprovacao: string } }).campanha.hashAprovacao)
+        .toMatch(/^[0-9a-f]{64}$/);
+
       // Seleção EXPLÍCITA do próprio operador → detalhe autorizado.
       const detalhe = await despachar(
         "GET",
@@ -753,6 +768,131 @@ describeDb("CAMPAIGN_RESUMABLE_ROUTES — retomada real (PostgreSQL 16)", () => 
     }
   });
 
+  it("corretivo: 2+ retomáveis com tentativa de limite → nunca SINGLE implícito (cardinalidade total)", async () => {
+    try {
+      const adminCookie = await bootstrapAdmin();
+      const dono = await provisionOperator(adminCookie, ["PREPARADOR", "EXECUTOR"]);
+
+      // 2 campanhas retomáveis: APROVADA sem lote + LOTE_CRIADO com lote HOLD.
+      const { NodePostgresPool } = await import("@integra-correios/persistence");
+      const pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE! });
+      try {
+        const semear = async (
+          operatorId: string,
+          estado: string,
+          loteEstado: string | null,
+        ): Promise<string> => {
+          const campanhaId = randomUUID();
+          await pool.query(
+            `INSERT INTO campanha_persistida (
+               id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao,
+               snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados,
+               estado, criada_em, atualizada_em)
+             VALUES ($1, $2, $3, 'V1-TESTE', $4, '{"registros":[]}'::jsonb, 2, 2, 0, 2,
+                     $5, now(), now())`,
+            [campanhaId, operatorId, sha(`seed-card-${randomUUID()}`), sha(`seed-card-hash-${randomUUID()}`), estado],
+          );
+          if (loteEstado !== null) {
+            await pool.query(
+              `INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em)
+               VALUES ($1, $2, 'PF', $3, 'V1-TESTE', $4, 2, now())`,
+              [randomUUID(), campanhaId, `CAMPANHA_PF_${randomUUID().slice(0, 8)}`, loteEstado],
+            );
+          }
+          return campanhaId;
+        };
+        await semear(dono.operatorId, "APROVADA", null);
+        await semear(dono.operatorId, "LOTE_CRIADO", "HOLD");
+
+        // Sem parâmetros: contagem TOTAL → MULTIPLE (nunca SINGLE).
+        const semParametro = await despachar("GET", "/api/campaigns/resumable", { headers: { cookie: dono.cookie } });
+        expect(semParametro.status).toBe(200);
+        const corpoSem = JSON.parse(semParametro.corpo) as { mode: string; campaigns: { campanhaId: string }[] };
+        expect(corpoSem.mode).toBe("MULTIPLE");
+        expect(corpoSem.campaigns).toHaveLength(2);
+
+        // Paginação pelo cliente NÃO existe mais: qualquer ?limite → 422.
+        for (const tentativa of ["1", "2", "10", "100"]) {
+          const paginada = await despachar(
+            "GET",
+            `/api/campaigns/resumable?limite=${tentativa}`,
+            { headers: { cookie: dono.cookie } },
+          );
+          expect(paginada.status).toBe(422);
+          expect(paginada.corpo).toContain("CAMPAIGN_RESUMABLE_INVALID");
+        }
+      } finally {
+        await pool.close();
+      }
+    } finally {
+      // Conexões efêmeras já fechadas nos helpers.
+    }
+  });
+
+  it("corretivo: filtro server-side de estados retomáveis — CANCELADA e lote fora de HOLD ficam fora; alheio invisível", async () => {
+    try {
+      const adminCookie = await bootstrapAdmin();
+      const dono = await provisionOperator(adminCookie, ["PREPARADOR", "EXECUTOR"]);
+      const terceiro = await provisionOperator(adminCookie, ["PREPARADOR", "EXECUTOR"]);
+
+      const { NodePostgresPool } = await import("@integra-correios/persistence");
+      const pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE! });
+      try {
+        const semear = async (
+          operatorId: string,
+          estado: string,
+          loteEstado: string | null,
+        ): Promise<string> => {
+          const campanhaId = randomUUID();
+          await pool.query(
+            `INSERT INTO campanha_persistida (
+               id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao,
+               snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados,
+               estado, criada_em, atualizada_em)
+             VALUES ($1, $2, $3, 'V1-TESTE', $4, '{"registros":[]}'::jsonb, 1, 1, 0, 1,
+                     $5, now(), now())`,
+            [campanhaId, operatorId, sha(`seed-filtro-${randomUUID()}`), sha(`seed-filtro-hash-${randomUUID()}`), estado],
+          );
+          if (loteEstado !== null) {
+            await pool.query(
+              `INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em)
+               VALUES ($1, $2, 'PF', $3, 'V1-TESTE', $4, 1, now())`,
+              [randomUUID(), campanhaId, `CAMPANHA_PF_${randomUUID().slice(0, 8)}`, loteEstado],
+            );
+          }
+          return campanhaId;
+        };
+        // Terceiro: CANCELADA (fora), APROVADA com lote PREPARADO (fora) e
+        // com lote ATIVO (estado executável futuro → fora do contrato).
+        const cancelada = await semear(terceiro.operatorId, "CANCELADA", null);
+        const alheiaPreparado = await semear(terceiro.operatorId, "APROVADA", "PREPARADO");
+        const alheiaAtiva = await semear(terceiro.operatorId, "APROVADA", "ATIVO");
+        // Dono: exatamente 1 retomável (APROVADA sem lote).
+        const retomavel = await semear(dono.operatorId, "APROVADA", null);
+        void cancelada;
+        void alheiaPreparado;
+        void alheiaAtiva;
+
+        const listaTerceiro = await despachar("GET", "/api/campaigns/resumable", { headers: { cookie: terceiro.cookie } });
+        expect(listaTerceiro.status).toBe(200);
+        const corpoTerceiro = JSON.parse(listaTerceiro.corpo) as { mode: string; campaigns: unknown[] };
+        expect(corpoTerceiro.mode).toBe("EMPTY");
+        expect(corpoTerceiro.campaigns).toEqual([]);
+        expect(listaTerceiro.corpo).not.toContain(retomavel);
+
+        const listaDono = await despachar("GET", "/api/campaigns/resumable", { headers: { cookie: dono.cookie } });
+        expect(listaDono.status).toBe(200);
+        const corpoDono = JSON.parse(listaDono.corpo) as { mode: string; campaign: { campanhaId: string } };
+        expect(corpoDono.mode).toBe("SINGLE");
+        expect(corpoDono.campaign.campanhaId).toBe(retomavel);
+      } finally {
+        await pool.close();
+      }
+    } finally {
+      // Conexões efêmeras já fechadas nos helpers.
+    }
+  });
+
   it("operador suspenso (sessão revogada) → bloqueado; limite inválido → 422", async () => {
     try {
       const adminCookie = await bootstrapAdmin();
@@ -772,10 +912,18 @@ describeDb("CAMPAIGN_RESUMABLE_ROUTES — retomada real (PostgreSQL 16)", () => 
       expect([401, 403]).toContain(detalheSuspenso.status);
 
       const novo = await provisionOperator(adminCookie, ["PREPARADOR"]);
-      const invalida = await despachar("GET", "/api/campaigns/resumable?limite=999", { headers: { cookie: novo.cookie } });
-      expect(invalida.status).toBe(422);
-      expect(invalida.corpo).toContain("CAMPAIGN_RESUMABLE_INVALID");
-      const valida = await despachar("GET", "/api/campaigns/resumable?limite=5", { headers: { cookie: novo.cookie } });
+      // Corretivo: ?limite saiu do contrato (cardinalidade é total, nunca
+      // paginada pelo cliente) → 422 para QUALQUER valor.
+      for (const tentativa of ["999", "0", "-1", "abc", "5"]) {
+        const resposta = await despachar(
+          "GET",
+          `/api/campaigns/resumable?limite=${tentativa}`,
+          { headers: { cookie: novo.cookie } },
+        );
+        expect(resposta.status).toBe(422);
+        expect(resposta.corpo).toContain("CAMPAIGN_RESUMABLE_INVALID");
+      }
+      const valida = await despachar("GET", "/api/campaigns/resumable", { headers: { cookie: novo.cookie } });
       expect(valida.status).toBe(200);
       expect((JSON.parse(valida.corpo) as { mode: string }).mode).toBe("EMPTY");
     } finally {

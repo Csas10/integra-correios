@@ -266,28 +266,6 @@ type RetomadaEstado =
   | { readonly status: "aplicada"; readonly campanha: CampanhaPersistida }
   | { readonly status: "multipla"; readonly campanhas: readonly CampanhaRetomavelResumo[] };
 
-/** Converte o resumo da descoberta no contrato de detalhe da sessão. */
-function resumoParaCampanha(resumo: CampanhaRetomavelResumo): CampanhaPersistida {
-  return {
-    campanhaId: resumo.campanhaId,
-    operatorId: "",
-    fingerprintArquivo: "",
-    templateVersao: "",
-    hashAprovacao: resumo.hashAprovacao,
-    estado: resumo.estado,
-    totalRegistros: 0,
-    totalAptos: 0,
-    totalBloqueados: 0,
-    totalAprovados: resumo.totalAprovados,
-    loteId: resumo.loteId,
-    loteCodigo: resumo.loteCodigo,
-    loteEstado: resumo.loteEstado,
-    outboxTotal: resumo.outboxTotal,
-    outboxNaoExecutavel: resumo.outboxNaoExecutavel,
-    criadaEm: resumo.criadaEm,
-  };
-}
-
 /** Detalhe autenticado da campanha do PRÓPRIO operador (seleção explícita). */
 async function obterCampanhaDetalhe(campanhaId: string): Promise<CampanhaPersistida> {
   const resposta = await fetchJson<{ campanha: CampanhaPersistida }>(
@@ -432,8 +410,10 @@ export function CampaignWorkspace() {
   // operator_id da sessão autenticada (GET /api/campaigns/resumable). Session
   // Storage vazio ou outro navegador NÃO impede a reconstrução — o débito
   // CROSS_BROWSER_RESUME_DEPENDS_ON_SESSION_CONTEXT é encerrado. SINGLE é
-  // retomado automaticamente (contrato server-driven); MULTIPLE exige
-  // seleção EXPLÍCITA do operador — nenhuma escolha silenciosa.
+  // retomado automaticamente (contrato server-driven): o detalhe é APLICADO
+  // ao estado operacional (setCampanha) — mesmo estado da recuperação
+  // normal; o Session Storage é preenchido só como conveniência. MULTIPLE
+  // exige seleção EXPLÍCITA do operador — nenhuma escolha silenciosa.
   useEffect(() => {
     if (!me) {
       setRetomada({ status: "indefinida" });
@@ -447,8 +427,16 @@ export function CampaignWorkspace() {
         );
         if (!ativo) return;
         if (resposta.mode === "SINGLE" && resposta.campaign) {
+          // Corretivo UX-FLOW-01B: SINGLE server-driven APLICA o detalhe ao
+          // estado operacional (campanha) — é dele que visaoMacro deriva a
+          // macroetapa 4 (Operação / preparar lote OU acompanhamento). Sem
+          // isso, navegador novo + Session Storage vazio nunca reconstruía a
+          // operação. Mesmo padrão da seleção explícita MULTIPLE.
           const detalhe = await obterCampanhaDetalhe(resposta.campaign.campanhaId);
           if (!ativo) return;
+          setCampanha(detalhe);
+          setHashSessao(detalhe.hashAprovacao);
+          sessionStorage.setItem("ic_campanha_hash", detalhe.hashAprovacao);
           setRetomada({ status: "aplicada", campanha: detalhe });
           return;
         }

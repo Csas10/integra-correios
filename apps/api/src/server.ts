@@ -1253,37 +1253,29 @@ const ROTAS: readonly Rota[] = [
     // nenhum evento de auditoria. Operador suspenso/revogado não passa do
     // exigirOperadorCampanha (sessão resolvida = ATIVO; 401 sanitizado).
     // Campanha alheia nunca aparece: invisível e indistinguível de ausência
-    // (lista vazia ≠ informação sobre terceiros). Política multi-campanha:
-    // criada_em DESC, limite server-side (o cliente nunca escolhe o alvo).
+    // (lista vazia ≠ informação sobre terceiros). Contrato de cardinalidade
+    // (corretivo UX-FLOW-01B): EMPTY/SINGLE/MULTIPLE dependem da contagem
+    // TOTAL de campanhas retomáveis do operador (filtro de estados
+    // server-side) — NUNCA de paginação/limite controlado pelo cliente; sem
+    // parâmetro limite nesta rota (?limite=N → 422 CAMPAIGN_RESUMABLE_INVALID).
     // ------------------------------------------------------------------
     metodo: "GET",
     caminhoExato: "/api/campaigns/resumable",
     handler: async (req, res, url) => {
       const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
       if (!identity) return;
-      const limiteParam = url.searchParams.get("limite") ?? "";
-      let limite = 20;
-      if (limiteParam !== "") {
-        if (!/^\d{1,3}$/.test(limiteParam)) {
-          json(res, 422, {
-            erro: "Parâmetro limite inválido (1–100).",
-            codigo: "CAMPAIGN_RESUMABLE_INVALID",
-          });
-          return;
-        }
-        limite = Number(limiteParam);
-        if (limite < 1 || limite > 100) {
-          json(res, 422, {
-            erro: "Parâmetro limite fora da faixa (1–100).",
-            codigo: "CAMPAIGN_RESUMABLE_INVALID",
-          });
-          return;
-        }
+      // Corretivo UX-FLOW-01B: ?limite=N sai do contrato — a cardinalidade
+      // EMPTY/SINGLE/MULTIPLE nunca pode depender de parâmetro do cliente.
+      if (url.searchParams.get("limite") !== null) {
+        json(res, 422, {
+          erro: "Parâmetro limite não é aceito na retomada (cardinalidade é sempre total).",
+          codigo: "CAMPAIGN_RESUMABLE_INVALID",
+        });
+        return;
       }
       try {
         const campanhas = await listarCampanhasRetomaveis(requireDbPool(), {
           operatorId: identity.operatorId,
-          limite,
         });
         // Política obrigatória de retomada: 0 → EMPTY; 1 → SINGLE (sem
         // seleção pelo cliente); 2+ → MULTIPLE (resumos autorizados; NENHUMA
@@ -1295,7 +1287,6 @@ const ROTAS: readonly Rota[] = [
             campaign: {
               campanhaId: unica.campanhaId,
               estado: unica.estado,
-              hashAprovacao: unica.hashAprovacao,
               totalAprovados: unica.totalAprovados,
               loteId: unica.loteId,
               loteCodigo: unica.loteCodigo,
@@ -1307,6 +1298,9 @@ const ROTAS: readonly Rota[] = [
           });
           return;
         }
+        // Cardinalidade da lista COMPLETA (nenhum limite do cliente):
+        // 0 → EMPTY; 1 → SINGLE (bloco acima); 2+ → MULTIPLE (sem escolha
+        // implícita — o operador seleciona explicitamente via detail).
         json(res, 200, {
           mode: campanhas.length === 0 ? "EMPTY" : "MULTIPLE",
           campaigns: campanhas,

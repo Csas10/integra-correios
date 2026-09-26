@@ -1,18 +1,21 @@
 /**
  * UX-FLOW-01B — Decisão PURA de retomada server-driven de campanha persistida.
  *
- * Débito CROSS_BROWSER_RESUME_DEPENDS_ON_SESSION_CONTEXT: a retomada antiga
- * dependia do hash no Session Storage — em outro navegador, campanha
- * persistida não era apresentada. Esta decisão consome EXCLUSIVAMENTE a
- * lista READ-ONLY do servidor (GET /api/campaigns/resumable, escopo
- * operator_id da sessão): nenhum requisito de hash prévio, nenhuma seleção
- * pelo cliente, nenhuma mutação.
+ * A decisão consome EXCLUSIVAMENTE a lista READ-ONLY do servidor
+ * (GET /api/campaigns/resumable, escopo operator_id da sessão): nenhum
+ * requisito de hash prévio, nenhuma seleção pelo cliente, nenhuma mutação.
  *
- * Política multi-campanha (explícita):
- *   · A retomada ABRE o foco da campanha mais recente (servidor devolve
- *     criada_em DESC — o cliente NÃO escolhe o alvo).
- *   · As demais permanecem listadas no acompanhamento para consulta
- *     read-only (sem trocar o foco silenciosamente).
+ * Contrato de cardinalidade (server-driven, sem escolha implícita):
+ *   - EMPTY (0 retomáveis) → SEM_RETOMADA;
+ *   - SINGLE (1 retomável) → foco ÚNICO autorizado pelo servidor
+ *     (PREPARAR_LOTE ou ACOMPANHAMENTO);
+ *   - MULTIPLE (2 ou mais) → SELECAO_EXPLICITA_NECESSARIA: NENHUMA campanha
+ *     é escolhida aqui (nem a mais recente, nem a primeira linha). A UI
+ *     lista os resumos autorizados e somente a ação humana do operador chama
+ *     GET /api/campaigns/detail?campanhaId=... (aplicação via setCampanha).
+ *
+ * Resumo minimizado (corretivo): o hash de aprovação NÃO faz parte da lista
+ * de descoberta — sai somente do detail autenticado após seleção explícita.
  *
  * Sem persistência de rascunho nesta entrega: o que não está no PostgreSQL
  * (importação, mapeamento, revisão da sessão) NÃO é retomado.
@@ -21,7 +24,6 @@
 export interface CampanhaRetomavelResumo {
   readonly campanhaId: string;
   readonly estado: string;
-  readonly hashAprovacao: string;
   readonly totalAprovados: number;
   readonly loteId: string | null;
   readonly loteCodigo: string | null;
@@ -32,25 +34,32 @@ export interface CampanhaRetomavelResumo {
 }
 
 export type DisposicaoRetomada =
-  /** Nada a retomar (ignoradas = 0) ou estado(s) não retomável(is). */
+  /** Nada a retomar: EMPTY do servidor ou estado(s) não retomável(is). */
   | { readonly tipo: "SEM_RETOMADA"; readonly ignoradas: number }
-  /** APROVADA sem lote → "Campanha pronta para preparar lote". */
+  /** SINGLE APROVADA sem lote → Operação / preparar lote. */
   | { readonly tipo: "PREPARAR_LOTE"; readonly campanha: CampanhaRetomavelResumo; readonly totalRetomaveis: number }
-  /** LOTE_CRIADO (lote HOLD) → "Operação e acompanhamento". */
+  /** SINGLE LOTE_CRIADO (lote HOLD) → Operação / acompanhamento. */
   | { readonly tipo: "ACOMPANHAMENTO"; readonly campanha: CampanhaRetomavelResumo; readonly totalRetomaveis: number }
-  /** Estado não retomável nesta entrega (ex.: CAMPAIGN_CANCELADA) → sem retomada. */
-  | { readonly tipo: "SEM_RETOMADA"; readonly ignoradas: number };
+  /** 2+ retomáveis → NENHUMA escolha implícita: a lista aguarda ação humana. */
+  | { readonly tipo: "SELECAO_EXPLICITA_NECESSARIA"; readonly totalRetomaveis: number };
 
 /**
- * Decide a retomada a partir da lista server-driven (ordem criada_em DESC
- * GARANTIDA pelo servidor). Puro: mesma lista, mesma disposição.
+ * Decide a retomada a partir da lista server-driven. Puro: mesma lista,
+ * mesma disposição. A cardinalidade é decidida pelo SERVIDOR (que já filtra
+ * apenas estados retomáveis e nunca aplica limite do cliente à decisão);
+ * esta função apenas reclassifica a lista autorizada — nunca inventa foco.
  */
 export function disposicaoRetomada(
   campanhas: readonly CampanhaRetomavelResumo[],
 ): DisposicaoRetomada {
+  const total = campanhas.length;
   const primeira = campanhas[0];
   if (!primeira) return { tipo: "SEM_RETOMADA", ignoradas: 0 };
-  const total = campanhas.length;
+  if (total >= 2) {
+    // Contrato UX-FLOW-01B: com 2+ campanhas NÃO existe "abrir a mais
+    // recente" — a UI mostra a lista e o operador escolhe explicitamente.
+    return { tipo: "SELECAO_EXPLICITA_NECESSARIA", totalRetomaveis: total };
+  }
   if (primeira.loteId !== null) {
     return { tipo: "ACOMPANHAMENTO", campanha: primeira, totalRetomaveis: total };
   }

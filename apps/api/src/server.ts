@@ -80,6 +80,8 @@ import {
 } from "./campaign-import.js";
 import {
   CampaignPersistenceError,
+  listarCampanhasRetomaveis,
+  recuperarCampanhaPorId,
   recuperarEstadoCampanha,
   persistirCampanhaAprovada,
   persistirLoteCampanha,
@@ -182,6 +184,8 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "GET /api/operator/admin/operators",
   "GET /api/campaigns/persisted",
   "GET /api/campaigns/batch",
+  "GET /api/campaigns/resumable",
+  "GET /api/campaigns/detail",
   "POST /api/campaigns/persist",
   "POST /api/campaigns/batch",
 ]);
@@ -1197,6 +1201,110 @@ const ROTAS: readonly Rota[] = [
           return;
         }
         json(res, 200, { campanha: estado });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    // ------------------------------------------------------------------
+    // UX-FLOW-01B — Detalhe READ-ONLY de UMA campanha (seleção explícita da
+    // retomada MULTIPLE). campanhaId vem do cliente, porém o escopo é
+    // SEMPRE operator_id da sessão: campanha inexistente ou alheia → 404
+    // sanitizado (indistinguível). Sem mutação, sem evento de auditoria.
+    // ------------------------------------------------------------------
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/detail",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const campanhaId = url.searchParams.get("campanhaId")?.trim() ?? "";
+      if (!operatorUuidValido(campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_DETAIL_INVALID",
+        });
+        return;
+      }
+      try {
+        const estado = await recuperarCampanhaPorId(requireDbPool(), {
+          campanhaId,
+          operatorId: identity.operatorId,
+        });
+        if (!estado) {
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, 200, { campanha: estado });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    // ------------------------------------------------------------------
+    // UX-FLOW-01B — Retomada server-driven: lista READ-ONLY das campanhas
+    // persistidas do operador da sessão. Escopo exclusivo = operator_id
+    // validado no servidor (nenhum parâmetro do cliente seleciona dados;
+    // sem hash e sem fingerprint prévios). Zero mutação: nenhuma escrita,
+    // nenhum evento de auditoria. Operador suspenso/revogado não passa do
+    // exigirOperadorCampanha (sessão resolvida = ATIVO; 401 sanitizado).
+    // Campanha alheia nunca aparece: invisível e indistinguível de ausência
+    // (lista vazia ≠ informação sobre terceiros). Contrato de cardinalidade
+    // (corretivo UX-FLOW-01B): EMPTY/SINGLE/MULTIPLE dependem da contagem
+    // TOTAL de campanhas retomáveis do operador (filtro de estados
+    // server-side) — NUNCA de paginação/limite controlado pelo cliente; sem
+    // parâmetro limite nesta rota (?limite=N → 422 CAMPAIGN_RESUMABLE_INVALID).
+    // ------------------------------------------------------------------
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/resumable",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      // Corretivo UX-FLOW-01B: ?limite=N sai do contrato — a cardinalidade
+      // EMPTY/SINGLE/MULTIPLE nunca pode depender de parâmetro do cliente.
+      if (url.searchParams.get("limite") !== null) {
+        json(res, 422, {
+          erro: "Parâmetro limite não é aceito na retomada (cardinalidade é sempre total).",
+          codigo: "CAMPAIGN_RESUMABLE_INVALID",
+        });
+        return;
+      }
+      try {
+        const campanhas = await listarCampanhasRetomaveis(requireDbPool(), {
+          operatorId: identity.operatorId,
+        });
+        // Política obrigatória de retomada: 0 → EMPTY; 1 → SINGLE (sem
+        // seleção pelo cliente); 2+ → MULTIPLE (resumos autorizados; NENHUMA
+        // escolha implícita de mais recente/último/maior id/primeira linha).
+        if (campanhas.length === 1) {
+          const unica = campanhas[0]!;
+          json(res, 200, {
+            mode: "SINGLE",
+            campaign: {
+              campanhaId: unica.campanhaId,
+              estado: unica.estado,
+              totalAprovados: unica.totalAprovados,
+              loteId: unica.loteId,
+              loteCodigo: unica.loteCodigo,
+              loteEstado: unica.loteEstado,
+              outboxTotal: unica.outboxTotal,
+              outboxNaoExecutavel: unica.outboxNaoExecutavel,
+              criadaEm: unica.criadaEm,
+            },
+          });
+          return;
+        }
+        // Cardinalidade da lista COMPLETA (nenhum limite do cliente):
+        // 0 → EMPTY; 1 → SINGLE (bloco acima); 2+ → MULTIPLE (sem escolha
+        // implícita — o operador seleciona explicitamente via detail).
+        json(res, 200, {
+          mode: campanhas.length === 0 ? "EMPTY" : "MULTIPLE",
+          campaigns: campanhas,
+        });
       } catch (error) {
         erroPersistenciaCampanha(res, error);
       }

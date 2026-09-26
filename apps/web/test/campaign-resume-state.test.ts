@@ -175,11 +175,12 @@ describe("corretivo MULTIPLE/HASH RACE — coordenação descoberta × hash", ()
   });
 
   it("3) /persisted atrasado em MULTIPLE → resposta posterior NÃO reativa campanha (cleanup + gate)", () => {
-    // Linha do tempo determinística: t0 descoberta em voo (fetch de hash
-    // permitido, em voo); t1 descoberta determina MULTIPLE → o efeito
-    // re-executa: o cleanup (`ativo`) descarta a resposta atrasada e o gate
-    // passa a bloquear novas recuperações por hash até seleção explícita.
-    expect(recuperacaoPorHashPermitida(estado("INDEFINIDO"))).toBe(true);
+    // Linha do tempo determinística (micro-gate FINAL HASH AUTHORITY):
+    // t0 descoberta em voo → o gate NEM autoriza iniciar o /persisted (não
+    // existe resposta precoce); t1 descoberta determina MULTIPLE → o gate
+    // segue bloqueado até seleção explícita e o cleanup (`ativo`) permanece
+    // como barreira secundária contra respostas tardias.
+    expect(recuperacaoPorHashPermitida(estado("INDEFINIDO"))).toBe(false);
     expect(recuperacaoPorHashPermitida(estado("MULTIPLE"))).toBe(false);
   });
 
@@ -212,5 +213,41 @@ describe("corretivo MULTIPLE/HASH RACE — coordenação descoberta × hash", ()
   it("8) EMPTY → nenhuma campanha ativa (hash não reativa)", () => {
     expect(ordemRetomadaParaRecuperacaoPorHash(0)).toEqual({ ordem: "LIMPAR_SELECAO" });
     expect(recuperacaoPorHashPermitida(estado("EMPTY"))).toBe(false);
+  });
+});
+
+describe("micro-gate FINAL HASH AUTHORITY — INDEFINIDO nunca autoriza hash", () => {
+  const estado = (modo: ModoDescobertaRetomada, aplicada = false): EstadoRetomadaLogado => ({
+    modo,
+    campanhaAplicada: aplicada,
+  });
+
+  it("1) INDEFINIDO + hash local → /persisted NÃO é autorizado", () => {
+    expect(recuperacaoPorHashPermitida(estado("INDEFINIDO"))).toBe(false);
+  });
+
+  it("2) /persisted 'mais rápido' não pode selecionar campanha antes de /resumable", () => {
+    // Com o modo INDEFINIDO o efeito de hash early-return ANTES de emitir a
+    // request: a resposta precoce não pode existir — a descoberta server-
+    // driven é a autoridade e o hash só atua após a política definida.
+    expect(recuperacaoPorHashPermitida(estado("INDEFINIDO", true))).toBe(false);
+  });
+
+  it("3) SINGLE após descoberta → hash pode funcionar como conveniência", () => {
+    expect(recuperacaoPorHashPermitida(estado("SINGLE"))).toBe(true);
+    expect(recuperacaoPorHashPermitida(estado("SINGLE", true))).toBe(true);
+  });
+
+  it("4) MULTIPLE sem seleção → continua bloqueado", () => {
+    expect(recuperacaoPorHashPermitida(estado("MULTIPLE"))).toBe(false);
+  });
+
+  it("5) MULTIPLE após detail explícito → permitido (converge à selecionada)", () => {
+    expect(recuperacaoPorHashPermitida(estado("MULTIPLE", true))).toBe(true);
+  });
+
+  it("6) EMPTY → bloqueado (seleção aplicada ou não)", () => {
+    expect(recuperacaoPorHashPermitida(estado("EMPTY"))).toBe(false);
+    expect(recuperacaoPorHashPermitida(estado("EMPTY", true))).toBe(false);
   });
 });

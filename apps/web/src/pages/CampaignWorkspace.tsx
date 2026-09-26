@@ -399,6 +399,8 @@ export function CampaignWorkspace() {
   // é CONVENIÊNCIA de precisão, NUNCA mecanismo paralelo de seleção. A
   // descoberta server-driven (resumable) é a autoridade e coordena este
   // efeito de forma determinística (módulo puro `recuperacaoPorHashPermitida`):
+  // · INDEFINIDO (descoberta em voo) → hash NEM inicia (/persisted "mais
+  //   rápido" que a descoberta não existe: gate fechado antes da request);
   // · MULTIPLE sem seleção explícita → hash NÃO seleciona (gate bloqueia);
   // · EMPTY → nenhuma campanha é reativada;
   // · SINGLE → hash converge para a MESMA campanha autorizada;

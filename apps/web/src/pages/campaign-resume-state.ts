@@ -74,6 +74,8 @@ export function disposicaoRetomada(
 // descoberta server-driven (AUTORIDADE da retomada) e a recuperação legado
 // por hash (conveniência de precisão). A recuperação por hash NUNCA é
 // mecanismo paralelo de seleção:
+//   · INDEFINIDO (descoberta em voo) → hash NEM sequer inicia (/persisted
+//     "mais rápido" não existe: a request só sai após a política definida);
 //   · MULTIPLE sem seleção explícita → hash NÃO seleciona campanha;
 //   · EMPTY → nenhuma campanha é reativada;
 //   · SINGLE → hash converge para a MESMA campanha autorizada;
@@ -117,13 +119,15 @@ export interface EstadoRetomadaLogado {
  * GET /api/campaigns/persisted?hash=... quando este gate permite.
  */
 export function recuperacaoPorHashPermitida(estado: EstadoRetomadaLogado): boolean {
+  if (estado.modo === "SINGLE") return true;
   if (estado.modo === "MULTIPLE") return estado.campanhaAplicada;
-  if (estado.modo === "EMPTY") return false;
-  // SINGLE: conveniência de precisão da MESMA campanha (converge, nunca
-  // escolhe outra). INDEFINIDO: descoberta ainda em voo — quando o modo for
-  // decidido, o efeito re-executa (cleanup cancela o fetch anterior) e o
-  // hash é re-ancorado na decisão da autoridade.
-  return true;
+  // EMPTY: nenhuma campanha é reativada. INDEFINIDO (micro-gate FINAL HASH
+  // AUTHORITY): a descoberta server-driven ainda NÃO determinou a política —
+  // a recuperação por hash só pode INICIAR depois dela. Assim, uma resposta
+  // de /persisted "mais rápida" que /resumable não pode selecionar campanha
+  // antes da autoridade: com o gate fechado a request nem chega a ser feita
+  // (o cleanup permanece como segunda barreira para respostas tardias).
+  return false;
 }
 
 /** Reset local completo (logout): nenhum estado operacional sobrevive. */

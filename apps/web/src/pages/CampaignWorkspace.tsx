@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { AppHeader } from "../components/AppHeader";
 import { campaignLogoutDisposition } from "./campaign-logout-state";
 import { visaoEtapa8 } from "./campaign-step8-presentation";
+import { disposicaoRetomada, type CampanhaRetomavelResumo } from "./campaign-resume-state";
 import {
   macroEtapaAtual,
   mapeamentoDeterministico,
@@ -257,6 +258,44 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
+// UX-FLOW-01B — modo de descoberta do servidor (EMPTY / SINGLE / MULTIPLE).
+// O cliente NUNCA escolhe campanha alheia nem infere por hash local.
+type RetomadaEstado =
+  | { readonly status: "indefinida" }
+  | { readonly status: "vazio" }
+  | { readonly status: "aplicada"; readonly campanha: CampanhaPersistida }
+  | { readonly status: "multipla"; readonly campanhas: readonly CampanhaRetomavelResumo[] };
+
+/** Converte o resumo da descoberta no contrato de detalhe da sessão. */
+function resumoParaCampanha(resumo: CampanhaRetomavelResumo): CampanhaPersistida {
+  return {
+    campanhaId: resumo.campanhaId,
+    operatorId: "",
+    fingerprintArquivo: "",
+    templateVersao: "",
+    hashAprovacao: resumo.hashAprovacao,
+    estado: resumo.estado,
+    totalRegistros: 0,
+    totalAptos: 0,
+    totalBloqueados: 0,
+    totalAprovados: resumo.totalAprovados,
+    loteId: resumo.loteId,
+    loteCodigo: resumo.loteCodigo,
+    loteEstado: resumo.loteEstado,
+    outboxTotal: resumo.outboxTotal,
+    outboxNaoExecutavel: resumo.outboxNaoExecutavel,
+    criadaEm: resumo.criadaEm,
+  };
+}
+
+/** Detalhe autenticado da campanha do PRÓPRIO operador (seleção explícita). */
+async function obterCampanhaDetalhe(campanhaId: string): Promise<CampanhaPersistida> {
+  const resposta = await fetchJson<{ campanha: CampanhaPersistida }>(
+    `/api/campaigns/detail?campanhaId=${encodeURIComponent(campanhaId)}`,
+  );
+  return resposta.campanha;
+}
+
 class ApiCampanhaError extends Error {
   constructor(
     message: string,
@@ -305,6 +344,11 @@ export function CampaignWorkspace() {
   // UX-FLOW-01A — detalhamento das dez etapas: consulta (painel), não wizard.
   const [painelAtividade, setPainelAtividade] = useState(false);
   const [etapaConsulta, setEtapaConsulta] = useState<Etapa>(1);
+  // UX-FLOW-01B — retomada server-driven (descoberta por operator_id).
+  const [retomada, setRetomada] = useState<RetomadaEstado>({ status: "indefinida" });
+  const [retomando, setRetomando] = useState(false);
+  const [retomadaErro, setRetomadaErro] = useState("");
+
   async function loadMe(): Promise<boolean> {
     try {
       const response = await fetch("/api/operator/me", {
@@ -361,12 +405,11 @@ export function CampaignWorkspace() {
     };
   }, [me]);
 
-  // SLICE-02 — Recuperação do estado persistido (etapa 10 reconstrói do
-  // PostgreSQL): reload/logout/login não pode apagar a campanha. A busca usa
-  // o hash congelado desta sessão do navegador; sem hash, nada é consultado.
+  // SLICE-02 — Recuperação por hash CONGELADO da sessão (mantida como
+  // conveniência de precisão; UX-FLOW-01B: nunca é requisito de descoberta).
   useEffect(() => {
     if (!me || !hashSessao) {
-      setCampanha(null);
+      if (!hashSessao) setCampanha(null);
       return;
     }
     let ativo = true;
@@ -384,6 +427,61 @@ export function CampaignWorkspace() {
       ativo = false;
     };
   }, [me, hashSessao]);
+
+  // UX-FLOW-01B — Retomada SERVER-DRIVEN: a descoberta usa exclusivamente o
+  // operator_id da sessão autenticada (GET /api/campaigns/resumable). Session
+  // Storage vazio ou outro navegador NÃO impede a reconstrução — o débito
+  // CROSS_BROWSER_RESUME_DEPENDS_ON_SESSION_CONTEXT é encerrado. SINGLE é
+  // retomado automaticamente (contrato server-driven); MULTIPLE exige
+  // seleção EXPLÍCITA do operador — nenhuma escolha silenciosa.
+  useEffect(() => {
+    if (!me) {
+      setRetomada({ status: "indefinida" });
+      return;
+    }
+    let ativo = true;
+    void (async () => {
+      try {
+        const resposta = await fetchJson<{ mode: string; campaign?: CampanhaRetomavelResumo; campaigns?: readonly CampanhaRetomavelResumo[] }>(
+          "/api/campaigns/resumable",
+        );
+        if (!ativo) return;
+        if (resposta.mode === "SINGLE" && resposta.campaign) {
+          const detalhe = await obterCampanhaDetalhe(resposta.campaign.campanhaId);
+          if (!ativo) return;
+          setRetomada({ status: "aplicada", campanha: detalhe });
+          return;
+        }
+        if (resposta.mode === "MULTIPLE" && resposta.campaigns) {
+          setRetomada({ status: "multipla", campanhas: resposta.campaigns });
+          return;
+        }
+        setRetomada({ status: "vazio" });
+      } catch {
+        if (ativo) setRetomada({ status: "vazio" });
+      }
+    })();
+    return () => {
+      ativo = false;
+    };
+  }, [me]);
+
+  /** Seleção EXPLÍCITA do operador na retomada MULTIPLE (0 mutações). */
+  async function retomarCampanhaSelecionada(campanhaId: string) {
+    setRetomando(true);
+    setRetomadaErro("");
+    try {
+      const detalhe = await obterCampanhaDetalhe(campanhaId);
+      setCampanha(detalhe);
+      setHashSessao(detalhe.hashAprovacao);
+      sessionStorage.setItem("ic_campanha_hash", detalhe.hashAprovacao);
+      setRetomada({ status: "aplicada", campanha: detalhe });
+    } catch (error) {
+      setRetomadaErro(error instanceof ApiCampanhaError ? error.message : "Retomada indisponível.");
+    } finally {
+      setRetomando(false);
+    }
+  }
 
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -944,6 +1042,39 @@ export function CampaignWorkspace() {
             {feedback ? <span className="campaign-session-error" role="status">{feedback}</span> : null}
           </div>
         </section>
+
+        {retomada.status === "multipla" ? (
+          <section className="campaign-resume-panel" aria-labelledby="retomada-multiple-title">
+            <h2 id="retomada-multiple-title">Campanhas retomáveis deste operador</h2>
+            <p>
+              Existem {retomada.campanhas.length} campanhas persistidas. Escolha explicitamente qual
+              retomar — nada é selecionado automaticamente. As demais continuam listadas aqui.
+            </p>
+            {retomadaErro ? <p role="alert" className="campaign-session-error">{retomadaErro}</p> : null}
+            <ul className="campaign-resume-list">
+              {retomada.campanhas.map((resumo) => (
+                <li key={resumo.campanhaId}>
+                  <div>
+                    <code>{resumo.campanhaId}</code>
+                    <small>
+                      {disposicaoRetomada([resumo]).tipo === "ACOMPANHAMENTO"
+                        ? "Operação e acompanhamento"
+                        : "Campanha pronta para preparar lote"}{" "}
+                      · Estado {resumo.estado} ·{" "}
+                      {resumo.loteId
+                        ? `lote ${resumo.loteCodigo ?? ""} ${resumo.loteEstado ?? ""}`.trim()
+                        : "sem lote"}{" "}
+                      · {resumo.totalAprovados} aprovados · {new Date(resumo.criadaEm).toLocaleString("pt-BR")}
+                    </small>
+                  </div>
+                  <button type="button" onClick={() => { void retomarCampanhaSelecionada(resumo.campanhaId); }} disabled={retomando}>
+                    {retomando ? "Retomando…" : "Retomar esta campanha"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
 
         {painelAdmin && souAdminTecnico ? (
           <section className="campaign-panel admin-panel" aria-labelledby="admin-panel-title">

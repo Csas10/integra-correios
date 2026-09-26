@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  CHAVE_HASH_SESSAO,
   disposicaoRetomada,
+  LIMPEZA_RETOMADA,
+  ordemRetomadaParaRecuperacaoPorHash,
+  recuperacaoPorHashPermitida,
   type CampanhaRetomavelResumo,
+  type EstadoRetomadaLogado,
+  type ModoDescobertaRetomada,
 } from "../src/pages/campaign-resume-state.js";
 import { macroEtapaAtual } from "../src/pages/campaign-macro-stage.js";
 
@@ -142,5 +148,69 @@ describe("retomada cross-browser — destinos derivados (UX-FLOW-01B)", () => {
       campanha: null,
     });
     expect(visao.macro).toBe(2);
+  });
+});
+
+describe("corretivo MULTIPLE/HASH RACE — coordenação descoberta × hash", () => {
+  const estado = (modo: ModoDescobertaRetomada, aplicada = false): EstadoRetomadaLogado => ({
+    modo,
+    campanhaAplicada: aplicada,
+  });
+
+  it("1) MULTIPLE + Session Storage vazio → nenhuma campanha ativa (hash bloqueado)", () => {
+    expect(ordemRetomadaParaRecuperacaoPorHash(2)).toEqual({ ordem: "RESPEITAR_SELECAO" });
+    expect(recuperacaoPorHashPermitida(estado("MULTIPLE"))).toBe(false);
+  });
+
+  it("2) MULTIPLE + hash local da campanha A → hash NÃO seleciona (macroetapa NÃO é 4, CTA de lote ausente)", () => {
+    expect(recuperacaoPorHashPermitida(estado("MULTIPLE"))).toBe(false);
+    const visao = macroEtapaAtual({
+      sessaoAtiva: true,
+      baseAvaliada: false,
+      decisoesPendentes: false,
+      aprovacaoPresente: false,
+      campanha: null,
+    });
+    expect(visao.macro).not.toBe(4);
+  });
+
+  it("3) /persisted atrasado em MULTIPLE → resposta posterior NÃO reativa campanha (cleanup + gate)", () => {
+    // Linha do tempo determinística: t0 descoberta em voo (fetch de hash
+    // permitido, em voo); t1 descoberta determina MULTIPLE → o efeito
+    // re-executa: o cleanup (`ativo`) descarta a resposta atrasada e o gate
+    // passa a bloquear novas recuperações por hash até seleção explícita.
+    expect(recuperacaoPorHashPermitida(estado("INDEFINIDO"))).toBe(true);
+    expect(recuperacaoPorHashPermitida(estado("MULTIPLE"))).toBe(false);
+  });
+
+  it("4) seleção explícita da campanha B → gate reabre (converge à B) e macroetapa 4", () => {
+    expect(recuperacaoPorHashPermitida(estado("MULTIPLE", true))).toBe(true);
+    const visao = macroEtapaAtual({
+      sessaoAtiva: true,
+      baseAvaliada: false,
+      decisoesPendentes: false,
+      aprovacaoPresente: false,
+      campanha: { estado: "APROVADA", loteId: null, loteEstado: null },
+    });
+    expect(visao.macro).toBe(4);
+    expect(visao.foco).toContain("preparar lote");
+  });
+
+  it("5/6) logout → LIMPEZA_RETOMADA zera hash/campanha/retomada/modo (nada do operador A sobrevive)", () => {
+    expect(LIMPEZA_RETOMADA.chaveHashSessao).toBe("ic_campanha_hash");
+    expect(LIMPEZA_RETOMADA.hashSessao).toBe("");
+    expect(LIMPEZA_RETOMADA.campanha).toBeNull();
+    expect(LIMPEZA_RETOMADA.modo).toBe("INDEFINIDO");
+    expect(LIMPEZA_RETOMADA.retomada.status).toBe("indefinida");
+  });
+
+  it("7) SINGLE → recuperação por hash continua permitida (converge à MESMA campanha)", () => {
+    expect(ordemRetomadaParaRecuperacaoPorHash(1)).toEqual({ ordem: "APLICAR_CAMPANHA" });
+    expect(recuperacaoPorHashPermitida(estado("SINGLE"))).toBe(true);
+  });
+
+  it("8) EMPTY → nenhuma campanha ativa (hash não reativa)", () => {
+    expect(ordemRetomadaParaRecuperacaoPorHash(0)).toEqual({ ordem: "LIMPAR_SELECAO" });
+    expect(recuperacaoPorHashPermitida(estado("EMPTY"))).toBe(false);
   });
 });

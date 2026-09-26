@@ -3,7 +3,14 @@ import type { FormEvent } from "react";
 import { AppHeader } from "../components/AppHeader";
 import { campaignLogoutDisposition } from "./campaign-logout-state";
 import { visaoEtapa8 } from "./campaign-step8-presentation";
-import { disposicaoRetomada, type CampanhaRetomavelResumo } from "./campaign-resume-state";
+import {
+  CHAVE_HASH_SESSAO,
+  disposicaoRetomada,
+  LIMPEZA_RETOMADA,
+  recuperacaoPorHashPermitida,
+  type CampanhaRetomavelResumo,
+  type ModoDescobertaRetomada,
+} from "./campaign-resume-state";
 import {
   macroEtapaAtual,
   mapeamentoDeterministico,
@@ -318,7 +325,7 @@ export function CampaignWorkspace() {
   const [persistindo, setPersistindo] = useState(false);
   const [criandoLote, setCriandoLote] = useState(false);
   const [campanha, setCampanha] = useState<CampanhaPersistida | null>(null);
-  const [hashSessao, setHashSessao] = useState(sessionStorage.getItem("ic_campanha_hash") ?? "");
+  const [hashSessao, setHashSessao] = useState(sessionStorage.getItem(CHAVE_HASH_SESSAO) ?? "");
   // UX-FLOW-01A — detalhamento das dez etapas: consulta (painel), não wizard.
   const [painelAtividade, setPainelAtividade] = useState(false);
   const [etapaConsulta, setEtapaConsulta] = useState<Etapa>(1);
@@ -326,6 +333,11 @@ export function CampaignWorkspace() {
   const [retomada, setRetomada] = useState<RetomadaEstado>({ status: "indefinida" });
   const [retomando, setRetomando] = useState(false);
   const [retomadaErro, setRetomadaErro] = useState("");
+  // Corretivo MULTIPLE/HASH RACE — modo definido EXCLUSIVAMENTE pela
+  // descoberta server-driven (resumable): EMPTY/SINGLE/MULTIPLE decide antes
+  // e coordena a recuperação legado por hash (que nunca é mecanismo
+  // paralelo de seleção).
+  const [modoRetomada, setModoRetomada] = useState<ModoDescobertaRetomada>("INDEFINIDO");
 
   async function loadMe(): Promise<boolean> {
     try {
@@ -383,11 +395,28 @@ export function CampaignWorkspace() {
     };
   }, [me]);
 
-  // SLICE-02 — Recuperação por hash CONGELADO da sessão (mantida como
-  // conveniência de precisão; UX-FLOW-01B: nunca é requisito de descoberta).
+  // SLICE-02 / corretivo MULTIPLE-HASH-RACE — Recuperação por hash CONGELADO
+  // é CONVENIÊNCIA de precisão, NUNCA mecanismo paralelo de seleção. A
+  // descoberta server-driven (resumable) é a autoridade e coordena este
+  // efeito de forma determinística (módulo puro `recuperacaoPorHashPermitida`):
+  // · MULTIPLE sem seleção explícita → hash NÃO seleciona (gate bloqueia);
+  // · EMPTY → nenhuma campanha é reativada;
+  // · SINGLE → hash converge para a MESMA campanha autorizada;
+  // · MULTIPLE pós-seleção explícita → converge para a selecionada.
+  // O efeito re-executa quando o modo muda: o cleanup (`ativo`) cancela o
+  // /persisted em voo — uma resposta atrasada NÃO reativa campanha depois de
+  // a descoberta ter determinado o modo.
   useEffect(() => {
     if (!me || !hashSessao) {
       if (!hashSessao) setCampanha(null);
+      return;
+    }
+    if (
+      !recuperacaoPorHashPermitida({
+        modo: modoRetomada,
+        campanhaAplicada: retomada.status === "aplicada",
+      })
+    ) {
       return;
     }
     let ativo = true;
@@ -404,7 +433,7 @@ export function CampaignWorkspace() {
     return () => {
       ativo = false;
     };
-  }, [me, hashSessao]);
+  }, [me, hashSessao, modoRetomada, retomada]);
 
   // UX-FLOW-01B — Retomada SERVER-DRIVEN: a descoberta usa exclusivamente o
   // operator_id da sessão autenticada (GET /api/campaigns/resumable). Session
@@ -416,7 +445,9 @@ export function CampaignWorkspace() {
   // exige seleção EXPLÍCITA do operador — nenhuma escolha silenciosa.
   useEffect(() => {
     if (!me) {
+      setModoRetomada("INDEFINIDO");
       setRetomada({ status: "indefinida" });
+      setCampanha(null);
       return;
     }
     let ativo = true;
@@ -434,16 +465,28 @@ export function CampaignWorkspace() {
           // operação. Mesmo padrão da seleção explícita MULTIPLE.
           const detalhe = await obterCampanhaDetalhe(resposta.campaign.campanhaId);
           if (!ativo) return;
+          setModoRetomada("SINGLE");
           setCampanha(detalhe);
           setHashSessao(detalhe.hashAprovacao);
-          sessionStorage.setItem("ic_campanha_hash", detalhe.hashAprovacao);
+          sessionStorage.setItem(CHAVE_HASH_SESSAO, detalhe.hashAprovacao);
           setRetomada({ status: "aplicada", campanha: detalhe });
           return;
         }
         if (resposta.mode === "MULTIPLE" && resposta.campaigns) {
+          // Corretivo MULTIPLE/HASH RACE: a descoberta é a AUTORIDADE —
+          // nenhuma campanha permanece ativa; a recuperação por hash passa a
+          // ser BLOQUEADA (recuperacaoPorHashPermitida) e um /persisted já
+          // em voo é cancelado pela re-execução do efeito (cleanup `ativo`):
+          // uma resposta atrasada NÃO pode reativar campanha. Só o clique em
+          // "Retomar esta campanha" chama detail e aplica setCampanha.
+          setModoRetomada("MULTIPLE");
+          setCampanha(null);
           setRetomada({ status: "multipla", campanhas: resposta.campaigns });
           return;
         }
+        // EMPTY: nenhuma campanha ativa (gate EMPTY impede reativação por hash).
+        setModoRetomada("EMPTY");
+        setCampanha(null);
         setRetomada({ status: "vazio" });
       } catch {
         if (ativo) setRetomada({ status: "vazio" });
@@ -462,7 +505,7 @@ export function CampaignWorkspace() {
       const detalhe = await obterCampanhaDetalhe(campanhaId);
       setCampanha(detalhe);
       setHashSessao(detalhe.hashAprovacao);
-      sessionStorage.setItem("ic_campanha_hash", detalhe.hashAprovacao);
+      sessionStorage.setItem(CHAVE_HASH_SESSAO, detalhe.hashAprovacao);
       setRetomada({ status: "aplicada", campanha: detalhe });
     } catch (error) {
       setRetomadaErro(error instanceof ApiCampanhaError ? error.message : "Retomada indisponível.");
@@ -633,6 +676,14 @@ export function CampaignWorkspace() {
         cache: "no-store",
       });
       if (campaignLogoutDisposition(response.status) === "SIGNED_OUT") {
+        // Corretivo R1: NENHUM estado operacional do operador anterior
+        // sobrevive localmente (hash em memória/Session Storage, campanha,
+        // retomada e modo de descoberta).
+        setHashSessao(LIMPEZA_RETOMADA.hashSessao);
+        sessionStorage.removeItem(LIMPEZA_RETOMADA.chaveHashSessao);
+        setCampanha(null);
+        setRetomada(LIMPEZA_RETOMADA.retomada);
+        setModoRetomada(LIMPEZA_RETOMADA.modo);
         setMe(null);
         setToken("");
         return;
@@ -712,7 +763,7 @@ export function CampaignWorkspace() {
       setAprovacao(null);
       setCampanha(null);
       setHashSessao("");
-      sessionStorage.removeItem("ic_campanha_hash");
+      sessionStorage.removeItem(CHAVE_HASH_SESSAO);
       // UX-FLOW-01A: a revisão unificada (com o bloco de exceções, quando
       // houver) abre automaticamente após a avaliação.
       setEtapa(6);
@@ -755,7 +806,7 @@ export function CampaignWorkspace() {
       });
       setAprovacao(resultado);
       setHashSessao(resultado.conteudoHash);
-      sessionStorage.setItem("ic_campanha_hash", resultado.conteudoHash);
+      sessionStorage.setItem(CHAVE_HASH_SESSAO, resultado.conteudoHash);
       // UX-FLOW-01A: pós-aprovação o destino segue derivado — a revisão
       // unificada apresenta persistência e lote como ações humanas explícitas.
       setEtapa(6);
@@ -809,7 +860,7 @@ export function CampaignWorkspace() {
       );
       setCampanha(detalhe.campanha);
       setHashSessao(resposta.conteudoHash);
-      sessionStorage.setItem("ic_campanha_hash", resposta.conteudoHash);
+      sessionStorage.setItem(CHAVE_HASH_SESSAO, resposta.conteudoHash);
       setEtapa(10);
     } catch (error) {
       setErroEtapa(

@@ -68,3 +68,70 @@ export function disposicaoRetomada(
   }
   return { tipo: "SEM_RETOMADA", ignoradas: total };
 }
+
+// ---------------------------------------------------------------------------
+// CORRETIVO MULTIPLE / HASH RACE — coordenação determinística entre a
+// descoberta server-driven (AUTORIDADE da retomada) e a recuperação legado
+// por hash (conveniência de precisão). A recuperação por hash NUNCA é
+// mecanismo paralelo de seleção:
+//   · MULTIPLE sem seleção explícita → hash NÃO seleciona campanha;
+//   · EMPTY → nenhuma campanha é reativada;
+//   · SINGLE → hash converge para a MESMA campanha autorizada;
+//   · MULTIPLE pós-seleção explícita → converge para a selecionada.
+// Quando o modo muda, o efeito de hash re-executa e o cleanup cancela o
+// /persisted em voo — uma resposta atrasada NÃO reativa campanha depois de
+// a descoberta ter determinado o modo. Session Storage segue conveniência,
+// nunca autoridade.
+// ---------------------------------------------------------------------------
+
+/** Modo determinado EXCLUSIVAMENTE pela descoberta (GET /api/campaigns/resumable). */
+export type ModoDescobertaRetomada = "INDEFINIDO" | "EMPTY" | "SINGLE" | "MULTIPLE";
+
+/** Ordem da autoridade (descoberta) para o mecanismo legado de hash. */
+export type OrdemRetomada =
+  /** 2+ retomáveis: hash NÃO seleciona — só clique humano (detail). */
+  | { readonly ordem: "RESPEITAR_SELECAO" }
+  /** 1 retomável: hash pode atuar — converge à MESMA campanha autorizada. */
+  | { readonly ordem: "APLICAR_CAMPANHA" }
+  /** 0 retomáveis: nenhuma campanha ativa — hash não reativa nada. */
+  | { readonly ordem: "LIMPAR_SELECAO" };
+
+/** Ordem derivada da cardinalidade total determinada pela descoberta. */
+export function ordemRetomadaParaRecuperacaoPorHash(
+  totalRetomaveis: number,
+): OrdemRetomada {
+  if (totalRetomaveis >= 2) return { ordem: "RESPEITAR_SELECAO" };
+  if (totalRetomaveis === 1) return { ordem: "APLICAR_CAMPANHA" };
+  return { ordem: "LIMPAR_SELECAO" };
+}
+
+export interface EstadoRetomadaLogado {
+  /** Modo determinado pela descoberta (resumable) — a autoridade. */
+  readonly modo: ModoDescobertaRetomada;
+  /** true somente após detail aplicado (SINGLE automático OU clique humano). */
+  readonly campanhaAplicada: boolean;
+}
+
+/**
+ * Gate determinístico da recuperação por hash: a UI só executa
+ * GET /api/campaigns/persisted?hash=... quando este gate permite.
+ */
+export function recuperacaoPorHashPermitida(estado: EstadoRetomadaLogado): boolean {
+  if (estado.modo === "MULTIPLE") return estado.campanhaAplicada;
+  if (estado.modo === "EMPTY") return false;
+  // SINGLE: conveniência de precisão da MESMA campanha (converge, nunca
+  // escolhe outra). INDEFINIDO: descoberta ainda em voo — quando o modo for
+  // decidido, o efeito re-executa (cleanup cancela o fetch anterior) e o
+  // hash é re-ancorado na decisão da autoridade.
+  return true;
+}
+
+/** Reset local completo (logout): nenhum estado operacional sobrevive. */
+export const CHAVE_HASH_SESSAO = "ic_campanha_hash";
+export const LIMPEZA_RETOMADA = {
+  chaveHashSessao: CHAVE_HASH_SESSAO,
+  hashSessao: "",
+  campanha: null,
+  modo: "INDEFINIDO",
+  retomada: { status: "indefinida" },
+} as const;

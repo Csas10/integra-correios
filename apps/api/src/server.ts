@@ -80,6 +80,7 @@ import {
 } from "./campaign-import.js";
 import {
   CampaignPersistenceError,
+  listarCampanhasRetomaveis,
   recuperarEstadoCampanha,
   persistirCampanhaAprovada,
   persistirLoteCampanha,
@@ -182,6 +183,8 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "GET /api/operator/admin/operators",
   "GET /api/campaigns/persisted",
   "GET /api/campaigns/batch",
+  "GET /api/campaigns/resumable",
+  "GET /api/campaigns/detail",
   "POST /api/campaigns/persist",
   "POST /api/campaigns/batch",
 ]);
@@ -1197,6 +1200,53 @@ const ROTAS: readonly Rota[] = [
           return;
         }
         json(res, 200, { campanha: estado });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    // ------------------------------------------------------------------
+    // UX-FLOW-01B — Retomada server-driven: lista READ-ONLY das campanhas
+    // persistidas do operador da sessão. Escopo exclusivo = operator_id
+    // validado no servidor (nenhum parâmetro do cliente seleciona dados;
+    // sem hash e sem fingerprint prévios). Zero mutação: nenhuma escrita,
+    // nenhum evento de auditoria. Operador suspenso/revogado não passa do
+    // exigirOperadorCampanha (sessão resolvida = ATIVO; 401 sanitizado).
+    // Campanha alheia nunca aparece: invisível e indistinguível de ausência
+    // (lista vazia ≠ informação sobre terceiros). Política multi-campanha:
+    // criada_em DESC, limite server-side (o cliente nunca escolhe o alvo).
+    // ------------------------------------------------------------------
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/resumable",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const limiteParam = url.searchParams.get("limite") ?? "";
+      let limite = 20;
+      if (limiteParam !== "") {
+        if (!/^\d{1,3}$/.test(limiteParam)) {
+          json(res, 422, {
+            erro: "Parâmetro limite inválido (1–100).",
+            codigo: "CAMPAIGN_RESUMABLE_INVALID",
+          });
+          return;
+        }
+        limite = Number(limiteParam);
+        if (limite < 1 || limite > 100) {
+          json(res, 422, {
+            erro: "Parâmetro limite fora da faixa (1–100).",
+            codigo: "CAMPAIGN_RESUMABLE_INVALID",
+          });
+          return;
+        }
+      }
+      try {
+        const campanhas = await listarCampanhasRetomaveis(requireDbPool(), {
+          operatorId: identity.operatorId,
+          limite,
+        });
+        json(res, 200, { campanhas });
       } catch (error) {
         erroPersistenciaCampanha(res, error);
       }

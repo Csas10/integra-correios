@@ -90,6 +90,29 @@ export interface EstadoCampanhaPersistida {
   readonly criadaEm: string;
 }
 
+/**
+ * UX-FLOW-01B — Resumo read-only de uma campanha retomável do operador.
+ * Sem PII além dos contadores já homologados; mesma família de campos de
+ * EstadoCampanhaPersistida (reuso do contrato, zero migration).
+ */
+export interface ResumoCampanhaRetomavel {
+  readonly campanhaId: string;
+  readonly estado: string;
+  readonly hashAprovacao: string;
+  readonly totalAprovados: number;
+  readonly loteId: string | null;
+  readonly loteCodigo: string | null;
+  readonly loteEstado: string | null;
+  readonly outboxTotal: number;
+  readonly outboxNaoExecutavel: number;
+  readonly criadaEm: string;
+}
+
+export interface ConsultaRetomaveis {
+  readonly operatorId: string;
+  readonly limite?: number;
+}
+
 function assertFingerprint(value: string): void {
   if (!/^[0-9a-f]{64}$/.test(value)) {
     throw new CampaignPersistenceError(
@@ -287,6 +310,152 @@ export async function persistirCampanhaAprovada(
   } finally {
     transaction.release();
   }
+}
+
+/**
+ * UX-FLOW-01B — Detalhe READ-ONLY de UMA campanha do operador autenticado
+ * (seleção explícita da retomada MULTIPLE). Escopo server-side: operator_id
+ * da sessão + campanhaId. Campanha inexistente ou alheia → undefined (a rota
+ * devolve 404 sanitizado — inexistência e alheio indistinguíveis). Sem
+ * mutação, sem evento de auditoria.
+ */
+export async function recuperarCampanhaPorId(
+  pool: CampanhaPool,
+  consulta: {
+    readonly campanhaId: string;
+    readonly operatorId: string;
+  },
+): Promise<EstadoCampanhaPersistida | undefined> {
+  if (!consulta.campanhaId || !operatorUuidValido(consulta.campanhaId)) {
+    throw new CampaignPersistenceError(
+      "CAMPAIGN_INPUT_INVALID",
+      "campanhaId (UUID) é obrigatório para o detalhe.",
+    );
+  }
+  if (!consulta.operatorId || !operatorUuidValido(consulta.operatorId)) {
+    throw new CampaignPersistenceError(
+      "CAMPAIGN_INPUT_INVALID",
+      "operatorId autenticado é obrigatório para o detalhe.",
+    );
+  }
+  const resultado = await pool.query(
+    `SELECT c.id AS campanha_id, c.operator_id, c.fingerprint_arquivo,
+            c.template_versao, c.hash_aprovacao, c.estado,
+            c.total_registros, c.total_aptos, c.total_bloqueados, c.total_aprovados,
+            c.criada_em,
+            lc.id AS lote_id, lc.codigo AS lote_codigo, lc.estado AS lote_estado,
+            (SELECT count(*)::text FROM outbox_campanha o WHERE o.lote_campanha_id = lc.id) AS outbox_total,
+            (SELECT count(*)::text FROM outbox_campanha o
+              WHERE o.lote_campanha_id = lc.id AND o.estado IN ('HOLD','PREPARADO')) AS outbox_nao_executavel
+       FROM campanha_persistida c
+       LEFT JOIN lote_campanha lc ON lc.campanha_id = c.id
+      WHERE c.id = $1
+        AND c.operator_id = $2
+      LIMIT 1`,
+    [consulta.campanhaId, consulta.operatorId],
+  );
+  const linhas = resultado.rows as {
+    campanha_id: string;
+    operator_id: string;
+    fingerprint_arquivo: string;
+    template_versao: string;
+    hash_aprovacao: string;
+    estado: string;
+    total_registros: number;
+    total_aptos: number;
+    total_bloqueados: number;
+    total_aprovados: number;
+    lote_id: string | null;
+    lote_codigo: string | null;
+    lote_estado: string | null;
+    outbox_total: string;
+    outbox_nao_executavel: string;
+    criada_em: string;
+  }[];
+  const linha = linhas[0];
+  if (!linha) return undefined;
+  return {
+    campanhaId: linha.campanha_id,
+    operatorId: linha.operator_id,
+    fingerprintArquivo: linha.fingerprint_arquivo,
+    templateVersao: linha.template_versao,
+    hashAprovacao: linha.hash_aprovacao,
+    estado: linha.estado,
+    totalRegistros: linha.total_registros,
+    totalAptos: linha.total_aptos,
+    totalBloqueados: linha.total_bloqueados,
+    totalAprovados: linha.total_aprovados,
+    loteId: linha.lote_id,
+    loteCodigo: linha.lote_codigo,
+    loteEstado: linha.lote_estado,
+    outboxTotal: Number(linha.outbox_total ?? 0),
+    outboxNaoExecutavel: Number(linha.outbox_nao_executavel ?? 0),
+    criadaEm: linha.criada_em,
+  };
+}
+
+function operatorUuidValido(value: string): boolean {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+/**
+ * UX-FLOW-01B — Lista READ-ONLY das campanhas persistidas do operador
+ * autenticado (operator_id validado no servidor pela rota). Sem hash, sem
+ * fingerprint, sem parâmetro do cliente que selecione dados: o escopo é
+ * exclusivamente o operator_id da sessão. Sem mutação e sem evento de
+ * auditoria — a leitura não altera nenhum agregado. Campanha alheia nunca
+ * entra no resultado (isolamento: invisível e indistinguível de ausência).
+ * Política multi-campanha: ordenação criada_em DESC, limite server-side.
+ */
+export async function listarCampanhasRetomaveis(
+  pool: CampanhaPool,
+  consulta: ConsultaRetomaveis,
+): Promise<ResumoCampanhaRetomavel[]> {
+  if (!consulta.operatorId || !/^[0-9a-f-]{36}$/i.test(consulta.operatorId)) {
+    throw new CampaignPersistenceError(
+      "CAMPAIGN_INPUT_INVALID",
+      "operatorId autenticado é obrigatório para a retomada.",
+    );
+  }
+  const limite = Math.max(1, Math.min(Math.floor(consulta.limite ?? 20), 100));
+  const resultado = await pool.query(
+    `SELECT c.id AS campanha_id, c.estado, c.hash_aprovacao, c.total_aprovados,
+            lc.id AS lote_id, lc.codigo AS lote_codigo, lc.estado AS lote_estado,
+            (SELECT count(*)::text FROM outbox_campanha o WHERE o.lote_campanha_id = lc.id) AS outbox_total,
+            (SELECT count(*)::text FROM outbox_campanha o
+              WHERE o.lote_campanha_id = lc.id AND o.estado IN ('HOLD','PREPARADO')) AS outbox_nao_executavel,
+            c.criada_em
+       FROM campanha_persistida c
+       LEFT JOIN lote_campanha lc ON lc.campanha_id = c.id
+      WHERE c.operator_id = $1
+      ORDER BY c.criada_em DESC
+      LIMIT $2`,
+    [consulta.operatorId, limite],
+  );
+  return (resultado.rows as {
+    campanha_id: string;
+    estado: string;
+    hash_aprovacao: string;
+    total_aprovados: number;
+    lote_id: string | null;
+    lote_codigo: string | null;
+    lote_estado: string | null;
+    outbox_total: string;
+    outbox_nao_executavel: string;
+    criada_em: string;
+  }[]).map((linha) => ({
+    campanhaId: linha.campanha_id,
+    estado: linha.estado,
+    hashAprovacao: linha.hash_aprovacao,
+    totalAprovados: linha.total_aprovados,
+    loteId: linha.lote_id,
+    loteCodigo: linha.lote_codigo,
+    loteEstado: linha.lote_estado,
+    outboxTotal: Number(linha.outbox_total ?? 0),
+    outboxNaoExecutavel: Number(linha.outbox_nao_executavel ?? 0),
+    criadaEm: linha.criada_em,
+  }));
 }
 
 /**

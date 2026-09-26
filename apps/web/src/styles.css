@@ -2305,3 +2305,123 @@ button:focus-visible {
   flex-wrap: wrap;
   gap: 0.5rem;
 }
+
+/* ==========================================================================
+   UX-FLOW-01A — Macroetapas e painel de atividade das dez etapas
+   ========================================================================== */
+
+
+.campaign-journey .campaign-activity-toggle {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-700);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.campaign-journey .campaign-activity-toggle:hover {
+  border-color: var(--accent, #14532d);
+  color: var(--ink-900);
+}
+
+.campaign-activity {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  background: var(--surface-muted);
+}
+
+.campaign-activity ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.campaign-activity li button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-500);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+.campaign-activity li button[aria-current="true"] {
+  border-color: var(--accent, #14532d);
+  color: var(--ink-900);
+}
+
+.campaign-macro-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--ink-500);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.campaign-macro-pill strong {
+  color: var(--ink-700);
+}
+
+.campaign-journey li.is-active .campaign-macro-pill {
+  background: var(--accent, #14532d);
+  border-color: var(--accent, #14532d);
+}
+
+.campaign-journey li.is-active .campaign-macro-pill strong,
+.campaign-journey li.is-active .campaign-macro-pill span {
+  color: #fff;
+}
+
+.campaign-anchor-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-900);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.campaign-anchor-link:hover {
+  border-color: var(--accent, #14532d);
+}
+
+.campaign-exceptions {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent, #14532d);
+  border-radius: 10px;
+  background: var(--surface-muted);
+}
+
+.campaign-exceptions h3 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}

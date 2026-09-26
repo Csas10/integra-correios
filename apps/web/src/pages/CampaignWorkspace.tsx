@@ -3,6 +3,11 @@ import type { FormEvent } from "react";
 import { AppHeader } from "../components/AppHeader";
 import { campaignLogoutDisposition } from "./campaign-logout-state";
 import { visaoEtapa8 } from "./campaign-step8-presentation";
+import {
+  macroEtapaAtual,
+  mapeamentoDeterministico,
+  pendenciasMapeamento,
+} from "./campaign-macro-stage";
 
 type OperatorMe = {
   operatorId: string;
@@ -156,6 +161,22 @@ const ROTULOS_ETAPA: Readonly<Record<Etapa, string>> = {
   10: "Acompanhamento",
 };
 
+/**
+ * UX-FLOW-01A — Quatro MACROETAPAS derivadas do estado operacional. Os dez
+ * destinos antigos permanecem apenas como PAINEL DE ATIVIDADE (histórico e
+ * auditoria); nenhum clique exclusivamente navegacional é exigido.
+ */
+const MACROETAPAS_UI = [
+  { numero: 1, titulo: "Identificação e contexto", descricao: "Credencial individual validada no servidor; sessão curta e auditada." },
+  { numero: 2, titulo: "Preparação", descricao: "Importação, mapeamento e classificação da base — nada persistido ainda." },
+  { numero: 3, titulo: "Revisão e aprovação", descricao: "Revisão dos destinatários, prévia da comunicação e congelamento por hash." },
+  { numero: 4, titulo: "Operação e acompanhamento", descricao: "Campanha persistida: preparo do lote HOLD e acompanhamento auditável." },
+] as const;
+
+const ROTULO_MACROETAPA: Readonly<Record<number, string>> = Object.fromEntries(
+  MACROETAPAS_UI.map((macro) => [macro.numero, macro.titulo]),
+);
+
 /** Rótulos dos campos do contrato mínimo (etapa 4). */
 const CAMPOS_MAPEAMENTO = [
   "profissional_id",
@@ -281,7 +302,9 @@ export function CampaignWorkspace() {
   const [criandoLote, setCriandoLote] = useState(false);
   const [campanha, setCampanha] = useState<CampanhaPersistida | null>(null);
   const [hashSessao, setHashSessao] = useState(sessionStorage.getItem("ic_campanha_hash") ?? "");
-
+  // UX-FLOW-01A — detalhamento das dez etapas: consulta (painel), não wizard.
+  const [painelAtividade, setPainelAtividade] = useState(false);
+  const [etapaConsulta, setEtapaConsulta] = useState<Etapa>(1);
   async function loadMe(): Promise<boolean> {
     try {
       const response = await fetch("/api/operator/me", {
@@ -556,7 +579,16 @@ export function CampaignWorkspace() {
       setBase(null);
       setAprovacao(null);
       setExcluidos([]);
-      setEtapa(4);
+      // UX-FLOW-01A (regras 3/5): mapeamento DETERMINÍSTICO pelas regras
+      // homologadas é aplicado e a avaliação segue automaticamente — sem
+      // clique exclusivamente navegacional. Ambíguo: a preparação apresenta
+      // SOMENTE os campos pendentes de decisão humana.
+      if (mapeamentoDeterministico(sugerido, resultado.campos_obrigatorios)) {
+        void avaliarArquivoSubmetido(arquivo, sugerido);
+      } else {
+        // Ambíguo: apresentar SOMENTE os campos que exigem decisão humana.
+        setEtapa(4);
+      }
     } catch (error) {
       setErroEtapa(
         error instanceof ApiCampanhaError
@@ -569,11 +601,11 @@ export function CampaignWorkspace() {
   }
 
   // ------- Etapas 4→5: mapeamento confirmado e recálculo server-side ------
-  async function avaliarBase() {
-    if (!arquivo || !avaliacaoArquivo) return;
-    const ausentes = CAMPOS_OBRIGATORIOS.filter(
-      (campo) => !(typeof mapeamento[campo] === "number" && mapeamento[campo] >= 0),
-    );
+  async function avaliarArquivoSubmetido(
+    arquivoSubmetido: File,
+    mapeamentoSubmetido: Record<string, number>,
+  ) {
+    const ausentes = pendenciasMapeamento(mapeamentoSubmetido, CAMPOS_OBRIGATORIOS);
     if (ausentes.length > 0) {
       setErroEtapa(`Mapeamento incompleto: ${ausentes.join(", ")}.`);
       return;
@@ -584,10 +616,10 @@ export function CampaignWorkspace() {
       const resultado = await fetchJson<AvaliacaoBase>("/api/campaigns/evaluate", {
         method: "POST",
         headers: {
-          "x-file-name": arquivo.name,
-          "x-mapping": JSON.stringify(mapeamento),
+          "x-file-name": arquivoSubmetido.name,
+          "x-mapping": JSON.stringify(mapeamentoSubmetido),
         },
-        body: arquivo,
+        body: arquivoSubmetido,
       });
       setBase(resultado);
       setExcluidos([]);
@@ -595,7 +627,9 @@ export function CampaignWorkspace() {
       setCampanha(null);
       setHashSessao("");
       sessionStorage.removeItem("ic_campanha_hash");
-      setEtapa(5);
+      // UX-FLOW-01A: a revisão unificada (com o bloco de exceções, quando
+      // houver) abre automaticamente após a avaliação.
+      setEtapa(6);
     } catch (error) {
       setErroEtapa(
         error instanceof ApiCampanhaError
@@ -636,7 +670,9 @@ export function CampaignWorkspace() {
       setAprovacao(resultado);
       setHashSessao(resultado.conteudoHash);
       sessionStorage.setItem("ic_campanha_hash", resultado.conteudoHash);
-      setEtapa(8);
+      // UX-FLOW-01A: pós-aprovação o destino segue derivado — a revisão
+      // unificada apresenta persistência e lote como ações humanas explícitas.
+      setEtapa(6);
     } catch (error) {
       setErroEtapa(
         error instanceof ApiCampanhaError ? error.message : "Aprovação recusada pelo servidor.",
@@ -720,6 +756,8 @@ export function CampaignWorkspace() {
         `/api/campaigns/persisted?hash=${encodeURIComponent(campanha.hashAprovacao)}`,
       );
       setCampanha(detalhe.campanha);
+      // UX-FLOW-01A (regra 10): lote criado → abrir o acompanhamento.
+      setEtapa(10);
       void resposta;
     } catch (error) {
       setErroEtapa(
@@ -756,7 +794,8 @@ export function CampaignWorkspace() {
         setExcluidos([]);
         setAprovacao(null);
         setCampanha(null);
-        setEtapa(5);
+        // UX-FLOW-01A: base sintética nasce avaliada → revisão unificada.
+        setEtapa(6);
       })
       .catch(() => setErroEtapa("Base sintética indisponível."))
       .finally(() => setAvaliando(false));
@@ -801,6 +840,29 @@ export function CampaignWorkspace() {
       }),
     [base, aprovacao, status, campanha],
   );
+
+  // UX-FLOW-01A — a macroetapa visível é DERIVADA do estado operacional
+  // (sessão, base, aprovação, campanha/lote). A navegação representa o
+  // estado existente; nunca produz mutação apenas para avançar.
+  const visaoMacro = useMemo(
+    () =>
+      macroEtapaAtual({
+        sessaoAtiva: me !== null,
+        baseAvaliada: base !== null,
+        decisoesPendentes: pendenciasMapeamento(mapeamento, CAMPOS_OBRIGATORIOS).length > 0,
+        aprovacaoPresente: aprovacao !== null,
+        campanha: campanha
+          ? { estado: campanha.estado, loteId: campanha.loteId, loteEstado: campanha.loteEstado }
+          : null,
+      }),
+    [me, base, mapeamento, aprovacao, campanha],
+  );
+  const macroAtiva = visaoMacro.macro;
+  const mostrarImportacao = macroAtiva === 2 && !base && !avaliacaoArquivo;
+  const mostrarMapeamento = macroAtiva === 2 && !base && avaliacaoArquivo !== null;
+  const mostrarRevisao = macroAtiva === 3 && base !== null;
+  const mostrarOperacao = macroAtiva === 4;
+  const mostrarPendenciasRevisao = mostrarRevisao && (base?.inconsistencias_pendentes ?? 0) > 0;
 
   function alternarExclusao(linha: number) {
     setExcluidos((atual) =>
@@ -1059,21 +1121,47 @@ export function CampaignWorkspace() {
           </section>
         ) : null}
 
-        <nav className="campaign-journey" aria-label="Etapas da jornada operacional">
+        <nav className="campaign-journey" aria-label="Macroetapas da jornada operacional">
           <ol>
-            {ETAPAS.map((item) => (
-              <li key={item.numero} className={etapa === item.numero ? "is-active" : undefined}>
-                <button
-                  type="button"
-                  onClick={() => setEtapa(item.numero)}
-                  aria-current={etapa === item.numero ? "step" : undefined}
-                >
-                  <span>{String(item.numero).padStart(2, "0")}</span>
-                  <strong>{ROTULOS_ETAPA[item.numero]}</strong>
-                </button>
+            {MACROETAPAS_UI.map((macro) => (
+              <li key={macro.numero} className={macroAtiva === macro.numero ? "is-active" : undefined}>
+                <span className="campaign-macro-pill" title={macro.descricao}>
+                  <span>{String(macro.numero).padStart(2, "0")}</span>
+                  <strong>{ROTULO_MACROETAPA[macro.numero]}</strong>
+                </span>
               </li>
             ))}
           </ol>
+          <button
+            type="button"
+            className="campaign-activity-toggle"
+            onClick={() => setPainelAtividade((atual) => !atual)}
+            aria-expanded={painelAtividade}
+          >
+            {painelAtividade ? "Ocultar histórico de etapas" : "Consultar histórico das 10 etapas"}
+          </button>
+          {painelAtividade ? (
+            <div className="campaign-activity" aria-label="Histórico das etapas da jornada">
+              <ol>
+                {ETAPAS.map((item) => (
+                  <li key={item.numero}>
+                    <button
+                      type="button"
+                      onClick={() => setEtapaConsulta(item.numero)}
+                      aria-current={etapaConsulta === item.numero ? "true" : undefined}
+                    >
+                      <span>{String(item.numero).padStart(2, "0")}</span>
+                      <strong>{ROTULOS_ETAPA[item.numero]}</strong>
+                    </button>
+                  </li>
+                ))}
+              </ol>
+              <p className="campaign-actions-note">
+                {String(etapaConsulta).padStart(2, "0")} · {ROTULOS_ETAPA[etapaConsulta]} —{" "}
+                {ETAPAS.find((item) => item.numero === etapaConsulta)?.descricao ?? ""}
+              </p>
+            </div>
+          ) : null}
         </nav>
 
         <section className="campaign-counters" aria-label="Contadores da campanha">
@@ -1090,8 +1178,8 @@ export function CampaignWorkspace() {
         </section>
 
         <p className="campaign-actions-note">
-          Etapa atual: {String(etapa).padStart(2, "0")} · {ROTULOS_ETAPA[etapa]} · Ações disponíveis:{" "}
-          {status?.availableActions.join(", ") || "—"}
+          Macroetapa: {macroAtiva} · {ROTULO_MACROETAPA[macroAtiva]} · Foco: {visaoMacro.foco} ·
+          Ações disponíveis: {status?.availableActions.join(", ") || "—"}
         </p>
         <p className="campaign-actions-note">
           Bloqueadas: EXECUTAR_LOTE (canExecute=false nesta fase) · ACOMPANHAR_PAUSAR_CANCELAR
@@ -1103,8 +1191,8 @@ export function CampaignWorkspace() {
           <p className="campaign-feedback campaign-feedback-error" role="alert">{erroEtapa}</p>
         ) : null}
 
-        {/* Etapa 3 — Importação */}
-        {etapa === 3 && (
+        {/* Macroetapa 2 — Importação */}
+        {mostrarImportacao && (
           <section className="campaign-panel" aria-labelledby="etapa-importacao">
             <h2 id="etapa-importacao">3 · Importação da base</h2>
             <p>
@@ -1136,21 +1224,27 @@ export function CampaignWorkspace() {
                 <small key={motivo} role="status">Bloqueado: {motivo}</small>
               ))}
             </div>
-            {avaliacaoArquivo ? (
-              <div className="campaign-flow-stats">
-                <p>SHA-256: <code>{avaliacaoArquivo.sha256}</code></p>
-                <p>Folhas: {avaliacaoArquivo.folhas_disponiveis.join(", ")} · Linhas: {avaliacaoArquivo.total_linhas}</p>
-                <p>Cabeçalhos: {avaliacaoArquivo.cabecalhos.join(" · ") || "—"}</p>
-                <button type="button" onClick={() => setEtapa(4)}>Confirmar e ir para o mapeamento</button>
-              </div>
-            ) : null}
           </section>
         )}
 
-        {/* Etapa 4 — Mapeamento */}
-        {etapa === 4 && avaliacaoArquivo && (
+        {/* Macroetapa 2 — Mapeamento (somente campos pendentes de decisão) */}
+        {mostrarMapeamento && avaliacaoArquivo && (
           <section className="campaign-panel" aria-labelledby="etapa-mapeamento">
             <h2 id="etapa-mapeamento">4 · Mapeamento de colunas</h2>
+            {avaliacaoArquivo ? (
+              <p className="campaign-flow-stats">
+                SHA-256: <code>{avaliacaoArquivo.sha256}</code> · Folhas:{" "}
+                {avaliacaoArquivo.folhas_disponiveis.join(", ")} · Linhas:{" "}
+                {avaliacaoArquivo.total_linhas} · Cabeçalhos:{" "}
+                {avaliacaoArquivo.cabecalhos.join(" · ") || "—"}
+              </p>
+            ) : null}
+            {avaliacaoArquivo && pendenciasMapeamento(mapeamento, CAMPOS_OBRIGATORIOS).length > 0 ? (
+              <p className="campaign-actions-note" role="status">
+                Mapeamento ambíguo: apenas os campos obrigatórios pendentes exigem decisão humana —
+                o restante já foi sugerido pelas regras homologadas.
+              </p>
+            ) : null}
             <p>
               Confirme campo a campo a coluna de origem. Campos obrigatórios precisam estar
               mapeados; cada coluna origina no máximo um campo. Campos derivados permanecem sem
@@ -1211,8 +1305,34 @@ export function CampaignWorkspace() {
               </tbody>
             </table>
             <div className="campaign-panel-actions">
-              <button type="button" onClick={avaliarBase} disabled={avaliando || !podeImportar}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!arquivo || !avaliacaoArquivo) return;
+                  const pendentes = pendenciasMapeamento(mapeamento, CAMPOS_OBRIGATORIOS);
+                  if (pendentes.length > 0) {
+                    setErroEtapa(`Mapeamento incompleto: ${pendentes.join(", ")}.`);
+                    return;
+                  }
+                  setErroEtapa("");
+                  void avaliarArquivoSubmetido(arquivo, mapeamento);
+                }}
+                disabled={avaliando || !podeImportar}
+              >
                 {avaliando ? "Avaliando…" : "Confirmar mapeamento e classificar"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAvaliacaoArquivo(null);
+                  setMapeamento({});
+                  setArquivo(null);
+                  setErroEtapa("");
+                  setEtapa(3);
+                }}
+                disabled={avaliando}
+              >
+                Trocar arquivo
               </button>
               {motivosBloqueioImportacao.map((motivo) => (
                 <small key={motivo} role="status">Bloqueado: {motivo}</small>
@@ -1220,7 +1340,7 @@ export function CampaignWorkspace() {
             </div>
           </section>
         )}
-        {etapa === 4 && !avaliacaoArquivo ? (
+        {mostrarMapeamento && !avaliacaoArquivo ? (
           <section className="campaign-panel">
             <h2>4 · Mapeamento de colunas</h2>
             <p>Nenhum arquivo analisado nesta sessão. Volte à etapa 3 para importar.</p>
@@ -1228,81 +1348,66 @@ export function CampaignWorkspace() {
           </section>
         ) : null}
 
-        {/* Etapa 5 — Inconsistências */}
-        {etapa === 5 && base?.sha256 === "sintetico-dev" ? (
-          <p className="campaign-actions-note" role="status">
-            Base sintética: o mapeamento é automático por construção (cabeçalhos canônicos) — não
-            há etapa manual de mapeamento para esta base.
-          </p>
-        ) : null}
-        {etapa === 5 && base && (
-          <section className="campaign-panel" aria-labelledby="etapa-inconsistencias">
-            <h2 id="etapa-inconsistencias">5 · Inconsistências aguardando decisão humana</h2>
-            <p>
-              Duplicidades e divergências de normalização exigem decisão do papel REVISOR. Nada é
-              corrigido automaticamente; o arquivo original nunca é alterado.
-            </p>
-            {base.inconsistencias_pendentes === 0 ? (
-              <p className="campaign-flow-stats">Nenhuma inconsistência pendente nesta base.</p>
-            ) : (
-              <table className="campaign-table">
-                <thead>
-                  <tr>
-                    <th>Linha</th>
-                    <th>Identificador</th>
-                    <th>E-mail normalizado</th>
-                    <th>Inconsistências</th>
-                    <th>Motivos de bloqueio</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {base.registros
-                    .filter((registro) => registro.inconsistencias.length > 0)
-                    .map((registro) => (
-                      <tr key={registro.linha}>
-                        <td>{registro.linha}</td>
-                        <td><code>{registro.profissional_id || "—"}</code></td>
-                        <td>{mascararEmail(registro.email_normalizado) || "—"}</td>
-                        <td>{registro.inconsistencias.join(", ")}</td>
-                        <td>{registro.motivo_bloqueio.join(", ") || "—"}</td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
-            )}
-            {base.duplicidades_email.length > 0 ? (
-              <div className="campaign-flow-stats">
-                <p>Grupos de e-mail duplicado:</p>
-                <ul>
-                  {base.duplicidades_email.map((grupo) => (
-                    <li key={grupo.email_normalizado}>
-                      {mascararEmail(grupo.email_normalizado)} · linhas {grupo.linhas.join(", ")}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-            <div className="campaign-panel-actions">
-              <button type="button" onClick={() => setEtapa(6)}>Continuar para a revisão</button>
-            </div>
-          </section>
-        )}
-        {etapa === 5 && !base ? (
-          <section className="campaign-panel">
-            <h2>5 · Inconsistências</h2>
-            <p>Nenhuma base avaliada nesta sessão. Importe e mapeie um arquivo primeiro.</p>
-            <button type="button" onClick={() => setEtapa(3)}>Ir para a importação</button>
-          </section>
-        ) : null}
-
-        {/* Etapa 6 — Revisão dos profissionais */}
-        {etapa === 6 && base && (
+        {/* Macroetapa 3 — Revisão + prévia UNIFICADAS (UX-FLOW-01A regra 7) */}
+        {mostrarRevisao && base && (
           <section className="campaign-panel" aria-labelledby="etapa-revisao">
-            <h2 id="etapa-revisao">6 · Revisão dos profissionais</h2>
+            <h2 id="etapa-revisao">Revisão dos profissionais e aprovação</h2>
             <p>
               Base final por identificador institucional. Marque exclusões apenas quando a decisão
               humana justificar (EXCLUIR_DO_LOTE); a marcação invalida qualquer aprovação vigente.
             </p>
+            {base.sha256 === "sintetico-dev" ? (
+              <p className="campaign-actions-note" role="status">
+                Base sintética: o mapeamento é automático por construção (cabeçalhos canônicos) —
+                não há etapa manual de mapeamento para esta base.
+              </p>
+            ) : null}
+            {mostrarPendenciasRevisao ? (
+              <div className="campaign-exceptions">
+                <h3>Exceções aguardando decisão humana</h3>
+                <p>
+                  Duplicidades e divergências de normalização exigem decisão do papel REVISOR.
+                  Decida na tabela de revisão abaixo (EXCLUIR_DO_LOTE); nada é corrigido
+                  automaticamente e o arquivo original nunca é alterado.
+                </p>
+                <table className="campaign-table">
+                  <thead>
+                    <tr>
+                      <th>Linha</th>
+                      <th>Identificador</th>
+                      <th>E-mail normalizado</th>
+                      <th>Inconsistências</th>
+                      <th>Motivos de bloqueio</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {base.registros
+                      .filter((registro) => registro.inconsistencias.length > 0)
+                      .map((registro) => (
+                        <tr key={registro.linha}>
+                          <td>{registro.linha}</td>
+                          <td><code>{registro.profissional_id || "—"}</code></td>
+                          <td>{mascararEmail(registro.email_normalizado) || "—"}</td>
+                          <td>{registro.inconsistencias.join(", ")}</td>
+                          <td>{registro.motivo_bloqueio.join(", ") || "—"}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+                {base.duplicidades_email.length > 0 ? (
+                  <div className="campaign-flow-stats">
+                    <p>Grupos de e-mail duplicado:</p>
+                    <ul>
+                      {base.duplicidades_email.map((grupo) => (
+                        <li key={grupo.email_normalizado}>
+                          {mascararEmail(grupo.email_normalizado)} · linhas {grupo.linhas.join(", ")}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             <table className="campaign-table">
               <thead>
                 <tr>
@@ -1344,8 +1449,31 @@ export function CampaignWorkspace() {
               </tbody>
             </table>
             <div className="campaign-panel-actions">
-              <button type="button" onClick={() => setEtapa(7)} disabled={aptosParaAprovacao.length === 0}>
-                Continuar para a prévia ({aptosParaAprovacao.length} aptos)
+              <a
+                className="campaign-anchor-link"
+                href="#etapa-previa"
+                onClick={(event) => {
+                  event.preventDefault();
+                  document.getElementById("etapa-previa")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+              >
+                Ver prévia da comunicação ({aptosParaAprovacao.length} aptos)
+              </a>
+              <button
+                type="button"
+                onClick={() => {
+                  setArquivo(null);
+                  setAvaliacaoArquivo(null);
+                  setMapeamento({});
+                  setBase(null);
+                  setAprovacao(null);
+                  setExcluidos([]);
+                  setErroEtapa("");
+                  setEtapa(3);
+                }}
+                disabled={avaliando || persistindo || criandoLote}
+              >
+                Importar outra base
               </button>
               {aptosParaAprovacao.length === 0 ? (
                 <small role="status">Bloqueado: nenhum profissional apto após exclusões.</small>
@@ -1361,10 +1489,10 @@ export function CampaignWorkspace() {
           </section>
         ) : null}
 
-        {/* Etapa 7 — Prévia das mensagens */}
-        {etapa === 7 && base && (
+        {/* Macroetapa 3 — Prévia da comunicação (mesma superfície da revisão) */}
+        {mostrarRevisao && base && (
           <section className="campaign-panel" aria-labelledby="etapa-previa">
-            <h2 id="etapa-previa">7 · Prévia das mensagens</h2>
+            <h2 id="etapa-previa">Prévia da comunicação</h2>
             <p>
               Prévia textual determinística do template {TEMPLATE_VERSAO_PADRAO}. Destinatários
               permanecem mascarados na interface; nada é enviado nesta fase.
@@ -1399,22 +1527,22 @@ export function CampaignWorkspace() {
               <p>Nenhuma mensagem elegível para prévia.</p>
             )}
             <div className="campaign-panel-actions">
-              <button type="button" onClick={() => setEtapa(8)} disabled={aptosParaAprovacao.length === 0}>
+              <a
+                className="campaign-anchor-link"
+                href="#etapa-aprovacao"
+                onClick={(event) => {
+                  event.preventDefault();
+                  document.getElementById("etapa-aprovacao")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+              >
                 Ir para a aprovação
-              </button>
+              </a>
             </div>
           </section>
         )}
-        {etapa === 7 && !base ? (
-          <section className="campaign-panel">
-            <h2>7 · Prévia das mensagens</h2>
-            <p>Nenhuma base avaliada nesta sessão.</p>
-            <button type="button" onClick={() => setEtapa(3)}>Ir para a importação</button>
-          </section>
-        ) : null}
 
-        {/* Etapa 8 — Aprovação */}
-        {etapa === 8 && base && (
+        {/* Macroetapa 3 — Aprovação e congelamento (ações humanas explícitas) */}
+        {mostrarRevisao && base && (
           <section className="campaign-panel" aria-labelledby="etapa-aprovacao">
             <h2 id="etapa-aprovacao">8 · Aprovação e congelamento</h2>
             <p>
@@ -1469,11 +1597,6 @@ export function CampaignWorkspace() {
                         ? "Lote criado ✓"
                         : "Criar lote controlado (HOLD)"}
                   </button>
-                  {campanha ? (
-                    <button type="button" onClick={() => setEtapa(10)}>
-                      Acompanhar campanha →
-                    </button>
-                  ) : null}
                 </div>
                 {campanha && !campanha.loteId && !visaoEtapa.mostrarCtaCriarLote ? (
                   <small role="status">
@@ -1507,17 +1630,10 @@ export function CampaignWorkspace() {
             </div>
           </section>
         )}
-        {etapa === 8 && visaoEtapa.mostrarFallbackImportacao ? (
-          <section className="campaign-panel">
-            <h2>8 · Aprovação</h2>
-            <p>Nenhuma base avaliada nesta sessão.</p>
-            <button type="button" onClick={() => setEtapa(3)}>Ir para a importação</button>
-          </section>
-        ) : null}
 
-        {/* Etapa 8 — campanha persistida reconstruída do PostgreSQL:
+        {/* Macroetapa 4 — Campanha persistida reconstruída do PostgreSQL:
             painel próprio, independe de base/aprovacao da sessão. */}
-        {etapa === 8 && campanha ? (
+        {mostrarOperacao && campanha ? (
           <section className="campaign-panel" aria-labelledby="etapa-campanha-reconstruida">
             <h2 id="etapa-campanha-reconstruida">8 · Campanha reconstruída do PostgreSQL</h2>
             <ul className="campaign-flow-stats">
@@ -1562,35 +1678,12 @@ export function CampaignWorkspace() {
             {visaoEtapa.mostrarLoteExistente ? (
               <p>Lote já criado — nenhuma segunda ação de criação é oferecida.</p>
             ) : null}
-            {visaoEtapa.mostrarAcompanharCampanha ? (
-              <div className="campaign-panel-actions">
-                <button type="button" onClick={() => setEtapa(10)}>
-                  Acompanhar campanha →
-                </button>
-              </div>
-            ) : null}
           </section>
         ) : null}
 
-        {/* Etapa 9 — Execução controlada (sempre bloqueada nesta fase) */}
-        {etapa === 9 && (
-          <section className="campaign-panel" aria-labelledby="etapa-execucao">
-            <h2 id="etapa-execucao">9 · Execução controlada</h2>
-            <p>
-              A execução de lote aprovado permanece bloqueada por política da fundação
-              (canExecute=false). Nenhum caminho da interface pode iniciar envio — o gate é
-              server-side e não existe botão de execução nesta etapa.
-            </p>
-            <ul className="campaign-flow-stats">
-              <li>Lote aprovado: {aprovacao ? `hash ${aprovacao.conteudoHash.slice(0, 12)}…` : "nenhum"}</li>
-              <li>Manifesto final: apresentado após a autorização humana de envio (futura).</li>
-              <li>Autorização de envio: aguardando gate externo — não disponível na interface.</li>
-            </ul>
-          </section>
-        )}
 
-        {/* Etapa 10 — Acompanhamento (estado persistido + sessão) */}
-        {etapa === 10 && (
+        {/* Macroetapa 4 — Acompanhamento (estado persistido + sessão) */}
+        {mostrarOperacao && (
           <section className="campaign-panel" aria-labelledby="etapa-acompanhamento">
             <h2 id="etapa-acompanhamento">10 · Acompanhamento</h2>
             {campanha ? (

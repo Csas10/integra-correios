@@ -296,7 +296,6 @@ async function registrarEventoExecucao(
       entrada.itemId,
       entrada.tipo,
       entrada.operatorId,
-      entrada.operatorId,
       entrada.agora,
       JSON.stringify(metadados),
       hashEventoExecucao(

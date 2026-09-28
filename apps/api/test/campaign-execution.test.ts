@@ -598,6 +598,224 @@ describe("SLICE_03A.1 — provas estruturais de fonte (SOURCE_STRUCTURE)", () =>
 // Sem DATABASE_URL: PENDING_CI (nunca falsificado como PASS).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Parte 3c — SOURCE_STRUCTURE/BEHAVIORAL: regressão de ARIDADE do binding SQL
+// (SLICE_03A.3). Detecta o defeito "bind message supplies N parameters, but
+// prepared statement requires M" SEM DATABASE_URL, via executor falso.
+// ---------------------------------------------------------------------------
+
+interface ChamadaSql {
+  readonly text: string;
+  readonly values: readonly unknown[];
+}
+
+/** Maior $n do texto. Guarda contra $$ (dollar-quoting) para não falso-positivar. */
+function maiorPlaceholder(texto: string): number {
+  return texto
+    .split("$$")
+    .reduce(
+      (maior, parte) =>
+        Math.max(maior, ...(parte.match(/\$(\d+)/g) ?? []).map((m) => Number(m.slice(1)))),
+      0,
+    );
+}
+
+/**
+ * Validador genérico de aridade: aceita reuso legítimo do MESMO placeholder
+ * (ex.: $4 em operator_id e ator_operator_id), exige contiguidade $1..$max
+ * e igualdade maxPlaceholder === values.length.
+ */
+function validarAridade(chamada: ChamadaSql): void {
+  const usados = chamada.text
+    .split("$$")
+    .flatMap((parte) => (parte.match(/\$(\d+)/g) ?? []).map((m) => Number(m.slice(1))));
+  const max = Math.max(0, ...usados);
+  if (max === 0) {
+    // Statements de controle (BEGIN/COMMIT/ROLLBACK) não têm placeholders.
+    expect(chamada.values.length, "values em statement sem placeholder").toBe(0);
+    return;
+  }
+  expect(max, "max placeholder de: " + chamada.text.slice(0, 80)).toBeGreaterThan(0);
+  const distintos = [...new Set(usados)].sort((a, b) => a - b);
+  expect(distintos).toEqual(Array.from({ length: max }, (_, i) => i + 1));
+  expect(chamada.values.length, "aridade de: " + chamada.text.slice(0, 80)).toBe(max);
+}
+
+/**
+ * Executor falso que percorre o FLUXO REAL do claim até registrarEventoExecucao
+ * (transação: BEGIN → SELECT com lock → CAS com rowCount=1 → evento → COMMIT).
+ * Não há DATABASE_URL envolvido: apenas a superfície CampanhaPool/Executor.
+ */
+function criarExecutorDeAuditoriaSpy(opcoes: { readonly rowCountCas: number }): {
+  pool: CampanhaPool;
+  chamadas: ChamadaSql[];
+} {
+  const chamadas: ChamadaSql[] = [];
+  const transacao = {
+    query: async (text: string, values: readonly unknown[] = []): Promise<{
+      rows: readonly any[];
+      rowCount: number | null;
+    }> => {
+      chamadas.push({ text, values });
+      if (text.includes("SELECT i.estado")) {
+        return {
+          rows: [
+            {
+              item_estado: "PREPARADO",
+              destinatario_fingerprint: "aa".repeat(32),
+              lote_estado: "ATIVO",
+              lote_codigo: "CAMPANHA_PF_SINTETICA",
+              hash_aprovacao: "bb".repeat(32),
+              operator_id: operadorDoFluxo,
+            },
+          ],
+          rowCount: 1,
+        };
+      }
+      if (text.includes("UPDATE outbox_campanha i SET estado")) {
+        return { rows: [], rowCount: opcoes.rowCountCas };
+      }
+      if (text.includes("SELECT destinatario_fingerprint")) {
+        return {
+          rows: [{ destinatario_fingerprint: "aa".repeat(32) }],
+          rowCount: 1,
+        };
+      }
+      if (text.includes("SELECT estado FROM outbox_campanha")) {
+        return { rows: [{ estado: "ENFILEIRADO" }], rowCount: 1 };
+      }
+      if (text.includes("SET estado = 'ENVIADO'")) {
+        return { rows: [], rowCount: 1 };
+      }
+      if (text.includes("SET estado = 'FALHOU'")) {
+        return { rows: [], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  const pool: CampanhaPool = {
+    query: async (text, values = []) => {
+      chamadas.push({ text, values });
+      return { rows: [], rowCount: 0 };
+    },
+    connect: async () => transacao,
+  };
+  return { pool, chamadas };
+}
+
+const operadorDoFluxo = "9a9b9c9d-0e1f-4a2b-8c3d-4e5f6a7b8c9d";
+
+describe("SLICE_03A.3 — aridade e mapeamento SQL (regressão local do binding)", () => {
+  const comando = {
+    operatorId: operadorDoFluxo,
+    campanhaId: "8a8b8c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d",
+    loteCampanhaId: "7b7c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e",
+    itemId: "6c6d7e8f-0a1b-4c2d-8e3f-4a5b6c7d8e9f",
+    politica: politicaAberta,
+    provas: provasSinteticas,
+  };
+
+  it("A: $4 reutilizado com quatro valores é aceito pelo validador", () => {
+    expect(() =>
+      validarAridade({
+        text: "UPDATE t SET a = $1, b = $2, c = $3 WHERE operator_id = $4 AND ator = $4",
+        values: ["v1", "v2", "v3", "v4"],
+      }),
+    ).not.toThrow();
+  });
+
+  it("B: placeholders até $7 com oito valores é REJEITADO (defeito original reproduzido)", () => {
+    expect(() =>
+      validarAridade({
+        text: "INSERT INTO t VALUES ($1, $2, $3, $4, $4, $5, $6, $7)",
+        values: ["v1", "v2", "v3", "v4", "v4", "v5", "v6", "v7"],
+      }),
+    ).toThrow(/aridade/);
+  });
+
+  it("C: placeholders até $7 com sete valores é aceito", () => {
+    expect(() =>
+      validarAridade({
+        text: "INSERT INTO t VALUES ($1, $2, $3, $4, $4, $5, $6, $7)",
+        values: ["v1", "v2", "v3", "v4", "v5", "v6", "v7"],
+      }),
+    ).not.toThrow();
+  });
+
+  it("D: fluxo do claim com binding CORRIGIDO — toda query gravada tem aridade válida e INSERT de auditoria mapeado", async () => {
+    const { pool, chamadas } = criarExecutorDeAuditoriaSpy({ rowCountCas: 1 });
+    const resultado = await executeAttemptCampanha(pool, {
+      ...comando,
+      provas: provasSinteticas,
+      provider: new ProvedorFakeCampanha(),
+    });
+    expect(resultado.resultado).toBe("ENVIADO");
+    expect(chamadas.length).toBeGreaterThan(3);
+    for (const chamada of chamadas) validarAridade(chamada);
+    const insertAuditoria = chamadas.find((c) =>
+      c.text.includes("INSERT INTO evento_auditoria"),
+    )!;
+    expect(insertAuditoria).toBeDefined();
+    // Mapeamento semântico do INSERT (placeholders → valores na posição correta):
+    expect(maiorPlaceholder(insertAuditoria.text)).toBe(7);
+    expect(insertAuditoria.values.length).toBe(7);
+    expect(insertAuditoria.text).toContain("$4, $4");
+    expect(insertAuditoria.values[0]).toMatch(/^[0-9a-f-]{36}$/); // id
+    expect(insertAuditoria.values[1]).toBe(comando.itemId); // agregado_id
+    expect(insertAuditoria.values[2]).toBe("EXEC_CLAIM"); // tipo
+    expect(insertAuditoria.values[3]).toBe(operadorDoFluxo); // operator_id/ator
+    expect(insertAuditoria.values[4]).toMatch(/^\d{4}-\d{2}-\d{2}T/); // ocorreu_em
+    expect(JSON.parse(String(insertAuditoria.values[5])).esquema).toBe("EXEC_EVENTO_V1");
+    expect(insertAuditoria.values[6]).toMatch(/^[0-9a-f]{64}$/); // hash_evento
+  });
+
+  it("E: ocorreu_em, metadados e hash_evento permanecem em $5/$6/$7 após a correção", async () => {
+    const { pool, chamadas } = criarExecutorDeAuditoriaSpy({ rowCountCas: 1 });
+    await executeAttemptCampanha(pool, {
+      ...comando,
+      provas: provasSinteticas,
+      provider: new ProvedorFakeCampanha(),
+    });
+    const insertAuditoria = chamadas.find((c) =>
+      c.text.includes("INSERT INTO evento_auditoria"),
+    )!;
+    expect(insertAuditoria.text).toContain("$4, $4, $5, $6::jsonb, NULL, $7");
+    expect(typeof insertAuditoria.values[4]).toBe("string"); // ocorreu_em
+    expect(insertAuditoria.values[4]).not.toBe(operadorDoFluxo); // não deslocado
+    const metadados = JSON.parse(String(insertAuditoria.values[5]));
+    expect(metadados.esquema).toBe("EXEC_EVENTO_V1");
+    expect(typeof metadados.nonce).toBe("string");
+    expect(insertAuditoria.values[6]).not.toBeNull();
+    // Fluxo corrompido (CAS 0 linhas) NÃO grava evento de claim:
+    const { pool: poolFalha, chamadas: chamadasFalha } = criarExecutorDeAuditoriaSpy({
+      rowCountCas: 0,
+    });
+    const rejeitado = await executeAttemptCampanha(poolFalha, {
+      ...comando,
+      provas: provasSinteticas,
+      provider: new ProvedorFakeCampanha(),
+    });
+    expect(rejeitado.resultado).toBe("NAO_CLAIMADO");
+    expect(
+      chamadasFalha.some(
+        (c) => c.text.includes("INSERT INTO evento_auditoria") && c.values[2] === "EXEC_CLAIM",
+      ),
+    ).toBe(false);
+  });
+
+  it("fonte do módulo: array de valores do INSERT de auditoria tem exatamente 7 elementos", () => {
+    const inicio = FONTE_EXECUCAO.indexOf("INSERT INTO evento_auditoria");
+    const trecho = FONTE_EXECUCAO.slice(inicio, FONTE_EXECUCAO.indexOf("],", inicio));
+    // itemId, tipo, operatorId, agora (4) + itemId, tipo, agora dentro do hash (3)
+    expect((trecho.match(/entrada\./g) ?? []).length).toBe(7);
+    expect(trecho).toContain("randomUUID()");
+    // Nenhum operatorId duplicado no array:
+    const indicePrimeiro = trecho.indexOf("entrada.operatorId");
+    expect(trecho.indexOf("entrada.operatorId", indicePrimeiro + 1)).toBe(-1);
+  });
+});
+
 const describeDb = DB_URL_AMBIENTE ? describe : describe.skip;
 
 type PoolTipado = import("@integra-correios/persistence").NodePostgresPool;

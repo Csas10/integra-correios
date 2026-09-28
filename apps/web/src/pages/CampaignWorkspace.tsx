@@ -415,9 +415,10 @@ export function CampaignWorkspace() {
   // Storage vazio ou outro navegador NÃO impede a reconstrução — o débito
   // CROSS_BROWSER_RESUME_DEPENDS_ON_SESSION_CONTEXT é encerrado. SINGLE é
   // retomado automaticamente (contrato server-driven): o detalhe é APLICADO
-  // ao estado operacional (setCampanha) — mesmo estado da recuperação
-  // normal; o Session Storage é preenchido só como conveniência. MULTIPLE
-  // exige seleção EXPLÍCITA do operador — nenhuma escolha silenciosa.
+  // ao estado operacional (setCampanha). A retomada é exclusivamente
+  // server-driven: /resumable descobre e /detail aplica a campanha
+  // autorizada. MULTIPLE exige seleção EXPLÍCITA do operador — nenhuma
+  // escolha silenciosa.
   useEffect(() => {
     if (!me) {
       setModoRetomada("INDEFINIDO");

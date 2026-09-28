@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 
 export const PF_UPDATE_CAMPAIGN_CODE_PREFIX =
   "PF_ATUALIZACAO_CADASTRAL_" as const;
-export const RESERVED_PILOT_BATCH_CODE = "CONTROLLED_GMAIL_TEST" as const;
+/** Reexportado do módulo neutro pilot-domain (segurança Slice-03A.1). */
+export { RESERVED_PILOT_BATCH_CODE } from "./pilot-domain.js";
 
 export const PF_UPDATE_CAMPAIGN_STATES = [
   "PREPARACAO",
@@ -96,7 +97,20 @@ export interface PfUpdateCampaignPolicy {
   readonly individualOperatorIdentityRequired: true;
   readonly canPersistImport: boolean;
   readonly canCreateBatch: boolean;
-  readonly canExecute: false;
+  /**
+   * Slice-03A.1: interpretado pela MESMA fronteira (autoridade única).
+   * Default fail-closed: ausente/vazio/inválido ⇒ false. O valor só abre
+   * com o literal homologado "true" — e o duplo gate com REAL_SEND_ENABLED
+   * continua obrigatório na execução.
+   */
+  readonly canExecute: boolean;
+  /**
+   * Slice-03B: capacidade de PREPARAÇÃO do lote (HOLD → PREPARADO), SEMPRE
+   * SEPARADA da execução. Default fail-closed: ausente ⇒ false. Preparar
+   * NUNCA liga o Gmail: toca apenas lote_campanha/outbox_campanha (a outbox
+   * PREPARADO continua não capturável — o claim exige lote ATIVO).
+   */
+  readonly canPrepareBatch: boolean;
   readonly realSendEnabled: boolean;
 }
 
@@ -111,7 +125,8 @@ export function carregarPoliticaCampanhaAtualizacao(
     individualOperatorIdentityRequired: true,
     canPersistImport: env.PF_CAMPAIGN_PERSIST_ENABLED === "true",
     canCreateBatch: env.PF_CAMPAIGN_BATCH_ENABLED === "true",
-    canExecute: false,
+    canExecute: env.PF_CAMPAIGN_EXECUTE_ENABLED === "true",
+    canPrepareBatch: env.PF_CAMPAIGN_PREPARE_ENABLED === "true",
     realSendEnabled: env.REAL_SEND_ENABLED === "true",
   };
 }

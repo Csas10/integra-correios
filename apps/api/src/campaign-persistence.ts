@@ -22,6 +22,7 @@
  */
 
 import { createHash, createHmac, randomUUID } from "node:crypto";
+import { fingerprintDestinatarioCampanha } from "./campaign-control.js";
 import {
   CAMPAIGN_TEMPLATE_VERSAO_PADRAO,
   codigoLoteCampanha,
@@ -668,10 +669,12 @@ export async function persistirLoteCampanha(
     );
     for (let ordem = 1; ordem <= registrosAptos.length; ordem += 1) {
       const registro = registrosAptos[ordem - 1]!;
-      // Fingerprint SHA-256 do e-mail normalizado (NUNCA o valor bruto).
-      const fingerprintDestinatario = createHash("sha256")
-        .update(registro.email_normalizado)
-        .digest("hex");
+      // SLICE-03B — helper canônico (paridade persistência↔execução).
+      // Mesma semântica homologada: SHA-256 do e-mail normalizado
+      // (NUNCA o valor bruto); única derivação do repositório.
+      const fingerprintDestinatario = fingerprintDestinatarioCampanha(
+        registro.email_normalizado,
+      );
       await transaction.query(
         `INSERT INTO outbox_campanha (
           id, lote_campanha_id, ordem, destinatario_fingerprint, payload_snapshot, estado, criada_em

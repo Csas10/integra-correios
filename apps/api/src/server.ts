@@ -79,6 +79,18 @@ import {
   avaliarBaseCampanha,
 } from "./campaign-import.js";
 import {
+  CampaignControlError,
+  avaliarAcaoOperacaoCampanha,
+  emitirProvasServerSideCampanha,
+  lerEstoqueOperacionalCampanha,
+  prepararLoteCampanha,
+  autorizarExecucaoCampanha,
+} from "./campaign-control.js";
+import {
+  executeAttemptCampanha,
+  ProvedorFakeCampanha,
+} from "./campaign-execution.js";
+import {
   CampaignPersistenceError,
   listarCampanhasRetomaveis,
   recuperarCampanhaPorId,
@@ -188,6 +200,10 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "GET /api/campaigns/detail",
   "POST /api/campaigns/persist",
   "POST /api/campaigns/batch",
+  "GET /api/campaigns/operational-readiness",
+  "POST /api/campaigns/prepare",
+  "POST /api/campaigns/authorize-execution",
+  "POST /api/campaigns/execute-attempt",
 ]);
 
 
@@ -327,6 +343,20 @@ function erroPersistenciaCampanha(
   }
   const mensagem = error instanceof Error ? error.message : "Erro interno.";
   json(res, 500, { erro: mensagem.slice(0, 200) });
+}
+
+/**
+ * SLICE-03B — mapeamento de erro do plano de controle: bloqueio de domínio
+ * → 409 sanitizado; infraestrutura → 503; entrada inválida → 422. Nenhum
+ * detalhe interno, HMAC ou PII na resposta.
+ */
+function erroControleCampanha(res: ServerResponse, error: unknown): void {
+  if (error instanceof CampaignControlError) {
+    const status = error.code === "CAMPAIGN_INPUT_INVALID" ? 422 : 409;
+    json(res, status, { erro: error.message, codigo: error.code });
+    return;
+  }
+  erroPersistenciaCampanha(res, error);
 }
 
 /** F12 — TTL da sessão operacional (cookie HttpOnly; token NUNCA vai ao browser). */
@@ -1455,6 +1485,344 @@ const ROTAS: readonly Rota[] = [
         });
       } catch (error) {
         erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // SLICE-03B — PLANO DE CONTROLE OPERACIONAL (NO SEND). Quatro rotas
+  // mínimas, todas com sessão individual + escopo exclusivo pelo
+  // operator_id da sessão. Nenhuma aceita operator_id, estado, prova,
+  // fingerprint ou chave idempotente do cliente: provas são emitidas e
+  // verificadas server-side; alheio/inexistente é 404 sanitizado; com as
+  // flags fechadas toda mutação é recusada ANTES de qualquer escrita e a
+  // tentativa de execução é bloqueada ANTES de claim/provider/Gmail.
+  // ------------------------------------------------------------------
+  {
+    // Readiness READ-ONLY: estado, contagens por estado da outbox da
+    // campanha, políticas e bloqueios objetivos + próxima ação. Nenhuma
+    // mutação, nenhum evento de auditoria.
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/operational-readiness",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const campanhaId = url.searchParams.get("campanhaId")?.trim() ?? "";
+      if (!operatorUuidValido(campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_READINESS_INVALID",
+        });
+        return;
+      }
+      try {
+        const estoque = await lerEstoqueOperacionalCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId,
+        });
+        if (!estoque) {
+          // Isolamento por operador: campanha alheia é indistinguível de
+          // inexistente (404 sanitizado).
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        const politica = carregarPoliticaCampanhaAtualizacao();
+        const preparacao = avaliarAcaoOperacaoCampanha({
+          acao: "PREPARAR_LOTE",
+          politica,
+          loteEstado: estoque.loteEstado,
+          totalItens: estoque.totalItens,
+          autorizacaoHumanaConcedida: estoque.autorizacaoHumana.concedida,
+        });
+        const autorizacao = avaliarAcaoOperacaoCampanha({
+          acao: "AUTORIZAR_EXECUCAO",
+          politica,
+          loteEstado: estoque.loteEstado,
+          totalItens: estoque.totalItens,
+          autorizacaoHumanaConcedida: estoque.autorizacaoHumana.concedida,
+        });
+        const execucao = avaliarAcaoOperacaoCampanha({
+          acao: "EXECUTAR_ITEM",
+          politica,
+          loteEstado: estoque.loteEstado,
+          totalItens: estoque.totalItens,
+          autorizacaoHumanaConcedida: estoque.autorizacaoHumana.concedida,
+        });
+        json(res, 200, {
+          campanha: { campanhaId, estado: "LOTE_CRIADO" },
+          lote: {
+            loteCampanhaId: estoque.loteCampanhaId,
+            codigo: estoque.loteCodigo,
+            estado: estoque.loteEstado,
+            totalItens: estoque.totalItens,
+            contagemPorEstado: estoque.contagemPorEstado,
+          },
+          politicas: {
+            canPrepareBatch: politica.canPrepareBatch,
+            canExecute: politica.canExecute,
+            realSendEnabled: politica.realSendEnabled,
+          },
+          autorizacaoHumana: {
+            concedida: estoque.autorizacaoHumana.concedida,
+            referenciaPresente: estoque.autorizacaoHumana.referencia !== null,
+          },
+          acoes: {
+            PREPARAR_LOTE: { permitida: preparacao.permitida, bloqueios: preparacao.bloqueios },
+            AUTORIZAR_EXECUCAO: { permitida: autorizacao.permitida, bloqueios: autorizacao.bloqueios },
+            EXECUTAR_ITEM: { permitida: execucao.permitida, bloqueios: execucao.bloqueios },
+          },
+          executavel: false,
+          envioRealDesabilitado: !politica.realSendEnabled,
+          proximaAcao: preparacao.permitida
+            ? "PREPARAR_LOTE"
+            : autorizacao.permitida
+              ? "AUTORIZAR_EXECUCAO"
+              : "AGUARDAR_GATES_OPERACIONAIS",
+        });
+      } catch (error) {
+        erroControleCampanha(res, error);
+      }
+    },
+  },
+  {
+    // Preparação controlada (HOLD → PREPARADO). Exige canPrepareBatch e
+    // papel EXECUTOR. NÃO liga o Gmail e NÃO captura item: a outbox
+    // PREPARADO continua não capturável (claim exige lote ATIVO — 03A).
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/prepare",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      if (!carregarPoliticaCampanhaAtualizacao().canPrepareBatch) {
+        json(res, 403, {
+          erro: "Preparação do lote desabilitada por política.",
+          codigo: "CAMPAIGN_PREPARE_DISABLED",
+        });
+        return;
+      }
+      if (!identity.roles.includes("EXECUTOR")) {
+        json(res, 403, {
+          erro: "Preparação exige papel EXECUTOR.",
+          codigo: "OPERATOR_ROLE_FORBIDDEN",
+        });
+        return;
+      }
+      if (identity.status !== "ATIVO") {
+        json(res, 403, {
+          erro: "Operador suspenso não pode preparar lote.",
+          codigo: "OPERATOR_SUSPENDED",
+        });
+        return;
+      }
+      let body: { campanhaId?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_PREPARE_JSON_INVALID" });
+        return;
+      }
+      if (!operatorUuidValido(body.campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_PREPARE_INVALID",
+        });
+        return;
+      }
+      try {
+        const resultado = await prepararLoteCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId: body.campanhaId as string,
+          politica: carregarPoliticaCampanhaAtualizacao(),
+        });
+        if (!resultado) {
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, resultado.resultado === "PREPARADO" ? 200 : 200, {
+          status:
+            resultado.resultado === "PREPARADO"
+              ? "CAMPAIGN_BATCH_PREPARED"
+              : "CAMPAIGN_BATCH_ALREADY_PREPARED",
+          campanhaId: resultado.campanhaId,
+          lote: {
+            loteCampanhaId: resultado.loteCampanhaId,
+            codigo: resultado.loteCodigo,
+            totalItens: resultado.totalItens,
+          },
+          executavel: false,
+          aviso:
+            "Lote PREPARADO permanece não capturável: nenhum envio foi realizado e o Gmail não foi chamado.",
+        });
+      } catch (error) {
+        erroControleCampanha(res, error);
+      }
+    },
+  },
+  {
+    // AUTORIZAÇÃO HUMANA explícita (lote PREPARADO). Emite a prova auditada
+    // server-side (evento append-only); NÃO ativa o lote e NÃO executa nada.
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/authorize-execution",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const politica = carregarPoliticaCampanhaAtualizacao();
+      if (!politica.canExecute) {
+        json(res, 403, {
+          erro: "Execução desabilitada por política — autorização humana indisponível.",
+          codigo: "CAMPAIGN_EXECUTE_DISABLED",
+        });
+        return;
+      }
+      if (!identity.roles.includes("EXECUTOR")) {
+        json(res, 403, {
+          erro: "Autorização exige papel EXECUTOR.",
+          codigo: "OPERATOR_ROLE_FORBIDDEN",
+        });
+        return;
+      }
+      if (identity.status !== "ATIVO") {
+        json(res, 403, {
+          erro: "Operador suspenso não pode autorizar execução.",
+          codigo: "OPERATOR_SUSPENDED",
+        });
+        return;
+      }
+      let body: { campanhaId?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_AUTHORIZE_EXEC_JSON_INVALID" });
+        return;
+      }
+      if (!operatorUuidValido(body.campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_AUTHORIZE_EXEC_INVALID",
+        });
+        return;
+      }
+      try {
+        const resultado = await autorizarExecucaoCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId: body.campanhaId as string,
+          politica,
+        });
+        if (!resultado) {
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, 200, {
+          status:
+            resultado.resultado === "AUTORIZADO"
+              ? "CAMPAIGN_EXECUTION_AUTHORIZED"
+              : "CAMPAIGN_EXECUTION_ALREADY_AUTHORIZED",
+          campanhaId: resultado.campanhaId,
+          lote: {
+            loteCampanhaId: resultado.loteCampanhaId,
+            totalItens: resultado.totalItens,
+          },
+          referenciaPresente: true,
+          executavel: false,
+          aviso:
+            "Autorização registrada server-side. O lote permanece PREPARADO; nenhuma execução foi iniciada.",
+        });
+      } catch (error) {
+        erroControleCampanha(res, error);
+      }
+    },
+  },
+  {
+    // Entrypoint de TENTATIVA de execução (structural hook 03A). Provas são
+    // emitidas/verificadas server-side; com as flags fechadas a tentativa é
+    // bloqueada ANTES do claim/mutação/provider/Gmail. O provider é SEMPRE
+    // o fake determinístico nesta fatia e NUNCA é selecionável por request:
+    // com realSendEnabled=false a rota bloqueia antes de qualquer chamada.
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/execute-attempt",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      let body: {
+        campanhaId?: unknown;
+        loteCampanhaId?: unknown;
+        itemId?: unknown;
+      };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_EXEC_JSON_INVALID" });
+        return;
+      }
+      const idsValidos =
+        operatorUuidValido(body.campanhaId) &&
+        operatorUuidValido(body.loteCampanhaId) &&
+        operatorUuidValido(body.itemId);
+      if (!idsValidos) {
+        json(res, 422, {
+          erro: "campanhaId, loteCampanhaId e itemId (UUID) são obrigatórios.",
+          codigo: "CAMPAIGN_EXEC_INVALID",
+        });
+        return;
+      }
+      try {
+        const provas = await emitirProvasServerSideCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId: body.campanhaId as string,
+          loteCampanhaId: body.loteCampanhaId as string,
+          itemId: body.itemId as string,
+        });
+        if (!provas) {
+          // Alheio/inexistente indistinguíveis — sem mutação, sem evento.
+          json(res, 404, {
+            erro: "Nenhum item para este identificador.",
+            codigo: "CAMPAIGN_EXEC_NOT_FOUND",
+          });
+          return;
+        }
+        const resultado = await executeAttemptCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId: body.campanhaId as string,
+          loteCampanhaId: body.loteCampanhaId as string,
+          itemId: body.itemId as string,
+          politica: carregarPoliticaCampanhaAtualizacao(),
+          provas: provas.provas,
+          // Injeção FIXA do fake determinístico (ZERO rede). Nenhuma seleção
+          // por request/config: com as políticas fechadas o fluxo nunca
+          // chega aqui (prova humana exige canExecute e emissão vigente).
+          provider: new ProvedorFakeCampanha([{ tipo: "ENVIADO" }]),
+        });
+        if (resultado.resultado === "ENVIADO") {
+          json(res, 409, {
+            erro: "Execução concluída não é esperada com as políticas atuais.",
+            codigo: "CAMPAIGN_EXEC_UNEXPECTED_SUCCESS",
+          });
+          return;
+        }
+        const bloqueios =
+          resultado.resultado === "NAO_CLAIMADO" && resultado.claim.resultado === "BLOQUEADO"
+            ? resultado.claim.bloqueios
+            : [];
+        json(res, 409, {
+          status: "CAMPAIGN_EXEC_BLOCKED",
+          resultado: resultado.resultado,
+          itemId: resultado.itemId,
+          bloqueios,
+          executavel: false,
+          aviso:
+            "Tentativa bloqueada antes de claim/mutação/provider — nenhuma chamada de rede foi realizada.",
+        });
+      } catch (error) {
+        erroControleCampanha(res, error);
       }
     },
   },

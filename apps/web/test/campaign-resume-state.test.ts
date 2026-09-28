@@ -184,10 +184,11 @@ describe("GATE: SERVER-DRIVEN RECOVERY AUTHORITY — efeito legado removido (fon
     expect(recorte).not.toContain("/api/campaigns/persisted");
   });
 
-  it("B·D: efeitos de retomada são EXATAMENTE 3 — sem efeito de hash (request por hash não pode iniciar nem concorrer)", () => {
-    // UX-FLOW-01B.1: efeitos restantes = loadMe, workspace/status, descoberta.
+  it("B·D: efeitos de retomada são EXATAMENTE 4 — sem efeito de hash (request por hash não pode iniciar nem concorrer)", () => {
+    // UX-FLOW-01B.1: loadMe, workspace/status, descoberta + readiness 03B
+    // (slice-03B: efeito read-only de /api/campaigns/operational-readiness).
     const usos = fonteComponente.split("useEffect(").length - 1;
-    expect(usos).toBe(3);
+    expect(usos).toBe(4);
   });
 
   it("C·F: ciclo de hash EXTINTO — zero leitura e zero gravação de ic_campanha_hash (UX-FLOW-01B.1)", () => {
@@ -231,8 +232,9 @@ describe("GATE: SERVER-DRIVEN RECOVERY AUTHORITY — efeito legado removido (fon
     expect(recorte.split("let ativo = true;").length - 1).toBe(1);
     expect(recorte.split("ativo = false;").length - 1).toBe(1);
     expect(recorte).toContain("if (!ativo) return;");
-    // File-wide: cleanup `ativo` nos 2 efeitos async restantes (status + descoberta).
-    expect(fonteComponente.split("let ativo = true;").length - 1).toBe(2);
+    // File-wide: cleanup `ativo` nos 3 efeitos async restantes (status +
+    // descoberta + readiness 03B).
+    expect(fonteComponente.split("let ativo = true;").length - 1).toBe(3);
   });
 
   it("J: retomada é ZERO-MUTAÇÃO — nenhum POST na janela server-driven", () => {

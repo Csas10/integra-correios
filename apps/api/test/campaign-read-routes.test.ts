@@ -403,10 +403,15 @@ describe("CAMPAIGN_READ_ROUTES — prova estática de zero-persistência", () =>
       fs.readFile(new URL("../src/campaign-import.ts", import.meta.url), "utf8"),
     ]);
     for (const fonte of fontes) {
-      expect(fonte).not.toMatch(/INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM/);
-      expect(fonte).not.toMatch(/\boutbox\b/i);
-      expect(fonte).not.toMatch(/\bgmail\b/i);
-      expect(fonte).not.toMatch(/requireDb|NodePostgresPool|claimOutbox|executarLive|enqueueCommunicationBatch/);
+      // A prova examina CÓDIGO: comentários de contrato (ex.: Slice-03B em
+      // campaigns.ts citando outbox_campanha) não são SQL de escrita.
+      const codigo = fonte
+        .replace(/\/\*[\s\S]*?\*\//g, " ")
+        .replace(/(^|[^:"'])\/\/.*$/gm, "$1");
+      expect(codigo).not.toMatch(/INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM/);
+      expect(codigo).not.toMatch(/\boutbox\b/i);
+      expect(codigo).not.toMatch(/\bgmail\b/i);
+      expect(codigo).not.toMatch(/requireDb|NodePostgresPool|claimOutbox|executarLive|enqueueCommunicationBatch/);
     }
   });
 

@@ -1,13 +1,11 @@
+import { readFileSync, existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
-  CHAVE_HASH_SESSAO,
   disposicaoRetomada,
   LIMPEZA_RETOMADA,
-  ordemRetomadaParaRecuperacaoPorHash,
-  recuperacaoPorHashPermitida,
   type CampanhaRetomavelResumo,
-  type EstadoRetomadaLogado,
-  type ModoDescobertaRetomada,
 } from "../src/pages/campaign-resume-state.js";
 import { macroEtapaAtual } from "../src/pages/campaign-macro-stage.js";
 
@@ -25,6 +23,29 @@ const base: CampanhaRetomavelResumo = {
   criadaEm: "2026-09-25T10:00:00.000Z",
 };
 
+// ---------------------------------------------------------------------------
+// UX-FLOW-01B SERVER-DRIVEN RECOVERY AUTHORITY — corretivo
+// LEGACY_HASH_RECOVERY_OVERWRITES_SERVER_DRIVEN_STATE.
+// UX-FLOW-01B.1 DEAD HASH LIFECYCLE CLEANUP: o ciclo de hash (estado React,
+// leitura e gravação de ic_campanha_hash) foi EXTINTO — sem leitor não há
+// conveniência operacional; resta apenas a remoção histórica no logout.
+// Ambiente de testes: `environment: "node"` (sem jsdom/testing-library), então
+// a invariância arquitetural é provada por (a) módulos puros e (b) ANÁLISE
+// DO CÓDIGO-FONTE REAL do componente — o mesmo mecanismo que gate anterior
+// usou para provar a ausência de Gmail/worker nos fluxos operacionais.
+// ---------------------------------------------------------------------------
+
+const diretorioAtual = dirname(fileURLToPath(import.meta.url));
+const caminhoComponente = resolve(diretorioAtual, "../src/pages/CampaignWorkspace.tsx");
+const fonteComponente = existsSync(caminhoComponente) ? readFileSync(caminhoComponente, "utf-8") : "";
+
+const efeitoLegadoRemovido = fonteComponente.length > 0;
+const mid = (sub: string): string => {
+  const i = fonteComponente.indexOf(sub);
+  if (i < 0) throw new Error(`Trecho não encontrado no CampaignWorkspace.tsx: ${sub}`);
+  return fonteComponente.slice(i);
+};
+
 describe("disposicaoRetomada — retomada server-driven (UX-FLOW-01B)", () => {
   it("lista vazia (EMPTY) → SEM_RETOMADA (ausência e alheio indistinguíveis)", () => {
     const disposicao = disposicaoRetomada([]);
@@ -38,6 +59,7 @@ describe("disposicaoRetomada — retomada server-driven (UX-FLOW-01B)", () => {
     if (disposicao.tipo !== "PREPARAR_LOTE") return;
     expect(disposicao.campanha.campanhaId).toBe(base.campanhaId);
     expect(disposicao.campanha.loteId).toBeNull();
+    expect(disposicao.campanha.outboxTotal).toBe(0);
     expect(disposicao.totalRetomaveis).toBe(1);
   });
 
@@ -71,8 +93,6 @@ describe("disposicaoRetomada — retomada server-driven (UX-FLOW-01B)", () => {
 
 describe("retomada cross-browser — destinos derivados (UX-FLOW-01B)", () => {
   it("Session Storage vazio: a decisão depende SOMENTE da lista server-driven", () => {
-    // O contrato da decisão não aceita estado local: mesma lista do
-    // servidor → mesma disposição, com ou sem hash no navegador.
     const lista = [base];
     const semHash = disposicaoRetomada(lista);
     const comHash = disposicaoRetomada(lista);
@@ -136,8 +156,6 @@ describe("retomada cross-browser — destinos derivados (UX-FLOW-01B)", () => {
   it("MULTIPLE: nenhuma retomada automática — nenhum foco ativo até seleção humana", () => {
     const outra = { ...base, campanhaId: "outra-campanha", criadaEm: "2026-09-24T00:00:00.000Z" };
     const disposicao = disposicaoRetomada([base, outra]);
-    // A UI NÃO aplica disposição MULTIPLE: a lista aguarda escolha humana e
-    // NENHUMA campanha entra no estado operacional (visaoMacro segue 2).
     expect(disposicao.tipo).toBe("SELECAO_EXPLICITA_NECESSARIA");
     expect(disposicao).not.toHaveProperty("campanha");
     const visao = macroEtapaAtual({
@@ -151,103 +169,115 @@ describe("retomada cross-browser — destinos derivados (UX-FLOW-01B)", () => {
   });
 });
 
-describe("corretivo MULTIPLE/HASH RACE — coordenação descoberta × hash", () => {
-  const estado = (modo: ModoDescobertaRetomada, aplicada = false): EstadoRetomadaLogado => ({
-    modo,
-    campanhaAplicada: aplicada,
+describe("GATE: SERVER-DRIVEN RECOVERY AUTHORITY — efeito legado removido (fonte real)", () => {
+  it("pré-condição: fonte do componente legível (análise estrutural disponível)", () => {
+    expect(fonteComponente.length).toBeGreaterThan(10000);
+    expect(efeitoLegadoRemovido).toBe(true);
   });
 
-  it("1) MULTIPLE + Session Storage vazio → nenhuma campanha ativa (hash bloqueado)", () => {
-    expect(ordemRetomadaParaRecuperacaoPorHash(2)).toEqual({ ordem: "RESPEITAR_SELECAO" });
-    expect(recuperacaoPorHashPermitida(estado("MULTIPLE"))).toBe(false);
+  it("A·C·F: nenhum caminho de recuperação por hash no fluxo de retomada", () => {
+    expect(fonteComponente).not.toContain("recuperacaoPorHashPermitida");
+    expect(fonteComponente).not.toContain("persisted?hash=${encodeURIComponent(hashSessao)}");
+    const janela = fonteComponente.indexOf("Retomada SERVER-DRIVEN");
+    const fimJanela = fonteComponente.indexOf("async function retomarCampanhaSelecionada");
+    const recorte = fonteComponente.slice(janela, fimJanela);
+    expect(recorte).not.toContain("/api/campaigns/persisted");
   });
 
-  it("2) MULTIPLE + hash local da campanha A → hash NÃO seleciona (macroetapa NÃO é 4, CTA de lote ausente)", () => {
-    expect(recuperacaoPorHashPermitida(estado("MULTIPLE"))).toBe(false);
-    const visao = macroEtapaAtual({
-      sessaoAtiva: true,
-      baseAvaliada: false,
-      decisoesPendentes: false,
-      aprovacaoPresente: false,
-      campanha: null,
-    });
-    expect(visao.macro).not.toBe(4);
+  it("B·D: efeitos de retomada são EXATAMENTE 3 — sem efeito de hash (request por hash não pode iniciar nem concorrer)", () => {
+    // UX-FLOW-01B.1: efeitos restantes = loadMe, workspace/status, descoberta.
+    const usos = fonteComponente.split("useEffect(").length - 1;
+    expect(usos).toBe(3);
   });
 
-  it("3) /persisted atrasado em MULTIPLE → resposta posterior NÃO reativa campanha (cleanup + gate)", () => {
-    // Linha do tempo determinística (micro-gate FINAL HASH AUTHORITY):
-    // t0 descoberta em voo → o gate NEM autoriza iniciar o /persisted (não
-    // existe resposta precoce); t1 descoberta determina MULTIPLE → o gate
-    // segue bloqueado até seleção explícita e o cleanup (`ativo`) permanece
-    // como barreira secundária contra respostas tardias.
-    expect(recuperacaoPorHashPermitida(estado("INDEFINIDO"))).toBe(false);
-    expect(recuperacaoPorHashPermitida(estado("MULTIPLE"))).toBe(false);
+  it("C·F: ciclo de hash EXTINTO — zero leitura e zero gravação de ic_campanha_hash (UX-FLOW-01B.1)", () => {
+    expect(fonteComponente).not.toContain("sessionStorage.getItem(CHAVE_HASH_SESSAO)");
+    expect(fonteComponente).not.toContain("sessionStorage.setItem(CHAVE_HASH_SESSAO");
+    expect(fonteComponente).not.toContain("hashSessao");
+    expect(fonteComponente).not.toContain("setHashSessao");
   });
 
-  it("4) seleção explícita da campanha B → gate reabre (converge à B) e macroetapa 4", () => {
-    expect(recuperacaoPorHashPermitida(estado("MULTIPLE", true))).toBe(true);
-    const visao = macroEtapaAtual({
-      sessaoAtiva: true,
-      baseAvaliada: false,
-      decisoesPendentes: false,
-      aprovacaoPresente: false,
-      campanha: { estado: "APROVADA", loteId: null, loteEstado: null },
-    });
-    expect(visao.macro).toBe(4);
-    expect(visao.foco).toContain("preparar lote");
+  it("D: MULTIPLE pré-seleção — única limpeza é a sincronizada da própria descoberta", () => {
+    const bloco = mid('if (resposta.mode === "MULTIPLE"');
+    expect(bloco).toContain("setCampanha(null)");
+    expect(bloco).toContain("Só o clique humano");
   });
 
-  it("5/6) logout → LIMPEZA_RETOMADA zera hash/campanha/retomada/modo (nada do operador A sobrevive)", () => {
-    expect(LIMPEZA_RETOMADA.chaveHashSessao).toBe("ic_campanha_hash");
-    expect(LIMPEZA_RETOMADA.hashSessao).toBe("");
-    expect(LIMPEZA_RETOMADA.campanha).toBeNull();
-    expect(LIMPEZA_RETOMADA.modo).toBe("INDEFINIDO");
-    expect(LIMPEZA_RETOMADA.retomada.status).toBe("indefinida");
+  it("A·E: SINGLE e seleção explícita aplicam campanha EXCLUSIVAMENTE por /detail (sem ciclo de hash)", () => {
+    const blocoSINGLE = mid('if (resposta.mode === "SINGLE"');
+    expect(blocoSINGLE).toContain("obterCampanhaDetalhe");
+    expect(blocoSINGLE).toContain("setCampanha(detalhe)");
+    expect(blocoSINGLE).not.toContain("CHAVE_HASH_SESSAO");
+    const blocoSelecao = mid("async function retomarCampanhaSelecionada");
+    expect(blocoSelecao).toContain("obterCampanhaDetalhe");
+    expect(blocoSelecao).toContain("setCampanha(detalhe)");
   });
 
-  it("7) SINGLE → recuperação por hash continua permitida (converge à MESMA campanha)", () => {
-    expect(ordemRetomadaParaRecuperacaoPorHash(1)).toEqual({ ordem: "APLICAR_CAMPANHA" });
-    expect(recuperacaoPorHashPermitida(estado("SINGLE"))).toBe(true);
+  it("G: nenhum catch no fluxo de retomada executa setCampanha(null) — 403 legado não limpa estado", () => {
+    const janela = fonteComponente.indexOf("Retomada SERVER-DRIVEN");
+    const fimJanela = fonteComponente.indexOf("async function retomarCampanhaSelecionada");
+    expect(janela).toBeGreaterThan(0);
+    expect(fimJanela).toBeGreaterThan(janela);
+    const recorte = fonteComponente.slice(janela, fimJanela);
+    const matches = recorte.match(/catch[\s\S]{0,140}?setCampanha\(null\)/g) ?? [];
+    expect(matches).toEqual([]);
+    expect(recorte).toContain("setCampanha(detalhe)");
   });
 
-  it("8) EMPTY → nenhuma campanha ativa (hash não reativa)", () => {
-    expect(ordemRetomadaParaRecuperacaoPorHash(0)).toEqual({ ordem: "LIMPAR_SELECAO" });
-    expect(recuperacaoPorHashPermitida(estado("EMPTY"))).toBe(false);
+  it("H: cleanup anti-stale (`ativo`) permanece nos 2 efeitos async (logout/desmontagem não aplicam resposta antiga)", () => {
+    const janela = fonteComponente.indexOf("Retomada SERVER-DRIVEN");
+    const fimJanela = fonteComponente.indexOf("Seleção EXPLÍCITA do operador");
+    const recorte = fonteComponente.slice(janela, fimJanela);
+    expect(recorte.split("let ativo = true;").length - 1).toBe(1);
+    expect(recorte.split("ativo = false;").length - 1).toBe(1);
+    expect(recorte).toContain("if (!ativo) return;");
+    // File-wide: cleanup `ativo` nos 2 efeitos async restantes (status + descoberta).
+    expect(fonteComponente.split("let ativo = true;").length - 1).toBe(2);
+  });
+
+  it("J: retomada é ZERO-MUTAÇÃO — nenhum POST na janela server-driven", () => {
+    const janela = fonteComponente.indexOf("Retomada SERVER-DRIVEN");
+    const fimJanela = fonteComponente.indexOf("Seleção EXPLÍCITA do operador");
+    const recorte = fonteComponente.slice(janela, fimJanela);
+    expect(recorte).not.toContain("method: \"POST\"");
+  });
+
+  it("política fail-closed intacta no cliente (nenhum flag habilitado para contornar o defeito)", () => {
+    const recorte = mid("type CampaignPolicy");
+    expect(recorte).toContain("canExecute: false");
+    expect(mid("function persistirCampanha")).toContain("if (!base || !aprovacao) return;");
+    expect(mid("function criarLoteCampanha")).toContain("if (!campanha) return;");
+  });
+
+  it("2º consumidor de /persisted permanece nos fluxos de CRIAÇÃO (escopo separado, não retomada)", () => {
+    expect(fonteComponente.split("/api/campaigns/persisted?hash=").length - 1).toBe(2);
+    expect(mid("SLICE-02 — persistir a campanha aprovada")).toContain("/api/campaigns/persisted?hash=");
+    expect(mid("SLICE-02 — lote controlado")).toContain("/api/campaigns/persisted?hash=");
   });
 });
 
-describe("micro-gate FINAL HASH AUTHORITY — INDEFINIDO nunca autoriza hash", () => {
-  const estado = (modo: ModoDescobertaRetomada, aplicada = false): EstadoRetomadaLogado => ({
-    modo,
-    campanhaAplicada: aplicada,
+describe("GATE: política de hash — conveniência write-only e limpeza de sessão", () => {
+  it("I: LIMPEZA_RETOMADA preserva o reset completo no logout (isolamento por operador)", () => {
+    expect(LIMPEZA_RETOMADA.chaveHashSessao).toBe("ic_campanha_hash");
+    expect(LIMPEZA_RETOMADA.campanha).toBeNull();
+    expect(LIMPEZA_RETOMADA.modo).toBe("INDEFINIDO");
+    expect(LIMPEZA_RETOMADA.retomada.status).toBe("indefinida");
+    expect(fonteComponente).toContain("sessionStorage.removeItem(LIMPEZA_RETOMADA.chaveHashSessao)");
   });
 
-  it("1) INDEFINIDO + hash local → /persisted NÃO é autorizado", () => {
-    expect(recuperacaoPorHashPermitida(estado("INDEFINIDO"))).toBe(false);
-  });
-
-  it("2) /persisted 'mais rápido' não pode selecionar campanha antes de /resumable", () => {
-    // Com o modo INDEFINIDO o efeito de hash early-return ANTES de emitir a
-    // request: a resposta precoce não pode existir — a descoberta server-
-    // driven é a autoridade e o hash só atua após a política definida.
-    expect(recuperacaoPorHashPermitida(estado("INDEFINIDO", true))).toBe(false);
-  });
-
-  it("3) SINGLE após descoberta → hash pode funcionar como conveniência", () => {
-    expect(recuperacaoPorHashPermitida(estado("SINGLE"))).toBe(true);
-    expect(recuperacaoPorHashPermitida(estado("SINGLE", true))).toBe(true);
-  });
-
-  it("4) MULTIPLE sem seleção → continua bloqueado", () => {
-    expect(recuperacaoPorHashPermitida(estado("MULTIPLE"))).toBe(false);
-  });
-
-  it("5) MULTIPLE após detail explícito → permitido (converge à selecionada)", () => {
-    expect(recuperacaoPorHashPermitida(estado("MULTIPLE", true))).toBe(true);
-  });
-
-  it("6) EMPTY → bloqueado (seleção aplicada ou não)", () => {
-    expect(recuperacaoPorHashPermitida(estado("EMPTY"))).toBe(false);
-    expect(recuperacaoPorHashPermitida(estado("EMPTY", true))).toBe(false);
+  it("logout/removeItem preservado como limpeza HISTÓRICA; hash nunca é lido nem gravado", () => {
+    // Justificativa do removeItem (gate 01B.1 item 6): remove resíduos de
+    // ic_campanha_hash gravados por versões anteriores; não alimenta
+    // nenhuma recuperação — não existe leitor da chave.
+    expect(fonteComponente.split("sessionStorage.removeItem(LIMPEZA_RETOMADA.chaveHashSessao)").length - 1).toBe(1);
+    expect(fonteComponente).not.toContain("sessionStorage.getItem(CHAVE_HASH_SESSAO)");
+    expect(fonteComponente).not.toContain("sessionStorage.setItem(CHAVE_HASH_SESSAO");
+    // A janela server-driven de retomada não contém NENHUMA referência a
+    // /persisted (os 2 consumidores restantes estão nos fluxos de criação).
+    const janela = fonteComponente.indexOf("Retomada SERVER-DRIVEN");
+    const fimJanela = fonteComponente.indexOf("async function retomarCampanhaSelecionada");
+    const recorte = fonteComponente.slice(janela, fimJanela);
+    expect(recorte).not.toContain("/api/campaigns/persisted");
+    expect(recorte).not.toContain("fetch(");
   });
 });

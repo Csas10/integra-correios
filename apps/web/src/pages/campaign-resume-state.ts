@@ -70,71 +70,34 @@ export function disposicaoRetomada(
 }
 
 // ---------------------------------------------------------------------------
-// CORRETIVO MULTIPLE / HASH RACE — coordenação determinística entre a
-// descoberta server-driven (AUTORIDADE da retomada) e a recuperação legado
-// por hash (conveniência de precisão). A recuperação por hash NUNCA é
-// mecanismo paralelo de seleção:
-//   · INDEFINIDO (descoberta em voo) → hash NEM sequer inicia (/persisted
-//     "mais rápido" não existe: a request só sai após a política definida);
-//   · MULTIPLE sem seleção explícita → hash NÃO seleciona campanha;
-//   · EMPTY → nenhuma campanha é reativada;
-//   · SINGLE → hash converge para a MESMA campanha autorizada;
-//   · MULTIPLE pós-seleção explícita → converge para a selecionada.
-// Quando o modo muda, o efeito de hash re-executa e o cleanup cancela o
-// /persisted em voo — uma resposta atrasada NÃO reativa campanha depois de
-// a descoberta ter determinado o modo. Session Storage segue conveniência,
-// nunca autoridade.
+// UX-FLOW-01B SERVER-DRIVEN RECOVERY AUTHORITY — corretivo
+// LEGACY_HASH_RECOVERY_OVERWRITES_SERVER_DRIVEN_STATE: o gate de recuperação
+// por hash (`recuperacaoPorHashPermitida`) e o efeito legado que o consumia
+// foram REMOVIDOS. `/api/campaigns/resumable` + `/api/campaigns/detail` são a
+// AUTORIDADE ÚNICA da recuperação autenticada:
+//   · SINGLE → detail automático aplica a campanha;
+//   · MULTIPLE → somente seleção explícita humana chama detail;
+//   · EMPTY/INDEFINIDO → nenhuma recuperação.
+// O hash no Session Storage é conveniência histórica write-only (setItem
+// preservado): nunca dispara GET /api/campaigns/persisted, nunca inicia
+// recuperação concorrente e nunca apaga campanha aplicada por detail.
+// Os únicos consumidores legítimos de /persisted são os fluxos de CRIAÇÃO
+// (persistirCampanha / criarLoteCampanha), escopo explicitamente separado.
 // ---------------------------------------------------------------------------
 
 /** Modo determinado EXCLUSIVAMENTE pela descoberta (GET /api/campaigns/resumable). */
 export type ModoDescobertaRetomada = "INDEFINIDO" | "EMPTY" | "SINGLE" | "MULTIPLE";
 
-/** Ordem da autoridade (descoberta) para o mecanismo legado de hash. */
-export type OrdemRetomada =
-  /** 2+ retomáveis: hash NÃO seleciona — só clique humano (detail). */
-  | { readonly ordem: "RESPEITAR_SELECAO" }
-  /** 1 retomável: hash pode atuar — converge à MESMA campanha autorizada. */
-  | { readonly ordem: "APLICAR_CAMPANHA" }
-  /** 0 retomáveis: nenhuma campanha ativa — hash não reativa nada. */
-  | { readonly ordem: "LIMPAR_SELECAO" };
-
-/** Ordem derivada da cardinalidade total determinada pela descoberta. */
-export function ordemRetomadaParaRecuperacaoPorHash(
-  totalRetomaveis: number,
-): OrdemRetomada {
-  if (totalRetomaveis >= 2) return { ordem: "RESPEITAR_SELECAO" };
-  if (totalRetomaveis === 1) return { ordem: "APLICAR_CAMPANHA" };
-  return { ordem: "LIMPAR_SELECAO" };
-}
-
-export interface EstadoRetomadaLogado {
-  /** Modo determinado pela descoberta (resumable) — a autoridade. */
-  readonly modo: ModoDescobertaRetomada;
-  /** true somente após detail aplicado (SINGLE automático OU clique humano). */
-  readonly campanhaAplicada: boolean;
-}
-
 /**
- * Gate determinístico da recuperação por hash: a UI só executa
- * GET /api/campaigns/persisted?hash=... quando este gate permite.
+ * Chave LEGADO do Session Storage (UX-FLOW-01B.1 DEAD HASH LIFECYCLE CLEANUP).
+ * Não há leitura nem gravação desta chave no código corrente: ela existe
+ * apenas para o logout REMOVER resíduos gravados por versões anteriores.
+ * Não alimenta nenhuma recuperação.
  */
-export function recuperacaoPorHashPermitida(estado: EstadoRetomadaLogado): boolean {
-  if (estado.modo === "SINGLE") return true;
-  if (estado.modo === "MULTIPLE") return estado.campanhaAplicada;
-  // EMPTY: nenhuma campanha é reativada. INDEFINIDO (micro-gate FINAL HASH
-  // AUTHORITY): a descoberta server-driven ainda NÃO determinou a política —
-  // a recuperação por hash só pode INICIAR depois dela. Assim, uma resposta
-  // de /persisted "mais rápida" que /resumable não pode selecionar campanha
-  // antes da autoridade: com o gate fechado a request nem chega a ser feita
-  // (o cleanup permanece como segunda barreira para respostas tardias).
-  return false;
-}
-
-/** Reset local completo (logout): nenhum estado operacional sobrevive. */
 export const CHAVE_HASH_SESSAO = "ic_campanha_hash";
+/** Reset local completo (logout): nenhum estado operacional sobrevive. */
 export const LIMPEZA_RETOMADA = {
   chaveHashSessao: CHAVE_HASH_SESSAO,
-  hashSessao: "",
   campanha: null,
   modo: "INDEFINIDO",
   retomada: { status: "indefinida" },

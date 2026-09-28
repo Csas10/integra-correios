@@ -78,9 +78,12 @@ export function disposicaoRetomada(
 //   · SINGLE → detail automático aplica a campanha;
 //   · MULTIPLE → somente seleção explícita humana chama detail;
 //   · EMPTY/INDEFINIDO → nenhuma recuperação.
-// O hash no Session Storage é conveniência histórica write-only (setItem
-// preservado): nunca dispara GET /api/campaigns/persisted, nunca inicia
-// recuperação concorrente e nunca apaga campanha aplicada por detail.
+// UX-FLOW-01B.1 DEAD HASH LIFECYCLE CLEANUP: o ciclo de recuperação por
+// hash está EXTINTO — zero leituras e zero gravações de ic_campanha_hash
+// no código corrente. A chave legado sobrevive EXCLUSIVAMENTE para a
+// remoção histórica no logout (removeItem de resíduos de versões
+// anteriores). O Session Storage NÃO é autoridade: /resumable + /detail
+// são a única autoridade da retomada.
 // Os únicos consumidores legítimos de /persisted são os fluxos de CRIAÇÃO
 // (persistirCampanha / criarLoteCampanha), escopo explicitamente separado.
 // ---------------------------------------------------------------------------

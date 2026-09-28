@@ -256,7 +256,7 @@ describe("GATE: SERVER-DRIVEN RECOVERY AUTHORITY — efeito legado removido (fon
   });
 });
 
-describe("GATE: política de hash — conveniência write-only e limpeza de sessão", () => {
+describe("GATE: ciclo de hash extinto — Session Storage não é autoridade", () => {
   it("I: LIMPEZA_RETOMADA preserva o reset completo no logout (isolamento por operador)", () => {
     expect(LIMPEZA_RETOMADA.chaveHashSessao).toBe("ic_campanha_hash");
     expect(LIMPEZA_RETOMADA.campanha).toBeNull();

@@ -274,18 +274,22 @@ export async function verificarProvaAutorizacaoHumanaCampanha(
     // nenhum detalhe do desvio é revelado (defesa em profundidade).
     return { verificada: false, motivo: "VINCULO_INCOMPATIVEL" };
   }
+  // Antirreplay ESTRUTURAL: a referência precisa ser um evento de
+  // AUTORIZAÇÃO real deste lote, carregando a ação autorizada. O vínculo do
+  // item e da chave idempotente já está no HMAC recomputável (determinístico
+  // sobre dados derivados do banco + a própria referência).
   const vigente = await pool.query(
     `SELECT count(*)::int AS total FROM evento_auditoria
       WHERE agregado_tipo = 'CAMPANHA_EXECUCAO'
         AND tipo = $1
         AND agregado_id = $2
         AND id = $3::uuid
-        AND metadados->>'chave_idempotencia' = $4`,
+        AND metadados->>'acao' = $4`,
     [
       CODIGO_EVENTO_AUTORIZACAO,
       apresentada.referencia,
       apresentada.referencia,
-      esperado.chaveIdempotencia,
+      ACAO_AUTORIZADA_EXECUCAO,
     ],
   );
   if ((vigente.rows[0] as { total: number } | undefined)?.total !== 1) {

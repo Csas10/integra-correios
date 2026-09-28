@@ -783,22 +783,37 @@ describeDb("SLICE_03B — jornada de controle (POSTGRESQL_INTEGRATION)", () => {
 
   it("prova de destinatário adulterada: fingerprint divergente do snapshot é rejeitado", async () => {
     const p = pool!;
-    const itemIdAdulterado = randomUUID();
     const agora = new Date().toISOString();
+    // Lote dedicado com UM item válido (ordem 1 mapeia o snapshot) cujo
+    // fingerprint persistido foi ADULTERADO (não deriva do snapshot).
+    const campanhaId = randomUUID();
+    const loteId = randomUUID();
+    const itemId = randomUUID();
+    const hashAprovacao = createHash("sha256").update("adulter-" + campanhaId).digest("hex");
+    const registros = [
+      {
+        profissional_id: "PF-CTRL-ADV",
+        nome: "Sintetico Adulterado",
+        email_normalizado: "adulterado.sintetico@exemplo.test",
+        status_validacao: "APTO",
+      },
+    ];
     await p.query(
-      "INSERT INTO outbox_campanha (id, lote_campanha_id, ordem, destinatario_fingerprint, payload_snapshot, estado, criada_em) VALUES ($1, $2, 99, $3, $4::jsonb, 'PREPARADO', $5)",
-      [
-        itemIdAdulterado,
-        cena.loteCampanhaId,
-        "ff".repeat(32),
-        JSON.stringify({ ordem: 99 }),
-        agora,
-      ],
+      "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'CTRL_TESTE_V1', $4, $5::jsonb, 1, 1, 0, 1, 'LOTE_CRIADO', $6, $6)",
+      [campanhaId, operadorId, hashAprovacao, hashAprovacao, JSON.stringify({ registros, total: 1 }), agora],
+    );
+    await p.query(
+      "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'CTRL_TESTE_V1', 'PREPARADO', 1, $4)",
+      [loteId, campanhaId, "CTRL_ADV_" + loteId.slice(0, 8), agora],
+    );
+    await p.query(
+      "INSERT INTO outbox_campanha (id, lote_campanha_id, ordem, destinatario_fingerprint, payload_snapshot, estado, criada_em) VALUES ($1, $2, 1, $3, $4::jsonb, 'PREPARADO', $5)",
+      [itemId, loteId, "ff".repeat(32), JSON.stringify({ ordem: 1 }), agora],
     );
     const verificacao = await verificarProvaDestinatarioCampanha(p, {
-      campanhaId: cena.campanhaId,
-      loteCampanhaId: cena.loteCampanhaId,
-      itemId: itemIdAdulterado,
+      campanhaId,
+      loteCampanhaId: loteId,
+      itemId,
     });
     expect(verificacao.verificada).toBe(false);
     expect(verificacao.motivo).toBe("FINGERPRINT_DIVERGENTE");

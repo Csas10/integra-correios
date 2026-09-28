@@ -104,6 +104,13 @@ export interface PfUpdateCampaignPolicy {
    * continua obrigatório na execução.
    */
   readonly canExecute: boolean;
+  /**
+   * Slice-03B: capacidade de PREPARAÇÃO do lote (HOLD → PREPARADO), SEMPRE
+   * SEPARADA da execução. Default fail-closed: ausente ⇒ false. Preparar
+   * NUNCA liga o Gmail: toca apenas lote_campanha/outbox_campanha (a outbox
+   * PREPARADO continua não capturável — o claim exige lote ATIVO).
+   */
+  readonly canPrepareBatch: boolean;
   readonly realSendEnabled: boolean;
 }
 
@@ -119,6 +126,7 @@ export function carregarPoliticaCampanhaAtualizacao(
     canPersistImport: env.PF_CAMPAIGN_PERSIST_ENABLED === "true",
     canCreateBatch: env.PF_CAMPAIGN_BATCH_ENABLED === "true",
     canExecute: env.PF_CAMPAIGN_EXECUTE_ENABLED === "true",
+    canPrepareBatch: env.PF_CAMPAIGN_PREPARE_ENABLED === "true",
     realSendEnabled: env.REAL_SEND_ENABLED === "true",
   };
 }

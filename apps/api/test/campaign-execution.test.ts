@@ -42,6 +42,7 @@ const politicaFechada: PoliticaExecucaoCampanha = {
   canPersistImport: false,
   canCreateBatch: false,
   canExecute: false,
+  canPrepareBatch: false,
   realSendEnabled: false,
 };
 const politicaAberta: PoliticaExecucaoCampanha = {
@@ -103,6 +104,7 @@ function codigoSemComentarios(fonte: string): string {
 
 describe("SLICE_03A.1 — política: autoridade única e fail-closed (BEHAVIORAL)", () => {
   it("autoridade única: sem nenhuma flag, a política carregada é integralmente fechada", () => {
+    // Slice-03B: canPrepareBatch entra na MESMA fronteira, também fechado.
     expect(carregarPoliticaCampanhaAtualizacao({})).toEqual({
       enabled: false,
       phase: "FOUNDATION",
@@ -110,6 +112,7 @@ describe("SLICE_03A.1 — política: autoridade única e fail-closed (BEHAVIORAL
       canPersistImport: false,
       canCreateBatch: false,
       canExecute: false,
+      canPrepareBatch: false,
       realSendEnabled: false,
     });
   });

@@ -31,7 +31,38 @@ type CampaignPolicy = {
   canPersistImport: boolean;
   canCreateBatch: boolean;
   canExecute: false;
+  canPrepareBatch: boolean;
   realSendEnabled: boolean;
+};
+
+/** SLICE-03B — readiness operacional read-only (server-driven). */
+type AcaoOperacao = {
+  permitida: boolean;
+  bloqueios: readonly string[];
+};
+
+type ReadinessOperacional = {
+  lote: {
+    loteCampanhaId: string;
+    codigo: string;
+    estado: string;
+    totalItens: number;
+    contagemPorEstado: Readonly<Record<string, number>>;
+  };
+  politicas: {
+    canPrepareBatch: boolean;
+    canExecute: boolean;
+    realSendEnabled: boolean;
+  };
+  autorizacaoHumana: { concedida: boolean; referenciaPresente: boolean };
+  acoes: {
+    PREPARAR_LOTE: AcaoOperacao;
+    AUTORIZAR_EXECUCAO: AcaoOperacao;
+    EXECUTAR_ITEM: AcaoOperacao;
+  };
+  executavel: false;
+  envioRealDesabilitado: boolean;
+  proximaAcao: string;
 };
 
 type RegistroAprovacao = {
@@ -272,6 +303,14 @@ type RetomadaEstado =
   | { readonly status: "multipla"; readonly campanhas: readonly CampanhaRetomavelResumo[] };
 
 /** Detalhe autenticado da campanha do PRÓPRIO operador (seleção explícita). */
+/** Readiness read-only do plano de controle (SLICE-03B) — sem mutação. */
+async function obterReadinessOperacional(campanhaId: string): Promise<ReadinessOperacional> {
+  const resposta = await fetchJson<ReadinessOperacional>(
+    `/api/campaigns/operational-readiness?campanhaId=${encodeURIComponent(campanhaId)}`,
+  );
+  return resposta;
+}
+
 async function obterCampanhaDetalhe(campanhaId: string): Promise<CampanhaPersistida> {
   const resposta = await fetchJson<{ campanha: CampanhaPersistida }>(
     `/api/campaigns/detail?campanhaId=${encodeURIComponent(campanhaId)}`,
@@ -339,6 +378,10 @@ export function CampaignWorkspace() {
   // EMPTY/SINGLE/MULTIPLE é registro audível da decisão do servidor.
   // Nenhum mecanismo legado por hash coordena ou disputa esta decisão.
   const [modoRetomada, setModoRetomada] = useState<ModoDescobertaRetomada>("INDEFINIDO");
+  // SLICE-03B — readiness do plano de controle: estado DERIVADO do servidor
+  // (read-only). Sem Session Storage; nenhuma autorização é decidida aqui.
+  const [readiness, setReadiness] = useState<ReadinessOperacional | null>(null);
+  const [readinessErro, setReadinessErro] = useState("");
 
   async function loadMe(): Promise<boolean> {
     try {
@@ -942,6 +985,35 @@ export function CampaignWorkspace() {
       }),
     [base, aprovacao, status, campanha],
   );
+
+  // SLICE-03B — readiness segue a campanha aplicada (server-driven; reload
+  // reconstrói tudo a partir do PostgreSQL; nenhuma autoridade local).
+  useEffect(() => {
+    if (!campanha?.campanhaId) {
+      setReadiness(null);
+      setReadinessErro("");
+      return;
+    }
+    let ativo = true;
+    void obterReadinessOperacional(campanha.campanhaId)
+      .then((corpo) => {
+        if (!ativo) return;
+        setReadiness(corpo);
+        setReadinessErro("");
+      })
+      .catch((error: unknown) => {
+        if (!ativo) return;
+        setReadiness(null);
+        setReadinessErro(
+          error instanceof ApiCampanhaError
+            ? error.message
+            : "Readiness operacional indisponível.",
+        );
+      });
+    return () => {
+      ativo = false;
+    };
+  }, [campanha?.campanhaId]);
 
   // UX-FLOW-01A — a macroetapa visível é DERIVADA do estado operacional
   // (sessão, base, aprovação, campanha/lote). A navegação representa o
@@ -1816,6 +1888,83 @@ export function CampaignWorkspace() {
           </section>
         ) : null}
 
+
+        {/* SLICE-03B — Plano de controle operacional (Macroetapa 4):
+            readiness read-only, bloqueios objetivos e ações que refletem
+            EXCLUSIVAMENTE a capacidade retornada pelo servidor. Nenhuma
+            ação envia, nenhuma deriva autorização no cliente. */}
+        {mostrarOperacao && campanha ? (
+          <section className="campaign-panel" aria-labelledby="controle-operacional">
+            <h2 id="controle-operacional">Controle operacional (readiness)</h2>
+            {readinessErro ? (
+              <p role="alert" className="campaign-session-error">{readinessErro}</p>
+            ) : null}
+            {!readiness && !readinessErro ? (
+              <p role="status">Carregando readiness operacional…</p>
+            ) : null}
+            {readiness ? (
+              <>
+                <ul className="campaign-flow-stats">
+                  <li>
+                    Lote: <code>{readiness.lote.codigo}</code> · estado{" "}
+                    <strong>{readiness.lote.estado}</strong> · {readiness.lote.totalItens}{" "}
+                    item(ns)
+                  </li>
+                  <li>
+                    Itens por estado:{" "}
+                    {Object.entries(readiness.lote.contagemPorEstado).length === 0
+                      ? "—"
+                      : Object.entries(readiness.lote.contagemPorEstado)
+                          .map(([estado, total]) => `${estado}=${total}`)
+                          .join(" · ")}
+                  </li>
+                  <li>
+                    Políticas: canPrepareBatch={String(readiness.politicas.canPrepareBatch)} ·
+                    canExecute={String(readiness.politicas.canExecute)} ·
+                    realSendEnabled={String(readiness.politicas.realSendEnabled)}
+                  </li>
+                  <li>
+                    Autorização humana:{" "}
+                    {readiness.autorizacaoHumana.concedida
+                      ? "vigente (registro auditado)"
+                      : "ausente"}
+                  </li>
+                  <li>
+                    Provider: indisponível nesta fase · envio real desabilitado:{" "}
+                    {String(readiness.envioRealDesabilitado)}
+                  </li>
+                  <li>Próxima ação necessária: {readiness.proximaAcao}</li>
+                </ul>
+                {readiness.lote.estado === "HOLD" || readiness.lote.estado === "PREPARADO" ? (
+                  <p className="campaign-actions-note">
+                    <strong>
+                      LOTE_{readiness.lote.estado === "HOLD" ? "CRIADO" : "PREPARADO"} /{" "}
+                      {readiness.lote.estado}
+                    </strong>{" "}
+                    — {readiness.lote.totalItens} itens · execução indisponível · motivo:{" "}
+                    {readiness.acoes.EXECUTAR_ITEM.bloqueios.join(", ") || "políticas fechadas"} ·
+                    próxima ação: {readiness.proximaAcao}
+                  </p>
+                ) : null}
+                <div className="campaign-panel-actions">
+                  <button type="button" disabled={!readiness.acoes.PREPARAR_LOTE.permitida}>
+                    Preparar lote
+                  </button>
+                  <button type="button" disabled={!readiness.acoes.AUTORIZAR_EXECUCAO.permitida}>
+                    Autorizar execução
+                  </button>
+                  <button type="button" disabled>
+                    Executar (bloqueada — nada é enviado)
+                  </button>
+                </div>
+                <small role="status">
+                  Ações refletem a capacidade retornada pelo servidor. Com as políticas atuais
+                  todas permanecem desabilitadas; nenhuma mutação operacional acontece nesta fase.
+                </small>
+              </>
+            ) : null}
+          </section>
+        ) : null}
 
         {/* Macroetapa 4 — Acompanhamento (estado persistido + sessão) */}
         {mostrarOperacao && (

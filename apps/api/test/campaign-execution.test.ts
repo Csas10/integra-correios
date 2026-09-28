@@ -1262,7 +1262,7 @@ describeDb("SLICE_03A.1 — corridas, falhas e restart (POSTGRESQL_INTEGRATION)"
     expect(await contarEventos(pool!, itemDefinitivaId, "EXEC_FALHA_DEFINITIVA")).toBe(1);
   });
 
-  it("corrida do claim: 2 POOLS separados, exatamente 1 vencedor, 1 provider, 1 EXEC_CLAIM", async () => {
+  it("corrida do claim: 2 POOLS separados — exatamente 1 vencedor; o perdedor observa ENFILEIRADO (BLOQUEADO) ou ENVIADO (JA_CONCLUIDO) conforme o interleaving", async () => {
     const { NodePostgresPool } = await import("@integra-correios/persistence");
     const poolB = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE!, max: 2 });
     try {
@@ -1278,16 +1278,55 @@ describeDb("SLICE_03A.1 — corridas, falhas e restart (POSTGRESQL_INTEGRATION)"
         executar(pool!, providerA, comando),
         executar(poolB, providerB, comando),
       ]);
+      // Invariantes globais válidos para AMBOS os ordenamentos reais:
       const enviados = [a, b].filter((r) => r.resultado === "ENVIADO");
+      const naoClaimados = [a, b].filter((r) => r.resultado === "NAO_CLAIMADO");
       expect(enviados.length).toBe(1);
+      expect(naoClaimados.length).toBe(1);
       expect(providerA.chamadas + providerB.chamadas).toBe(1);
       expect(await estadoDoItem(pool!, itemCorridaId)).toBe("ENVIADO");
       expect(await contarEventos(pool!, itemCorridaId, "EXEC_CLAIM")).toBe(1);
+      expect(await contarEventos(pool!, itemCorridaId, "EXEC_TENTATIVA_INICIADA")).toBe(1);
       expect(await contarEventos(pool!, itemCorridaId, "EXEC_RECEIPT")).toBe(1);
+      expect(await contarEventos(pool!, itemCorridaId, "EXEC_SETTLEMENT")).toBe(1);
+      expect(await contarEventos(pool!, itemCorridaId, "EXEC_FALHA_PRE_PROVIDER")).toBe(0);
+      expect(await contarEventos(pool!, itemCorridaId, "EXEC_FALHA_DEFINITIVA")).toBe(0);
+      expect(await contarEventos(pool!, itemCorridaId, "EXEC_AMBIGUO")).toBe(0);
+      const vencedor = a.resultado === "ENVIADO" ? a : b;
       const perdedor = a.resultado === "ENVIADO" ? b : a;
+      const providerPerdedor = vencedor === a ? providerB : providerA;
       expect(perdedor.resultado).toBe("NAO_CLAIMADO");
       if (perdedor.resultado !== "NAO_CLAIMADO") return;
-      expect(perdedor.claim.resultado).toBe("BLOQUEADO");
+      // Contrato do perdedor: SOMENTE os dois desfechos seguros. CLAIMADO,
+      // NAO_ENCONTRADO ou qualquer outro resultado é rejeitado.
+      if (
+        perdedor.claim.resultado !== "BLOQUEADO" &&
+        perdedor.claim.resultado !== "JA_CONCLUIDO"
+      ) {
+        throw new Error("desfecho inseguro do perdedor: " + perdedor.claim.resultado);
+      }
+      expect(providerPerdedor.chamadas).toBe(0);
+      const rejeitados = await contarEventos(pool!, itemCorridaId, "EXEC_CLAIM_REJEITADO");
+      if (perdedor.claim.resultado === "BLOQUEADO") {
+        // Interleaving 1: trava obtida após o claim do vencedor e antes do
+        // settlement → item ENFILEIRADO → rejeição com bloqueio específico.
+        expect(perdedor.claim.bloqueios).toContain("ITEM_NAO_PREPARADO");
+        expect(rejeitados).toBe(1);
+      } else {
+        // Interleaving 2: trava obtida somente após o settlement → item
+        // ENVIADO → idempotente com a MESMA chave persistida do vencedor.
+        expect(perdedor.claim.estado).toBe("ENVIADO");
+        const receipt = await pool!.query(
+          "SELECT metadados FROM evento_auditoria WHERE agregado_id = $1 AND tipo = 'EXEC_RECEIPT'",
+          [itemCorridaId],
+        );
+        const chaveVencedor = String(
+          (receipt.rows[0] as { metadados: { chave_idempotencia: string } }).metadados
+            .chave_idempotencia,
+        );
+        expect(perdedor.claim.chaveIdempotencia).toBe(chaveVencedor);
+        expect(rejeitados).toBe(0);
+      }
     } finally {
       await poolB.close();
     }

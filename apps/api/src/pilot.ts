@@ -12,6 +12,7 @@ import {
   type CommunicationSource,
   type EncryptedValue,
 } from "@integra-correios/persistence";
+import { RESERVED_PILOT_BATCH_CODE } from "./pilot-domain.js";
 import { executarWorkerUmaVezLive } from "@integra-correios/worker";
 import { providerGmailConfigurado } from "@integra-correios/worker";
 
@@ -529,7 +530,8 @@ export async function statusOutbox(
 // A preparação é IDEMPOTENTE pelo código canônico do lote (UNIQUE origem+codigo).
 // ---------------------------------------------------------------------------
 
-export const CODIGO_LOTE_TESTE_CONTROLADO = "CONTROLLED_GMAIL_TEST";
+/** Código do lote do piloto — constante compartilhada (Slice-03A.1). */
+export const CODIGO_LOTE_TESTE_CONTROLADO = RESERVED_PILOT_BATCH_CODE;
 
 /**
  * Código canônico do lote DRY_RUN histórico validado diretamente no Neon:

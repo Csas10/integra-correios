@@ -287,7 +287,7 @@ export async function verificarProvaAutorizacaoHumanaCampanha(
         AND metadados->>'acao' = $4`,
     [
       CODIGO_EVENTO_AUTORIZACAO,
-      apresentada.referencia,
+      esperado.loteCampanhaId,
       apresentada.referencia,
       ACAO_AUTORIZADA_EXECUCAO,
     ],

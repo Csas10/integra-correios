@@ -23,6 +23,7 @@ import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   ACAO_AUTORIZADA_EXECUCAO,
+  CODIGO_EVENTO_AUTORIZACAO,
   CampaignControlError,
   avaliarAcaoOperacaoCampanha,
   emitirProvaAutorizacaoHumanaCampanha,
@@ -35,6 +36,7 @@ import {
   verificarProvaAutorizacaoHumanaCampanha,
   verificarProvaDestinatarioCampanha,
   type CampanhaPool,
+  type CampanhaSqlExecutor,
   type MotivoBloqueioAcaoOperacao,
 } from "../src/campaign-control.js";
 import { chaveIdempotenciaExecucao } from "../src/campaign-execution.js";
@@ -348,6 +350,66 @@ describe("SLICE_03B — provas server-side (BEHAVIORAL)", () => {
     const ausente = await verificarProvaAutorizacaoHumanaCampanha(poolVazio, esperado, null);
     expect(ausente.verificada).toBe(false);
     expect(ausente.motivo).toBe("FORMATO_INVALIDO");
+  });
+
+  it("bind da autorização: agregado_id=$2 = loteCampanhaId, id=$3::uuid = referência (regressão AUTH_EVENT_AGGREGATE_BIND_MISMATCH)", async () => {
+    // Fixtura exige referencia ≠ loteCampanhaId; falha determinística se degenerar.
+    const nonce = randomUUID();
+    const chaveIdempotencia = chaveIdempotenciaExecucao({
+      campanhaId: ids.campanhaId,
+      loteCampanhaId: ids.loteCampanhaId,
+      itemId: ids.itemId,
+      destinatarioFingerprint: "aa".repeat(32),
+      hashAprovacao: "bb".repeat(32),
+    });
+    const esperadoBind = { ...ids, chaveIdempotencia };
+    const prova = emitirProvaAutorizacaoHumanaCampanha({
+      ...ids,
+      chaveIdempotencia,
+      acaoAutorizada: ACAO_AUTORIZADA_EXECUCAO,
+      nonce,
+    });
+    const referencia = prova.referencia;
+    expect(referencia).toBe(nonce);
+    if (referencia === esperadoBind.loteCampanhaId) {
+      throw new Error("fixtura degenerada: referencia igual a loteCampanhaId");
+    }
+
+    // Executor falso: registra SQL/parâmetros; evento vigente (total=1) e
+    // nenhum settlement posterior (total=0).
+    const consultas: Array<{ sql: string; values: readonly unknown[] }> = [];
+    const executorFalso: CampanhaSqlExecutor = {
+      query: async (sql: string, values: readonly unknown[] = []) => {
+        consultas.push({ sql, values });
+        return { rows: [{ total: consultas.length === 1 ? 1 : 0 }], rowCount: 1 };
+      },
+    };
+
+    const verificacao = await verificarProvaAutorizacaoHumanaCampanha(
+      executorFalso,
+      esperadoBind,
+      { valor: prova.valor, referencia },
+    );
+    expect(verificacao.verificada).toBe(true);
+    expect(verificacao.motivo).toBe(null);
+    expect(consultas.length).toBe(2);
+    const antirreplay = consultas[0];
+    const settlement = consultas[1];
+    if (!antirreplay || !settlement) {
+      throw new Error("verificador não emitiu as duas consultas esperadas");
+    }
+    expect(antirreplay.sql).toContain("agregado_id = $2");
+    expect(antirreplay.sql).toContain("id = $3::uuid");
+    expect(antirreplay.sql).toContain("metadados->>'acao' = $4");
+    expect(antirreplay.values[0]).toBe(CODIGO_EVENTO_AUTORIZACAO);
+    // REGRESSÃO: $2 é o lote da campanha — NUNCA a referência do evento.
+    expect(antirreplay.values[1]).toBe(esperadoBind.loteCampanhaId);
+    expect(antirreplay.values[1]).not.toBe(referencia);
+    expect(antirreplay.values[2]).toBe(referencia);
+    expect(antirreplay.values[3]).toBe(ACAO_AUTORIZADA_EXECUCAO);
+    expect(settlement.sql).toContain("agregado_id = $1");
+    expect(settlement.values[0]).toBe(esperadoBind.itemId);
+    expect(settlement.values[1]).toBe(referencia);
   });
 });
 

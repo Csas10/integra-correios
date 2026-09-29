@@ -76,6 +76,18 @@ function semComentarios(fonte: string): string {
   return fonte.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 }
 
+// 03C.2A.4 — MATRIZ EXPLÍCITA DE POLÍTICA POR CENÁRIO (fonte única).
+// Somente a string literal "true" habilita cada flag no loader; a matriz
+// torna explícito, por cenário, quais gates sintéticos estão abertos.
+const MATRIZ_POLITICA_CENARIO = {
+  A: { canarySend: false, execute: true, realSend: true },
+  B: { canarySend: true, execute: true, realSend: true },
+  D: { canarySend: true, execute: true, realSend: true },
+  E: { canarySend: false, execute: false, realSend: false },
+} as const;
+type MatrizGatesCenario = (typeof MATRIZ_POLITICA_CENARIO)[keyof typeof MATRIZ_POLITICA_CENARIO];
+type CenarioCanario = keyof typeof MATRIZ_POLITICA_CENARIO;
+
 function politicaBase(): PfUpdateCampaignPolicy {
   return {
     enabled: true,
@@ -259,6 +271,38 @@ describe("SLICE_03C.2A.2 — contratos de fixture (fonte única, determinístico
     const sufixoProibido = "CONTA_ESPERADA" + " " + '+' + " " + '"' + "+" + '"';
     expect(fonteTeste).not.toContain(sufixoProibido);
     expect(fonteTeste).toContain("const alvo = detalhe ?? CONTA_ESPERADA;");
+  });
+
+  it("03C.2A.4. matriz de política explícita por cenário (fonte única, gates independentes)", () => {
+    const fonteTeste = readFileSync(new URL("./campaign-canary.test.ts", import.meta.url), "utf8");
+    // (a) Contrato da matriz por cenário (tipada, sem default implícito).
+    expect(MATRIZ_POLITICA_CENARIO.A).toEqual({ canarySend: false, execute: true, realSend: true });
+    expect(MATRIZ_POLITICA_CENARIO.B).toEqual({ canarySend: true, execute: true, realSend: true });
+    expect(MATRIZ_POLITICA_CENARIO.D).toEqual({ canarySend: true, execute: true, realSend: true });
+    expect(MATRIZ_POLITICA_CENARIO.E).toEqual({ canarySend: false, execute: false, realSend: false });
+    // (b) TODAS as chamadas de rota passam a matriz explícita (5 chamadas: A,B,D,E,E).
+    const chamadas = fonteTeste.match(/ambienteBase\(cena\.fingerprints\[0\]!, MATRIZ_POLITICA_CENARIO\.[A-E]\)/g) ?? [];
+    expect(chamadas.length).toBe(5);
+    expect(new Set(chamadas.map((c) => c.slice(-2, -1))).size).toBe(4);
+    // (c) ambienteBase deriva cada gate EXPLICITAMENTE da matriz — nunca ausente.
+    for (const [chave, gate] of [
+      ["PF_CAMPAIGN_CANARY_SEND_ENABLED", "canarySend"],
+      ["PF_CAMPAIGN_EXECUTE_ENABLED", "execute"],
+      ["REAL_SEND_ENABLED", "realSend"],
+    ] as const) {
+      expect(fonteTeste).toContain('process.env.' + chave + ' = gates.' + gate + ' ? "true" : "false";');
+    }
+    // (d) Contrato do loader: SOMENTE o literal exato "true" habilita, cada
+    // flag independentemente; ausência/valores diversos ⇒ fail-closed.
+    for (const [chave, propriedade] of [
+      ["PF_CAMPAIGN_CANARY_SEND_ENABLED", "canarySendEnabled"],
+      ["PF_CAMPAIGN_EXECUTE_ENABLED", "canExecute"],
+      ["REAL_SEND_ENABLED", "realSendEnabled"],
+    ] as const) {
+      expect(carregarPoliticaCampanhaAtualizacao({ [chave]: "true" })[propriedade]).toBe(true);
+      expect(carregarPoliticaCampanhaAtualizacao({ [chave]: "1" })[propriedade]).toBe(false);
+      expect(carregarPoliticaCampanhaAtualizacao({})[propriedade]).toBe(false);
+    }
   });
 
   it("03C.2A.3. nonce=12 bytes, authTag=16 bytes, chave de fingerprint válida (contrato do schema)", () => {
@@ -759,6 +803,50 @@ describe("SLICE_03C.2A — HTTP fail-closed (contrato determinístico)", () => {
 const DB_URL_AMBIENTE = ambienteOriginal.DATABASE_URL ?? "";
 const describeDb = DB_URL_AMBIENTE ? describe : describe.skip;
 
+// ---------------------------------------------------------------------------
+// 03C.2A.4 — contrato de sanitização ESTRUTURAL da resposta de readiness.
+// Allowlist das chaves públicas de corpo.oauth (tokenRefreshes é telemetria
+// numérica legítima e PERMITIDA; o substring-match bruto "token", que gerava
+// falso-positivo, foi removido SEM diluir o contrato).
+// ---------------------------------------------------------------------------
+const CHAVES_OAUTH_PUBLICAS = [
+  "configurationReady",
+  "connectionStored",
+  "expectedAccountConfigured",
+  "storedAccountMatchesExpected",
+  "encryptionConfigurationReady",
+  "executionReady",
+  "estado",
+  "tokenRefreshes",
+  "googleNetworkCalls",
+] as const;
+
+function varrerCamposProibidos(json: string, proibidos: readonly string[]): string[] {
+  const violacoes: string[] = [];
+  const visitas = (no: unknown, caminho: string): void => {
+    if (Array.isArray(no)) {
+      no.forEach((item, indice) => visitas(item, caminho + "[" + String(indice) + "]"));
+      return;
+    }
+    if (no !== null && typeof no === "object") {
+      for (const [chave, valor] of Object.entries(no as Record<string, unknown>)) {
+        const caminhoFilho = caminho + "." + chave;
+        if (proibidos.includes(chave.toLowerCase())) violacoes.push(caminhoFilho);
+        visitas(valor, caminhoFilho);
+      }
+      return;
+    }
+    if (typeof no === "string") {
+      const folha = no.toLowerCase();
+      for (const proibido of proibidos) {
+        if (folha.includes(proibido)) violacoes.push(caminho + ' ~ "' + proibido + '"');
+      }
+    }
+  };
+  visitas(JSON.parse(json), "$");
+  return violacoes;
+}
+
 describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATION)", () => {
   let pool: import("@integra-correios/persistence").NodePostgresPool | undefined;
   let despachar: Despachar;
@@ -790,10 +878,28 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE!, max: 4 });
   });
 
-  function ambienteBase(fingerprintCanario: string, canarySend: boolean): void {
+  // 03C.2A.4 — registro da cena (prova estrutural; nenhuma variável de
+  // repositório é lida ou alterada — a matriz é constante do próprio teste).
+  let matrizCenarioRegistrada: readonly [CenarioCanario, boolean, boolean, boolean] | undefined;
+  function registroMatriz(gates: MatrizGatesCenario): void {
+    const cenario = (Object.keys(MATRIZ_POLITICA_CENARIO) as CenarioCanario[]).find(
+      (k) => MATRIZ_POLITICA_CENARIO[k] === gates,
+    );
+    matrizCenarioRegistrada = cenario
+      ? [cenario, gates.canarySend, gates.execute, gates.realSend]
+      : undefined;
+  }
+
+  function ambienteBase(fingerprintCanario: string, gates: MatrizGatesCenario): void {
+    registroMatriz(gates);
     process.env.PF_CAMPAIGN_PROOF_KEY_BASE64 = CHAVE_PROVA_BASE64;
     process.env.PF_CAMPAIGN_CANARY_RECIPIENT_FINGERPRINT = fingerprintCanario;
-    process.env.PF_CAMPAIGN_CANARY_SEND_ENABLED = canarySend ? "true" : "false";
+    // Matriz 03C.2A.4: os TRÊS gates são explícitos por cenário — sem
+    // default implícito. A: canarySend fechado (prova 409); B+C/D: abertos
+    // (caminho elegível/divergente); E: TODOS fechados (readiness independe).
+    process.env.PF_CAMPAIGN_CANARY_SEND_ENABLED = gates.canarySend ? "true" : "false";
+    process.env.PF_CAMPAIGN_EXECUTE_ENABLED = gates.execute ? "true" : "false";
+    process.env.REAL_SEND_ENABLED = gates.realSend ? "true" : "false";
     process.env.GMAIL_OAUTH_CLIENT_ID = "client-id-sintetico";
     process.env.GMAIL_OAUTH_CLIENT_SECRET = "client-secret-sintetico";
     process.env.GMAIL_OAUTH_REDIRECT_URI = "https://exemplo.test/callback";
@@ -895,6 +1001,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
   // RETURNING; limpeza por id (nunca DELETE global; nunca toca dados de
   // outra suíte; executa também após falha intermediária via afterEach).
   const conexoesOAuthDaSuite: string[] = [];
+  let conexaoRecemInserida: string | undefined;
 
   // 03C.2A.3 — o helper NÃO lê env implícita: usa a MESMA constante sintética
   // do ambienteBase (FINGERPRINT_KEY_SOURCE_MATCH=true). O comportamento
@@ -904,6 +1011,9 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
   // conta que deveria corresponder. O parâmetro explícito existe SOMENTE para
   // o cenário divergente (outra.conta@exemplo.test ⇒ DIVERGENT_MISMATCH=true).
   async function conectarOAuthCorrespondente(detalhe?: string): Promise<string> {
+    // 03C.2A.4 — registrar o id da conexão ANTES de qualquer asserção
+    // intermediária: o cleanup owned por id cobre falhas em qualquer ponto.
+    conexaoRecemInserida = undefined;
     const { derivarFingerprintContaGmail } = await import("@integra-correios/mail");
     const fp = new HmacSha256Fingerprinter(Buffer.from(CHAVE_FINGERPRINT_FIXTURE_B64, "base64"));
     const alvo = detalhe ?? CONTA_ESPERADA;
@@ -914,11 +1024,17 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     );
     const id = (inserida.rows[0] as { id: string }).id;
     conexoesOAuthDaSuite.push(id);
+    conexaoRecemInserida = id;
     return id;
   }
 
   afterEach(async () => {
     // Limpeza OWNED: somente as linhas criadas por esta suíte (por id).
+    // 03C.2A.4 — a ÚLTIMA conexão inserida é incluída mesmo que o cenário
+    // falhe ANTES de qualquer asserção (failures intermediárias cobertas).
+    if (conexaoRecemInserida && !conexoesOAuthDaSuite.includes(conexaoRecemInserida)) {
+      conexoesOAuthDaSuite.push(conexaoRecemInserida);
+    }
     for (const id of conexoesOAuthDaSuite.splice(0)) {
       await pool?.query("DELETE FROM oauth_connection WHERE id = $1 AND provider = 'GMAIL'", [id]);
     }
@@ -967,7 +1083,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
       operatorId: executorIdReal,
       emails: ["canario.rota.a@exemplo.test"],
     });
-    ambienteBase(cena.fingerprints[0]!, false);
+    ambienteBase(cena.fingerprints[0]!, MATRIZ_POLITICA_CENARIO.A);
     await conectarOAuthCorrespondente(); // canarySendEnabled=FALSE
 
     const providerEspiao = {
@@ -1019,7 +1135,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
       operatorId: operatorIdB,
       emails: ["canario.rota.b@exemplo.test"],
     });
-    ambienteBase(cena.fingerprints[0]!, true);
+    ambienteBase(cena.fingerprints[0]!, MATRIZ_POLITICA_CENARIO.B);
     await conectarOAuthCorrespondente(); // canarySendEnabled=TRUE
 
     let chamadasProvider = 0;
@@ -1094,7 +1210,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
       operatorId: operatorIdD,
       emails: ["canario.rota.d@exemplo.test"],
     });
-    ambienteBase(cena.fingerprints[0]!, true);
+    ambienteBase(cena.fingerprints[0]!, MATRIZ_POLITICA_CENARIO.D);
     await conectarOAuthCorrespondente();
     // Corrompe a outbox: fingerprint persistido ≠ snapshot ≠ configuração.
     await pool!.query(
@@ -1155,7 +1271,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     vi.stubGlobal("fetch", espiaoRede);
 
     // E.1 — configuração OAuth ausente ⇒ CONFIGURATION_REQUIRED.
-    ambienteBase(cena.fingerprints[0]!, false);
+    ambienteBase(cena.fingerprints[0]!, MATRIZ_POLITICA_CENARIO.E);
     for (const chave of ["GMAIL_OAUTH_CLIENT_ID", "GMAIL_OAUTH_CLIENT_SECRET", "GMAIL_OAUTH_REDIRECT_URI"]) {
       delete process.env[chave];
     }
@@ -1172,7 +1288,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(corpo.oauth.estado).toBe("CONFIGURATION_REQUIRED");
 
     // E.2 — config presente, conexão ausente ⇒ NOT_CONNECTED.
-    ambienteBase(cena.fingerprints[0]!, false);
+    ambienteBase(cena.fingerprints[0]!, MATRIZ_POLITICA_CENARIO.E);
     resposta = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cena.campanhaId}`, {
       headers: { cookie: cookieE },
     });
@@ -1205,10 +1321,31 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     corpo = JSON.parse(resposta.corpo);
     expect(corpo.oauth.estado).toBe("CONNECTED");
 
-    // Sanitização + zero rede: resposta sem conta/e-mail/token/fingerprint.
+    // Sanitização ESTRUTURAL (03C.2A.4): allowlist EXATA de chaves públicas
+    // de corpo.oauth + varredura recursiva por campos sensíveis. tokenRefreshes
+    // é telemetria numérica legítima (0) — o substring-match bruto "token" era
+    // um falso-positivo e foi removido SEM diluir o contrato de sanitização.
+    expect(Object.keys(corpo.oauth).sort()).toEqual([...CHAVES_OAUTH_PUBLICAS].sort());
+    const camposProibidos = [
+      "accesstoken",
+      "refreshtoken",
+      "accesstokenciphertext",
+      "refreshtokenciphertext",
+      "tokenciphertext",
+      "nonce",
+      "authtag",
+      "clientsecret",
+      "encryptionkey",
+      "contafingerprint",
+      "contaesperada",
+      "token",
+    ];
+    expect(varrerCamposProibidos(resposta.corpo, camposProibidos)).toEqual([]);
+    // Nenhum segredo-sintético da fixture vaza no corpo.
+    expect(resposta.corpo).not.toContain("ciphertext-sintetico");
+    // Sem conta/e-mail no JSON (contrato preservado).
     expect(resposta.corpo).not.toContain(CONTA_ESPERADA);
     expect(resposta.corpo).not.toContain("@exemplo.test");
-    expect(resposta.corpo.toLowerCase()).not.toContain("token");
     expect(resposta.corpo).not.toMatch(/\b[0-9a-f]{64}\b/);
     expect(espiaoRede).not.toHaveBeenCalled();
     expect(corpo.oauth.tokenRefreshes).toBe(0);

@@ -46,7 +46,10 @@ import {
   injetarProvedorCanarioParaTeste,
 } from "../src/server.js";
 import { chaveIdempotenciaExecucao } from "../src/campaign-execution.js";
-import { fingerprintDestinatarioCampanha } from "../src/campaign-control.js";
+import {
+  ACAO_AUTORIZADA_EXECUCAO,
+  fingerprintDestinatarioCampanha,
+} from "../src/campaign-control.js";
 import {
   derivarFingerprintContaGmail,
   GmailAmbiguousError,
@@ -303,6 +306,15 @@ describe("SLICE_03C.2A.2 — contratos de fixture (fonte única, determinístico
       expect(carregarPoliticaCampanhaAtualizacao({ [chave]: "1" })[propriedade]).toBe(false);
       expect(carregarPoliticaCampanhaAtualizacao({})[propriedade]).toBe(false);
     }
+  });
+
+  it("03C.2A.5. ação da prova humana é a constante canônica de produção (control plane ≠ prova)", () => {
+    // Contratos DISTINTOS por desenho: "AUTORIZAR_EXECUCAO" é a ação do
+    // control plane; a constante canônica de produção é a ação que a prova
+    // humana autoriza e o antirreplay verifica. A fixture grava EXATAMENTE a
+    // constante de produção — sem aceitar os dois valores, sem relaxar o
+    // antirreplay.
+    expect(ACAO_AUTORIZADA_EXECUCAO).toBe("EXECUTAR_ITEM_CAMPANHA");
   });
 
   it("03C.2A.3. nonce=12 bytes, authTag=16 bytes, chave de fingerprint válida (contrato do schema)", () => {
@@ -912,6 +924,8 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
   interface CenaCanario {
     campanhaId: string;
     loteCampanhaId: string;
+    /** ID do item canário — agregado dos eventos EXEC_* em produção. */
+    readonly itemCanarioId: string;
     fingerprints: readonly string[];
   }
 
@@ -989,12 +1003,20 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
           "CAMPANHA_EXECUCAO_AUTORIZADA",
           params.operatorId,
           agora,
-          JSON.stringify({ esquema: "CAMPANHA_CONTROLE_V1", acao: "AUTORIZAR_EXECUCAO", lote_estado: "ATIVO" }),
+          // 03C.2A.5 — acao = constante canônica de produção
+          // ("EXECUTAR_ITEM_CAMPANHA"), EXATAMENTE como o caso de uso
+          // AUTORIZAR_EXECUCAO de produção grava: o control plane autoriza; a
+          // prova humana autoriza EXECUÇÃO do item e o antirreplay verifica
+          // este MESMO valor nos metadados.
+          JSON.stringify({ esquema: "CAMPANHA_CONTROLE_V1", acao: ACAO_AUTORIZADA_EXECUCAO, lote_estado: "ATIVO" }),
           hashEventoTeste(eventoId, loteCampanhaId, "CAMPANHA_EXECUCAO_AUTORIZADA", agora),
         ],
       );
     }
-    return { campanhaId, loteCampanhaId, fingerprints };
+    // 03C.2A.5 — o item canário criado pela própria cena é a autoridade dos
+    // eventos EXEC_* (o MESMO id persistido em
+    // CAMPANHA_CANARIO_SELECIONADO.metadados.item_id — sem fallback/heurística).
+    return { campanhaId, loteCampanhaId, itemCanarioId: itemIds[0]!, fingerprints };
   }
 
   // E — conexões OAuth SÃO PROPRIEDADE DA SUÍTE: ids capturados via
@@ -1040,10 +1062,13 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     }
   });
 
-  async function contagensExec(loteCampanhaId: string): Promise<Record<string, number>> {
+  // 03C.2A.5 — produção agrega EXEC_* pelo ITEM (agregado_id = itemId): a
+  // contagem da suíte usa a MESMA autoridade — nunca o lote, nunca "primeiro
+  // evento", nunca heurística por timestamp ou redescoberta por destinatário.
+  async function contagensExec(itemCanarioId: string): Promise<Record<string, number>> {
     const eventos = await pool!.query(
-      "SELECT tipo, count(*)::int AS total FROM evento_auditoria WHERE agregado_id = $1 AND tipo LIKE 'EXEC%' GROUP BY tipo",
-      [loteCampanhaId],
+      "SELECT tipo, count(*)::int AS total FROM evento_auditoria WHERE agregado_tipo = 'CAMPANHA_EXECUCAO' AND agregado_id = $1 AND tipo LIKE 'EXEC%' GROUP BY tipo",
+      [itemCanarioId],
     );
     return Object.fromEntries(
       (eventos.rows as { tipo: string; total: number }[]).map((r) => [r.tipo, r.total]),
@@ -1096,7 +1121,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     const espiaoRede = vi.fn();
     vi.stubGlobal("fetch", espiaoRede);
 
-    const antes = await contagensExec(cena.loteCampanhaId);
+    const antes = await contagensExec(cena.itemCanarioId);
     const resposta = await despachar("POST", "/api/campaigns/canary-send", {
       headers: { cookie: executorCookie, "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
@@ -1104,8 +1129,9 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(resposta.status).toBe(409);
     expect(resposta.corpo).toContain("CAMPAIGN_CANARY_SEND_DISABLED");
     expect(espiaoRede).not.toHaveBeenCalled();
-    const depois = await contagensExec(cena.loteCampanhaId);
+    const depois = await contagensExec(cena.itemCanarioId);
     expect(depois).toEqual(antes);
+    expect(depois["EXEC_CLAIM"] ?? 0).toBe(0); // A_EXEC_EVENT_DELTA = 0 (cena possui só eventos de controle)
     expect(await estadoItem(cena.loteCampanhaId)).toBe("PREPARADO");
     injetarProvedor!(null);
   });
@@ -1166,7 +1192,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(resposta.corpo).toContain("messageId");
     expect(chamadasProvider).toBe(1);
     expect(espiaoRede).not.toHaveBeenCalled(); // ZERO rede real
-    const contagens = await contagensExec(cena.loteCampanhaId);
+    const contagens = await contagensExec(cena.itemCanarioId);
     expect(contagens["EXEC_RECEIPT"]).toBe(1);
     expect(contagens["EXEC_SETTLEMENT"]).toBe(1);
     expect(await estadoItem(cena.loteCampanhaId)).toBe("ENVIADO");
@@ -1177,11 +1203,15 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
       headers: { cookie: cookieB, "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
     });
+    // REPLAY — contrato do preflight vigente: item ENVIADO ⇒ 409
+    // ITEM_NAO_PREPARADO. Deltas do provider e dos eventos EXEC_* = 0; os
+    // TOTAIS persistidos permanecem 1 (receipt/settlement NÃO se repetem).
     expect(replay.status).toBe(409);
-    expect(chamadasProvider).toBe(1); // inalterado
-    const contagensReplay = await contagensExec(cena.loteCampanhaId);
-    expect(contagensReplay["EXEC_RECEIPT"]).toBe(1);
-    expect(contagensReplay["EXEC_SETTLEMENT"]).toBe(1);
+    expect(replay.corpo).toContain("ITEM_NAO_PREPARADO");
+    expect(chamadasProvider).toBe(1); // delta de provider = 0
+    const contagensReplay = await contagensExec(cena.itemCanarioId);
+    expect(contagensReplay["EXEC_RECEIPT"]).toBe(1); // delta = 0; total = 1
+    expect(contagensReplay["EXEC_SETTLEMENT"]).toBe(1); // delta = 0; total = 1
     injetarProvedor!(null);
   });
 
@@ -1238,8 +1268,9 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(chamadasProvider).toBe(0);
     expect(espiaoRede).not.toHaveBeenCalled();
     expect(await estadoItem(cena.loteCampanhaId)).toBe("PREPARADO");
-    const contagens = await contagensExec(cena.loteCampanhaId);
+    const contagens = await contagensExec(cena.itemCanarioId);
     expect(contagens["EXEC_RECEIPT"]).toBeUndefined();
+    expect(contagens["EXEC_CLAIM"] ?? 0).toBe(0); // D_EXEC_EVENT_DELTA = 0 (bloqueio antes do claim)
     injetarProvedor!(null);
   });
 
@@ -1320,6 +1351,15 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     });
     corpo = JSON.parse(resposta.corpo);
     expect(corpo.oauth.estado).toBe("CONNECTED");
+
+    // 03C.2A.5 — identidade do agregado: o metadado do evento canário
+    // persistido pela cena carrega o MESMO itemCanarioId retornado
+    // (EXEC_EVENT_AGGREGATE_MATCH=true; nenhuma redescoberta por heurística).
+    const canarioPersistido = await pool!.query(
+      "SELECT metadados->>'item_id' AS item_id FROM evento_auditoria WHERE agregado_tipo = 'CAMPANHA_EXECUCAO' AND tipo = 'CAMPANHA_CANARIO_SELECIONADO' AND agregado_id = $1",
+      [cena.loteCampanhaId],
+    );
+    expect((canarioPersistido.rows[0] as { item_id: string }).item_id).toBe(cena.itemCanarioId);
 
     // Sanitização ESTRUTURAL (03C.2A.4): allowlist EXATA de chaves públicas
     // de corpo.oauth + varredura recursiva por campos sensíveis. tokenRefreshes

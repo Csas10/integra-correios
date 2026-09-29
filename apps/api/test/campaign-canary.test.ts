@@ -50,11 +50,14 @@ import {
   ACAO_AUTORIZADA_EXECUCAO,
   fingerprintDestinatarioCampanha,
 } from "../src/campaign-control.js";
+import { avaliarReadinessOauthCanario } from "../src/campaign-canary.js";
+import { criarCampanhaGmailRuntime } from "../src/campaign-gmail-runtime.js";
 import {
   derivarFingerprintContaGmail,
   GmailAmbiguousError,
   GmailAuthError,
   GmailHttpTransport,
+  GmailMailGateway,
   GmailPermanentPolicyError,
   GmailRateLimitError,
   MailProviderNaoConfiguradoError,
@@ -62,7 +65,10 @@ import {
   type MailReceipt,
   type OutboundMail,
 } from "@integra-correios/mail";
-import { HmacSha256Fingerprinter } from "@integra-correios/persistence";
+import {
+  Aes256GcmSecretBox,
+  HmacSha256Fingerprinter,
+} from "@integra-correios/persistence";
 
 type Despachar = typeof despacharSemBanco;
 const COOKIE_SESSAO = `__Host-ic_campaign_operator_session=${"B".repeat(43)}`;
@@ -1083,6 +1089,324 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     return (itens.rows[0] as { estado: string }).estado;
   }
 
+
+  // -------------------------------------------------------------------
+  // SLICE-03C.2B1A — runtime Gmail REAL (local, strict zero send).
+  // Constantes LIVE separadas das sintéticas 03C.2A para provar
+  // independência: chaves/conta/token próprios deste gate.
+  // -------------------------------------------------------------------
+  const CHAVE_CRIPTO_LIVE = Buffer.from("chave-cripto-live-03c2b1a".padEnd(32, "!"), "utf8"); // 32 bytes
+  const CONTA_LIVE_H = "institucional.live@exemplo.test";
+  const TOKEN_LIVE_H = "token-live-h-03c2b1a-sintetico";
+  const VERSAO_LIVE_H = "v1-live-h";
+
+  function ambienteLiveH(fingerprintCanario: string, canarySend: boolean): void {
+    process.env.PF_CAMPAIGN_PROOF_KEY_BASE64 = CHAVE_PROVA_BASE64;
+    process.env.PF_CAMPAIGN_CANARY_RECIPIENT_FINGERPRINT = fingerprintCanario;
+    // Gates SINTÉTICOS DE PROCESSO: abertos SOMENTE no cenário H (teste);
+    // produção continua sem qualquer flag (fail-closed, STRICT NO SEND).
+    process.env.PF_CAMPAIGN_CANARY_SEND_ENABLED = canarySend ? "true" : "false";
+    process.env.PF_CAMPAIGN_EXECUTE_ENABLED = canarySend ? "true" : "false";
+    process.env.REAL_SEND_ENABLED = canarySend ? "true" : "false";
+    process.env.GMAIL_OAUTH_CLIENT_ID = "client-id-live-h";
+    process.env.GMAIL_OAUTH_CLIENT_SECRET = "client-secret-live-h";
+    process.env.GMAIL_OAUTH_REDIRECT_URI = "https://exemplo.test/callback";
+    process.env.GMAIL_EXPECTED_ACCOUNT = CONTA_LIVE_H;
+    process.env.DOCUMENT_FINGERPRINT_KEY_BASE64 = CHAVE_FINGERPRINT_FIXTURE_B64;
+    process.env.DATA_ENCRYPTION_KEY_BASE64 = CHAVE_CRIPTO_LIVE.toString("base64");
+    process.env.DATA_ENCRYPTION_KEY_VERSION = VERSAO_LIVE_H;
+  }
+
+  async function inserirConexaoLiveH(): Promise<string> {
+    const { derivarFingerprintContaGmail: derivar } = await import("@integra-correios/mail");
+    const fpConta = derivar(new HmacSha256Fingerprinter(Buffer.from(CHAVE_FINGERPRINT_FIXTURE_B64, "base64")), CONTA_LIVE_H);
+    const envelope = new Aes256GcmSecretBox(CHAVE_CRIPTO_LIVE, VERSAO_LIVE_H).seal(TOKEN_LIVE_H, "oauth:access");
+    const inserida = await pool!.query(
+      "INSERT INTO oauth_connection (provider, conta_fingerprint, scopes, access_token_ciphertext, access_token_nonce, access_token_auth_tag, chave_versao, expira_em) VALUES ('GMAIL', $1, ARRAY['https://www.googleapis.com/auth/gmail.send']::text[], $2, $3, $4, $5, now() + interval '1 hour') RETURNING id",
+      [fpConta, Buffer.from(envelope.ciphertext), Buffer.from(envelope.nonce), Buffer.from(envelope.authTag), VERSAO_LIVE_H],
+    );
+    const id = (inserida.rows[0] as { id: string }).id;
+    conexoesOAuthDaSuite.push(id); // cleanup OWNED existente cobre falhas
+    return id;
+  }
+
+  let tokenVistoPeloTransporte: string | undefined;
+
+  async function montarStackLiveH(cena: CenaCanario): Promise<ReturnType<typeof criarCampanhaGmailRuntime>> {
+    const runtime = criarCampanhaGmailRuntime({
+      env: process.env,
+      pool: pool!,
+      portaTransporte: async (_mensagem, accessToken) => {
+        tokenVistoPeloTransporte = accessToken;
+        return {
+          provider: "GMAIL" as const,
+          messageId: "sintetico-live-h-" + cena.itemCanarioId.slice(0, 12),
+          acceptedAt: new Date().toISOString(),
+        };
+      },
+      // Qualquer tentativa de refresh neste cenário é um BUG do resolver.
+      portaRefresh: async () => {
+        throw new Error("refresh proibido: access token da cena é válido");
+      },
+    });
+    injetarProvedor!(
+      new ProvedorGmailCampanha({
+        pool: pool!,
+        campanhaId: cena.campanhaId,
+        gateway: new GmailMailGateway(runtime.transport, runtime.loadAccessToken, undefined, process.env),
+      }),
+    );
+    return runtime;
+  }
+
+  it("2B1A-H0. ARMAMENTO FECHADO com stack Gmail REAL montada: 409 com ZERO token-load/decrypt/rede (pré-claim)", async () => {
+    const credencialH0 = tokenSintetico("live-h0");
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: await bootstrapAdmin(), "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-CNR-" + randomUUID().slice(0, 8),
+        displayName: "Operador Live H0",
+        roles: ["EXECUTOR"],
+        credentialHash: createHash("sha256").update(credencialH0).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const operatorIdH0 = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencialH0 })),
+    });
+    expect(login.status).toBe(200);
+    const cookieH0 = firstCookie(login.headers["set-cookie"]);
+    const cena = await criarCenaCanario({
+      operatorId: operatorIdH0,
+      emails: ["canario.live.h0@exemplo.test"],
+    });
+    ambienteLiveH(cena.fingerprints[0]!, false); // TODOS os gates fechados
+    await inserirConexaoLiveH();
+    const runtime = await montarStackLiveH(cena);
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    const resposta = await despachar("POST", "/api/campaigns/canary-send", {
+      headers: { cookie: cookieH0, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
+    });
+    expect(resposta.status).toBe(409);
+    expect(resposta.corpo).toContain("CAMPAIGN_CANARY_SEND_DISABLED");
+    expect(espiaoRede).not.toHaveBeenCalled();
+    // PRÉ-CLAIM: zero leitura de conexão, zero decrypt, zero refresh, zero transport.
+    expect(runtime.metricas.leiturasConexao()).toBe(0);
+    expect(runtime.metricas.descriptografias()).toBe(0);
+    expect(runtime.metricas.refreshes()).toBe(0);
+    expect(runtime.metricas.chamadasTransporte()).toBe(0);
+    expect(await contagensExec(cena.itemCanarioId)).toEqual({});
+    expect(await estadoItem(cena.loteCampanhaId)).toBe("PREPARADO");
+    injetarProvedor!(null);
+  });
+
+  it("2B1A-H0b. EXECUTE fechado isoladamente (canary=true, execute=false, real=true): zero claim/token/rede", async () => {
+    const credencialH0b = tokenSintetico("live-h0b");
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: await bootstrapAdmin(), "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-CNR-" + randomUUID().slice(0, 8),
+        displayName: "Operador Live H0b",
+        roles: ["EXECUTOR"],
+        credentialHash: createHash("sha256").update(credencialH0b).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const operatorId = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencialH0b })),
+    });
+    expect(login.status).toBe(200);
+    const cookie = firstCookie(login.headers["set-cookie"]);
+    const cena = await criarCenaCanario({
+      operatorId,
+      emails: ["canario.live.h0b@exemplo.test"],
+    });
+    ambienteLiveH(cena.fingerprints[0]!, true);
+    process.env.PF_CAMPAIGN_EXECUTE_ENABLED = "false"; // ÚNICO gate fechado
+    await inserirConexaoLiveH();
+    const runtime = await montarStackLiveH(cena);
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    const resposta = await despachar("POST", "/api/campaigns/canary-send", {
+      headers: { cookie, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
+    });
+    expect(resposta.status).toBe(409);
+    expect(resposta.corpo).toContain("CAMPAIGN_CANARY_BLOCKED");
+    expect(espiaoRede).not.toHaveBeenCalled();
+    expect(runtime.metricas.leiturasConexao()).toBe(0);
+    expect(runtime.metricas.descriptografias()).toBe(0);
+    expect(runtime.metricas.refreshes()).toBe(0);
+    expect(runtime.metricas.chamadasTransporte()).toBe(0);
+    expect(await contagensExec(cena.itemCanarioId)).toEqual({});
+    injetarProvedor!(null);
+  });
+
+  it("2B1A-H0c. REAL_SEND fechado isoladamente (canary=true, execute=true, real=false): zero claim/token/rede", async () => {
+    const credencialH0c = tokenSintetico("live-h0c");
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: await bootstrapAdmin(), "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-CNR-" + randomUUID().slice(0, 8),
+        displayName: "Operador Live H0c",
+        roles: ["EXECUTOR"],
+        credentialHash: createHash("sha256").update(credencialH0c).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const operatorId = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencialH0c })),
+    });
+    expect(login.status).toBe(200);
+    const cookie = firstCookie(login.headers["set-cookie"]);
+    const cena = await criarCenaCanario({
+      operatorId,
+      emails: ["canario.live.h0c@exemplo.test"],
+    });
+    ambienteLiveH(cena.fingerprints[0]!, true);
+    process.env.REAL_SEND_ENABLED = "false"; // ÚNICO gate fechado
+    await inserirConexaoLiveH();
+    const runtime = await montarStackLiveH(cena);
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    const resposta = await despachar("POST", "/api/campaigns/canary-send", {
+      headers: { cookie, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
+    });
+    expect(resposta.status).toBe(409);
+    expect(resposta.corpo).toContain("CAMPAIGN_CANARY_BLOCKED");
+    expect(espiaoRede).not.toHaveBeenCalled();
+    expect(runtime.metricas.leiturasConexao()).toBe(0);
+    expect(runtime.metricas.descriptografias()).toBe(0);
+    expect(runtime.metricas.refreshes()).toBe(0);
+    expect(runtime.metricas.chamadasTransporte()).toBe(0);
+    expect(await contagensExec(cena.itemCanarioId)).toEqual({});
+    injetarProvedor!(null);
+  });
+
+  it("2B1A-H. Flags sintéticas true: caminho completo via STACK GMAIL REAL (transport fake, receipt sintético, zero rede)", async () => {
+    const credencialH = tokenSintetico("live-h");
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: await bootstrapAdmin(), "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-CNR-" + randomUUID().slice(0, 8),
+        displayName: "Operador Live H",
+        roles: ["EXECUTOR"],
+        credentialHash: createHash("sha256").update(credencialH).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const operatorIdH = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencialH })),
+    });
+    expect(login.status).toBe(200);
+    const cookieH = firstCookie(login.headers["set-cookie"]);
+    const cena = await criarCenaCanario({
+      operatorId: operatorIdH,
+      emails: ["canario.live.h@exemplo.test"],
+    });
+    ambienteLiveH(cena.fingerprints[0]!, true); // gates sintéticos abertos (teste)
+    await inserirConexaoLiveH();
+    const runtime = await montarStackLiveH(cena);
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+
+    const resposta = await despachar("POST", "/api/campaigns/canary-send", {
+      headers: { cookie: cookieH, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
+    });
+    expect(resposta.status).toBe(200);
+    expect(resposta.corpo).toContain("ENVIADO");
+    expect(resposta.corpo).toContain("messageId");
+    expect(espiaoRede).not.toHaveBeenCalled(); // ZERO rede real
+    expect(tokenVistoPeloTransporte).toBe(TOKEN_LIVE_H); // token DECIFRADO chegou ao gateway
+    // ACCESS_TOKEN_LOADS=1; decrypt=1; refresh=0; transport=1
+    expect(runtime.metricas.leiturasConexao()).toBe(1);
+    expect(runtime.metricas.descriptografias()).toBe(1);
+    expect(runtime.metricas.refreshes()).toBe(0);
+    expect(runtime.metricas.chamadasTransporte()).toBe(1);
+    const contagens = await contagensExec(cena.itemCanarioId);
+    expect(contagens["EXEC_CLAIM"]).toBe(1);
+    expect(contagens["EXEC_TENTATIVA_INICIADA"]).toBe(1);
+    expect(contagens["EXEC_RECEIPT"]).toBe(1);
+    expect(contagens["EXEC_SETTLEMENT"]).toBe(1);
+    expect(await estadoItem(cena.loteCampanhaId)).toBe("ENVIADO");
+
+    // REPLAY — deltas ZERO (token e transport não são re-resolvidos).
+    const replay = await despachar("POST", "/api/campaigns/canary-send", {
+      headers: { cookie: cookieH, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
+    });
+    expect(replay.status).toBe(409);
+    expect(replay.corpo).toContain("ITEM_NAO_PREPARADO");
+    expect(runtime.metricas.leiturasConexao()).toBe(1); // SECOND_TOKEN_RESOLUTIONS=0
+    expect(runtime.metricas.chamadasTransporte()).toBe(1); // SECOND_GMAIL_CALLS=0
+    const contagensReplay = await contagensExec(cena.itemCanarioId);
+    expect(contagensReplay["EXEC_RECEIPT"]).toBe(1); // delta 0; total 1
+    expect(contagensReplay["EXEC_SETTLEMENT"]).toBe(1); // delta 0; total 1
+    injetarProvedor!(null);
+  });
+
+  it("2B1A-I. Readiness NÃO carrega/descriptografa/renova token; CONNECTED ≠ token válido", async () => {
+    const credencialI = tokenSintetico("live-i");
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: await bootstrapAdmin(), "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-CNR-" + randomUUID().slice(0, 8),
+        displayName: "Operador Live I",
+        roles: ["EXECUTOR"],
+        credentialHash: createHash("sha256").update(credencialI).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const operatorIdI = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencialI })),
+    });
+    expect(login.status).toBe(200);
+    const cena = await criarCenaCanario({
+      operatorId: operatorIdI,
+      emails: ["canario.live.i@exemplo.test"],
+    });
+    ambienteLiveH(cena.fingerprints[0]!, false);
+    await inserirConexaoLiveH();
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    const runtime = criarCampanhaGmailRuntime({
+      env: process.env,
+      pool: pool!,
+      portaTransporte: async () => {
+        throw new Error("transport não deveria ser invocado pelo readiness");
+      },
+      portaRefresh: async () => {
+        throw new Error("refresh não deveria ser invocado pelo readiness");
+      },
+    });
+    const readiness = await avaliarReadinessOauthCanario(pool!, new HmacSha256Fingerprinter(Buffer.from(CHAVE_FINGERPRINT_FIXTURE_B64, "base64")));
+    expect(readiness.oauthConfigurationReady).toBe(true);
+    expect(readiness.oauthConnectionStored).toBe(true);
+    expect(readiness.oauthExpectedAccountConfigured).toBe(true);
+    expect(readiness.oauthStoredAccountMatchesExpected).toBe(true);
+    expect(readiness.oauthEncryptionConfigurationReady).toBe(true);
+    expect(readiness.executionReady).toBe(true);
+    // ZERO resolução de token pelo readiness (CONNECTED ≠ ACCESS_TOKEN_VALID):
+    expect(runtime.metricas.leiturasConexao()).toBe(0);
+    expect(runtime.metricas.descriptografias()).toBe(0);
+    expect(runtime.metricas.refreshes()).toBe(0);
+    expect(espiaoRede).not.toHaveBeenCalled();
+  });
+
   it("A. ARMAMENTO AUSENTE (rota real): 409 CAMPAIGN_CANARY_SEND_DISABLED com CLAIMS=0, eventos=0, token=0, provider=0, rede=0", async () => {
     const admin = await despachar("POST", "/api/operator/admin/provision", {
       headers: { cookie: await bootstrapAdmin(), "content-type": "application/json" },
@@ -1420,6 +1744,22 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(login.status).toBe(200);
     return firstCookie(login.headers["set-cookie"]);
   }
+});
+
+
+describe("SLICE_03C.2B1A — fonte (SOURCE_STRUCTURE, sem DB)", () => {
+  it("runtime normal da API NÃO usa mais o stub GmailMailGateway(undefined, async () => undefined)", () => {
+    const fonteServer = readFileSync(new URL("../src/server.ts", import.meta.url), "utf8");
+    expect(fonteServer).toContain("criarCampanhaGmailRuntime({ env:");
+    expect(fonteServer).toContain("new GmailMailGateway(runtime.transport, runtime.loadAccessToken");
+    expect(fonteServer).not.toContain("new GmailMailGateway(undefined, async () => undefined)");
+    const fonteRuntime = readFileSync(new URL("../src/campaign-gmail-runtime.ts", import.meta.url), "utf8");
+    // Helper neutro: NENHUMA dependência do worker na API.
+    expect(fonteRuntime).not.toContain("../../worker");
+    expect(fonteRuntime).toContain("refreshOauthAccessToken");
+    const fonteMail = readFileSync(new URL("../../../packages/mail/src/adapters/gmail.ts", import.meta.url), "utf8");
+    expect(fonteMail).toContain("refreshPort");
+  });
 });
 
 function firstCookie(header: string | readonly string[] | string[] | undefined): string {

@@ -505,6 +505,44 @@ export function composeMimeMessage(message: OutboundMail): string {
  * erros ou receipts — apenas códigos curtos determinísticos.
  */
 export class GmailHttpTransport {
+  constructor(
+    /** Porta de refresh injetável (testes usam fake; default = endpoint real). */
+    private readonly refreshPort: (
+      config: GmailOauthConfig,
+      refreshToken: string,
+    ) => Promise<GmailTokenRefreshResponse> = GmailHttpTransport.#refreshAccessTokenPadrao,
+  ) {}
+
+  static async #refreshAccessTokenPadrao(
+    config: GmailOauthConfig,
+    refreshToken: string,
+  ): Promise<GmailTokenRefreshResponse> {
+    const body = new URLSearchParams({
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    });
+    let response: Response;
+    try {
+      response = await fetch(GMAIL_OAUTH_TOKEN_ENDPOINT, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body,
+      });
+    } catch {
+      throw new MailProviderRequestError("GMAIL", "token.refresh (rede)");
+    }
+    if (!response.ok) {
+      throw new MailProviderRequestError("GMAIL", `token.refresh (HTTP ${response.status})`);
+    }
+    const data = (await response.json()) as GmailTokenRefreshResponse;
+    if (!data?.access_token) {
+      throw new MailProviderRequestError("GMAIL", "token.refresh (resposta sem access_token)");
+    }
+    return data;
+  }
+
   async send(message: OutboundMail, accessToken: string): Promise<MailReceipt> {
     const mime = composeMimeMessage(message);
     const body = JSON.stringify({ raw: Buffer.from(mime, "utf8").toString("base64url") });
@@ -575,29 +613,7 @@ export class GmailHttpTransport {
     config: GmailOauthConfig,
     refreshToken: string,
   ): Promise<GmailTokenRefreshResponse> {
-    const body = new URLSearchParams({
-      client_id: config.clientId,
-      client_secret: config.clientSecret,
-      refresh_token: refreshToken,
-      grant_type: "refresh_token",
-    });
-    let response: Response;
-    try {
-      response = await fetch(GMAIL_OAUTH_TOKEN_ENDPOINT, {
-        method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded" },
-        body,
-      });
-    } catch {
-      throw new MailProviderRequestError("GMAIL", "token.refresh (rede)");
-    }
-    if (!response.ok) {
-      throw new MailProviderRequestError("GMAIL", `token.refresh (HTTP ${response.status})`);
-    }
-    const data = (await response.json()) as GmailTokenRefreshResponse;
-    if (!data?.access_token) {
-      throw new MailProviderRequestError("GMAIL", "token.refresh (resposta sem access_token)");
-    }
-    return data;
+    // Porta injetável: testes substituem por fake (zero rede real).
+    return this.refreshPort(config, refreshToken);
   }
 }

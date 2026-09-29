@@ -90,6 +90,7 @@ import {
 // provider Gmail, OAuth readiness read-only). STRICT NO SEND: o caminho só
 // arma com PF_CAMPAIGN_CANARY_SEND_ENABLED=true (política) e a UI não tem
 // handler de envio.
+import { criarCampanhaGmailRuntime } from "./campaign-gmail-runtime.js";
 import {
   ProvedorGmailCampanha,
   avaliarReadinessOauthCanario,
@@ -112,11 +113,16 @@ export function injetarProvedorCanarioParaTeste(
 }
 
 function provedorCanarioRuntime(campanhaId: string): ProvedorEnvioCampanha {
+  // SLICE-03C.2B1A — provider fake permanece disponível SOMENTE por DI de teste.
   if (provedorCanarioParaTeste) return provedorCanarioParaTeste;
+  // Runtime Gmail REAL: transport + token resolver (decrypt/refresh/
+  // persistência cifrada) compostos no GmailMailGateway. O envio continua
+  // fail-closed pelas políticas de produção (flags ausentes ou false).
+  const runtime = criarCampanhaGmailRuntime({ env: process.env, pool: requireDbPool() });
   return new ProvedorGmailCampanha({
     pool: requireDbPool(),
     campanhaId,
-    gateway: new GmailMailGateway(undefined, async () => undefined),
+    gateway: new GmailMailGateway(runtime.transport, runtime.loadAccessToken, undefined, process.env),
   });
 }
 

@@ -621,8 +621,27 @@ export function avaliarAcaoOperacaoCampanha(
 // E. MUTAÇÕES MÍNIMAS — preparar lote e autorizar execução (transacionais)
 // ---------------------------------------------------------------------------
 
-function hashEventoControle(id: string, ocorreuEm: string): string {
-  return createHmac("sha256", "audit-chain").update(id).update(ocorreuEm).digest("hex");
+// Contrato V2: hash de evento de controle vinculado à identidade completa do
+// evento (id, agregado_tipo, agregado_id, tipo, ocorreu_em) com framing JSON
+// inequívoco — eventos distintos do mesmo agregado no mesmo instante produzem
+// hashes distintos (a colisão agregado+timestamp do contrato anterior violava
+// UNIQUE(hash_evento) quando dois eventos eram gravados na mesma transação).
+function hashEventoControle(
+  eventoId: string,
+  agregadoTipo: string,
+  agregadoId: string,
+  tipo: string,
+  ocorreuEm: string,
+): string {
+  const representacao = JSON.stringify([
+    "CAMPANHA_CONTROLE_HASH_V2",
+    eventoId,
+    agregadoTipo,
+    agregadoId,
+    tipo,
+    ocorreuEm,
+  ]);
+  return createHmac("sha256", "audit-chain").update(representacao).digest("hex");
 }
 
 async function executarTransacao(
@@ -852,6 +871,8 @@ export async function prepararLoteCampanha(
       );
     }
     const agora = new Date().toISOString();
+    // eventoId explícito ANTES do INSERT: o mesmo id entra na linha e no hash.
+    const eventoId = randomUUID();
     await transaction.query(
       `UPDATE outbox_campanha o SET estado = 'PREPARADO'
         FROM lote_campanha l
@@ -868,7 +889,7 @@ export async function prepararLoteCampanha(
         ocorreu_em, metadados, hash_anterior, hash_evento
       ) VALUES ($1, 'CAMPANHA_EXECUCAO', $2, 'CAMPANHA_LOTE_PREPARADO', $3, $3, $4, $5::jsonb, NULL, $6)`,
       [
-        randomUUID(),
+        eventoId,
         linha.id,
         comando.operatorId,
         agora,
@@ -877,7 +898,7 @@ export async function prepararLoteCampanha(
           acao: "PREPARAR_LOTE",
           total_itens: Number(linha.total_itens),
         }),
-        hashEventoControle(linha.id, agora),
+        hashEventoControle(eventoId, "CAMPANHA_EXECUCAO", linha.id, "CAMPANHA_LOTE_PREPARADO", agora),
       ],
     );
     resultado = {
@@ -1003,7 +1024,7 @@ export async function autorizarExecucaoCampanha(
           lote_estado: linha.estado,
           total_itens: Number(linha.total_itens),
         }),
-        hashEventoControle(linha.id, agora),
+        hashEventoControle(eventoId, "CAMPANHA_EXECUCAO", linha.id, CODIGO_EVENTO_AUTORIZACAO, agora),
       ],
     );
     resultado = {
@@ -1206,7 +1227,7 @@ export async function ativarLoteCampanha(
           item_id: canario.id,
           ordem: Number(canario.ordem),
         }),
-        hashEventoControle(linha.id, agora),
+        hashEventoControle(eventoCanarioId, "CAMPANHA_EXECUCAO", linha.id, CODIGO_EVENTO_CANARIO, agora),
       ],
     );
     // CAS durável PREPARADO → ATIVO (defesa adicional ao FOR UPDATE).
@@ -1221,13 +1242,17 @@ export async function ativarLoteCampanha(
         "Ativação concorrente detectada — apenas uma é concedida.",
       );
     }
+    // Segundo evento da mesma transação: eventId PRÓPRIO e distinto do
+    // canário, garantindo hash_evento distinto mesmo com agregado/timestamp
+    // idênticos (regressão: SAME_AGGREGATE_SAME_TIME_TWO_EVENTS).
+    const eventoAtivacaoId = randomUUID();
     await transaction.query(
       `INSERT INTO evento_auditoria (
         id, agregado_tipo, agregado_id, tipo, operator_id, ator_operator_id,
         ocorreu_em, metadados, hash_anterior, hash_evento
       ) VALUES ($1, 'CAMPANHA_EXECUCAO', $2, $3, $4, $4, $5, $6::jsonb, NULL, $7)`,
       [
-        randomUUID(),
+        eventoAtivacaoId,
         linha.id,
         CODIGO_EVENTO_ATIVACAO,
         comando.operatorId,
@@ -1238,7 +1263,7 @@ export async function ativarLoteCampanha(
           total_itens: Number(linha.total_itens),
           canario_ordem: Number(canario.ordem),
         }),
-        hashEventoControle(linha.id, agora),
+        hashEventoControle(eventoAtivacaoId, "CAMPANHA_EXECUCAO", linha.id, CODIGO_EVENTO_ATIVACAO, agora),
       ],
     );
     resultado = {

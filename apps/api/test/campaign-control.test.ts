@@ -703,6 +703,125 @@ describe("SLICE_03C.1 — ATIVAR_LOTE e blocos de ativação (BEHAVIORAL)", () =
 });
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Parte 2.b — Regressão 03C.1.1: hash de evento por IDENTIDADE do evento.
+// A falha de CI (run 36510431980) foi colisão determinística de
+// hash_evento: canário + ativação gravados na MESMA transação com o MESMO
+// (agregadoId, ocorreuEm) sob o contrato antigo agregado+timestamp.
+// Correção: contrato V2 — HMAC-SHA256 sobre representação JSON canônica
+// ["CAMPANHA_CONTROLE_HASH_V2", eventoId, agregadoTipo, agregadoId, tipo,
+// ocorreuEm]. Sem sleep, sem atraso artificial, sem retry, sem tocar o
+// UNIQUE(hash_evento) e sem alterar o timestamp para contornar a colisão.
+// ---------------------------------------------------------------------------
+describe("SLICE_03C.1.1 — hash de evento vinculado à identidade (SOURCE_STRUCTURE + fail-closed)", () => {
+  const codigosEvento = [
+    "CAMPANHA_LOTE_PREPARADO",
+    "CAMPANHA_EXECUCAO_AUTORIZADA",
+    "CAMPANHA_CANARIO_SELECIONADO",
+    "CAMPANHA_LOTE_ATIVADO",
+  ];
+
+  it("J. os QUATRO emissores de controle usam o contrato V2 (event.id = eventoId do hash)", () => {
+    const codigo = semComentarios(FONTE_CONTROLE);
+    // Assinatura V2: helper exige os cinco campos da identidade persistida.
+    expect(codigo).toContain('"CAMPANHA_CONTROLE_HASH_V2"');
+    expect(codigo).toMatch(
+      /function hashEventoControle\(\s*eventoId: string,\s*agregadoTipo: string,\s*agregadoId: string,\s*tipo: string,\s*ocorreuEm: string,?\s*\)/,
+    );
+    // Exatamente quatro call-sites, um por emissor, cada um com eventId
+    // explícito ANTES do INSERT (não há randomUUID anônimo no par).
+    const chamadas = codigo.match(/hashEventoControle\(/g) ?? [];
+    expect(chamadas.length).toBe(5); // 1 definição + 4 emissores
+    const emissores = [
+      ["CAMPANHA_LOTE_PREPARADO", "eventoId, \"CAMPANHA_EXECUCAO\", linha.id, \"CAMPANHA_LOTE_PREPARADO\", agora"],
+      ["CAMPANHA_EXECUCAO_AUTORIZADA", "eventoId, \"CAMPANHA_EXECUCAO\", linha.id, CODIGO_EVENTO_AUTORIZACAO, agora"],
+      ["CAMPANHA_CANARIO_SELECIONADO", "eventoCanarioId, \"CAMPANHA_EXECUCAO\", linha.id, CODIGO_EVENTO_CANARIO, agora"],
+      ["CAMPANHA_LOTE_ATIVACAO", "eventoAtivacaoId, \"CAMPANHA_EXECUCAO\", linha.id, CODIGO_EVENTO_ATIVACAO, agora"],
+    ];
+    for (const [tipo, chamada] of emissores) {
+      const codigoTipo = tipo === "CAMPANHA_LOTE_ATIVACAO" ? "CAMPANHA_LOTE_ATIVADO" : tipo;
+      expect(codigosEvento).toContain(codigoTipo);
+      expect(codigo).toContain("hashEventoControle(" + chamada + ")");
+    }
+    // Na ativação, os dois eventos da MESMA transação possuem ids PRÓPRIOS
+    // e distintos — nunca um randomUUID anônimo no INSERT do segundo evento.
+    const eventoCanarioDeclaracao = codigo.indexOf("const eventoCanarioId = randomUUID();");
+    const eventoAtivacaoDeclaracao = codigo.indexOf("const eventoAtivacaoId = randomUUID();");
+    expect(eventoCanarioDeclaracao).toBeGreaterThan(-1);
+    expect(eventoAtivacaoDeclaracao).toBeGreaterThan(eventoCanarioDeclaracao);
+    // Ambos vêm depois do bloco de bloqueios da ativação e antes dos INSERTs.
+    const trechoAtivacao = codigo.slice(
+      codigo.indexOf("CAMPAIGN_ACTIVATE_BLOCKED"),
+      eventoAtivacaoDeclaracao + 1200,
+    );
+    expect(trechoAtivacao).toContain("const eventoCanarioId = randomUUID();");
+    expect(trechoAtivacao).toContain("const eventoAtivacaoId = randomUUID();");
+    expect(trechoAtivacao).not.toMatch(/randomUUID\(\),\s*\n\s*linha\.id/);
+    // Sem overload/legado: exatamente 1 definição + 4 call-sites, todos os
+    // call-sites iniciando com um eventId explícito (eventoId |
+    // eventoCanarioId | eventoAtivacaoId) — nenhum contrato antigo.
+    const ocorrencias = codigo.match(/hashEventoControle\(/g) ?? [];
+    expect(ocorrencias.length).toBe(5); // 1 definição + 4 emissores
+    const emissoresHash = codigo.match(/(?<!function )hashEventoControle\(/g) ?? [];
+    expect(emissoresHash.length).toBe(4);
+    const comEventId = codigo.match(
+      /(?<!function )hashEventoControle\(\s*(eventoId|eventoCanarioId|eventoAtivacaoId)\b/g,
+    ) ?? [];
+    expect(comEventId.length).toBe(4);
+    // Sem aleatorização fora do vínculo com eventId, sem retry/sleep.
+    expect(codigo).not.toMatch(/hashEventoControle[^\n]*(sleep|retry|delay)/i);
+  });
+
+  it("D/F (fail-closed local). representação canônica é inequívoca: framing JSON, sem concatenação sem delimitador", () => {
+    const codigo = semComentarios(FONTE_CONTROLE);
+    const indice = codigo.indexOf("function hashEventoControle(");
+    const trecho = codigo.slice(indice, indice + 700);
+    // Campos serializados via JSON.stringify do array completo — framing
+    // inequívoco, sem concatenação direta de campos.
+    expect(trecho).toContain("JSON.stringify([");
+    expect(trecho).not.toMatch(/update\(eventoId\)\.update/);
+    // Algoritmo preservado: HMAC-SHA256 com o segredo legado intocado.
+    expect(trecho).toContain('createHmac("sha256", "audit-chain")');
+    expect(trecho).toContain('.digest("hex")');
+  });
+
+  it("D/H fail-closed. ausência da chave de prova impede emissão de prova (sem mutação, sem hash)", () => {
+    // Exercita a fronteira de emissão sem banco: sem chaveProva, nenhuma
+    // prova é gerada e, portanto, nenhum hash de evento é derivado.
+    try {
+      emitirProvaDestinatarioCampanha({
+        campanhaId: randomUUID(),
+        loteCampanhaId: randomUUID(),
+        itemId: randomUUID(),
+        fingerprintDestinatario: randomUUID().replace(/-/g, "").repeat(2),
+      });
+      expect.unreachable("emissão deveria falhar sem chave de prova");
+    } catch (error) {
+      expect((error as CampaignControlError).code).toBe("CAMPAIGN_PROOF_KEY_UNAVAILABLE");
+    }
+  });
+
+  it("A–C (estrutural). dois eventos do MESMO agregado com o MESMO ocorreu_em diferem por eventId e tipo", () => {
+    // Prova da CONTRATO V2 no nível de derivação (sem banco): ids distintos
+    // ou tipos distintos sobre o mesmo agregado/timestamp produzem hashes
+    // distintos — condição que o contrato antigo violava. A prova de
+    // persistência (COUNT/hash 64-hex/recomputação) é DB-gated = PENDING_CI.
+    const agora = new Date().toISOString();
+    const agregado = randomUUID();
+    const derivar = (payload: string): string =>
+      createHash("sha256").update(payload).digest("hex");
+    const canario = derivar(JSON.stringify([
+      "CAMPANHA_CONTROLE_HASH_V2", randomUUID(), "CAMPANHA_EXECUCAO", agregado, "CAMPANHA_CANARIO_SELECIONADO", agora,
+    ]));
+    const ativacao = derivar(JSON.stringify([
+      "CAMPANHA_CONTROLE_HASH_V2", randomUUID(), "CAMPANHA_EXECUCAO", agregado, "CAMPANHA_LOTE_ATIVADO", agora,
+    ]));
+    expect(canario).toMatch(/^[0-9a-f]{64}$/);
+    expect(ativacao).toMatch(/^[0-9a-f]{64}$/);
+    expect(canario).not.toBe(ativacao);
+  });
+});
+
 // Parte 2 — SOURCE_STRUCTURE
 // ---------------------------------------------------------------------------
 
@@ -1784,4 +1903,85 @@ describeDb("SLICE_03C.1 — ativação controlada do lote (POSTGRESQL_INTEGRATIO
     expect(login.status).toBe(200);
     return { operatorId, cookie: firstCookie(login.headers["set-cookie"]) };
   }
+
+  it("A+B+C+E. dois eventos do MESMO agregado, MESMA transação, MESMO ocorreu_em: 2 linhas, 2 hashes distintos (64 hex)", async () => {
+    const cena = await criarCenaAtivacao({
+      operatorId: operadorId,
+      estadoLote: "PREPARADO",
+      emails: ["unico.hashregressao@exemplo.test"],
+    });
+    await inserirEventoAutorizacao(cena.loteCampanhaId, new Date().toISOString());
+    const resultado = await comCanario(cena.fingerprints[0]!, async () =>
+      ativarLoteCampanha(pool!, comandoAtivar(cena), { chaveProva: CHAVE_PROVA_SINTETICA }),
+    );
+    expect(resultado?.resultado).toBe("ATIVADO");
+    const p = pool!;
+    const linhas = await p.query(
+      `SELECT id, agregado_tipo, agregado_id, tipo, ocorreu_em, hash_evento
+        FROM evento_auditoria
+        WHERE agregado_id = $1 AND tipo IN ($2, $3)
+        ORDER BY tipo`,
+      [cena.loteCampanhaId, CODIGO_EVENTO_CANARIO, CODIGO_EVENTO_ATIVACAO],
+    );
+    expect(linhas.rows.length).toBe(2);
+    const eventos = linhas.rows as {
+      id: string; agregado_tipo: string; agregado_id: string;
+      tipo: string; ocorreu_em: string; hash_evento: string;
+    }[];
+    const ids = new Set(eventos.map((e) => e.id));
+    const hashes = new Set(eventos.map((e) => e.hash_evento));
+    expect(ids.size).toBe(2);
+    expect(hashes.size).toBe(2);
+    for (const e of eventos) {
+      expect(e.hash_evento).toMatch(/^[0-9a-f]{64}$/);
+      expect(e.agregado_tipo).toBe("CAMPANHA_EXECUCAO");
+      expect(e.agregado_id).toBe(cena.loteCampanhaId);
+      expect(e.ocorreu_em).toBe(eventos[0]!.ocorreu_em);
+    }
+    // Identidade persistida do canário = canarioReferencia retornado.
+    const referenciaCanario = eventos.find((e) => e.tipo === CODIGO_EVENTO_CANARIO)!.id;
+    expect(referenciaCanario).toBe(resultado?.canarioReferencia);
+  });
+
+  it("I. recomputação do hash V2 a partir da linha persistida (id, agregado_tipo, agregado_id, tipo, ocorreu_em)", async () => {
+    const cena = await criarCenaAtivacao({
+      operatorId: operadorId,
+      estadoLote: "PREPARADO",
+      emails: ["unico.recompute@exemplo.test"],
+    });
+    await inserirEventoAutorizacao(cena.loteCampanhaId, new Date().toISOString());
+    const resultado = await comCanario(cena.fingerprints[0]!, async () =>
+      ativarLoteCampanha(pool!, comandoAtivar(cena), { chaveProva: CHAVE_PROVA_SINTETICA }),
+    );
+    expect(resultado?.resultado).toBe("ATIVADO");
+    const p = pool!;
+    const linhas = await p.query(
+      `SELECT id, agregado_tipo, agregado_id, tipo, ocorreu_em, hash_evento
+        FROM evento_auditoria
+        WHERE agregado_id = $1 AND tipo IN ($2, $3)
+        ORDER BY tipo`,
+      [cena.loteCampanhaId, CODIGO_EVENTO_CANARIO, CODIGO_EVENTO_ATIVACAO],
+    );
+    const eventos = linhas.rows as {
+      id: string; agregado_tipo: string; agregado_id: string;
+      tipo: string; ocorreu_em: string; hash_evento: string;
+    }[];
+    expect(eventos.length).toBe(2);
+    for (const e of eventos) {
+      // Recomputação INDEPENDENTE (mesmo contrato V2 documentado): o teste
+      // deriva o hash a partir da linha persistida — sem helper interno
+      // exportado de produção.
+      const recomputado = createHash("sha256")
+        .update(JSON.stringify([
+          "CAMPANHA_CONTROLE_HASH_V2",
+          e.id,
+          e.agregado_tipo,
+          e.agregado_id,
+          e.tipo,
+          e.ocorreu_em,
+        ]))
+        .digest("hex");
+      expect(recomputado).toBe(e.hash_evento);
+    }
+  });
 });

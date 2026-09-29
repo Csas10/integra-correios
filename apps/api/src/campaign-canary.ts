@@ -39,6 +39,7 @@ import {
   type ResultadoProvedorCampanha,
   type ResultadoTentativaExecucao,
 } from "./campaign-execution.js";
+import { CampanhaTokenResolutionError } from "./campaign-gmail-runtime.js";
 import type { PfUpdateCampaignPolicy } from "./campaigns.js";
 import {
   derivarFingerprintContaGmail,
@@ -567,6 +568,12 @@ export class ProvedorGmailCampanha implements ProvedorEnvioCampanha {
       // SLICE-03C.2A.1 — matriz normativa de classificação. AUTO_RETRY é
       // SEMPRE false neste slice (o canário proíbe segunda tentativa
       // automática); AMBIGUO ⇒ reconciliação HUMANA.
+      // SLICE-03C.2B1A — resolução de token (config/conexão/decrypt/refresh)
+      // falhou ANTES de qualquer messages.send: SEMPRE FALHA_PRE_PROVIDER.
+      // Nunca AMBIGUO (nada foi despachado) e nunca rejeição de envio.
+      if (error instanceof CampanhaTokenResolutionError) {
+        return { tipo: "FALHA_PRE_PROVIDER", motivo: "TOKEN_RESOLUTION_INDISPONIVEL" };
+      }
       if (error instanceof GmailAmbiguousError) {
         return { tipo: "AMBIGUO", motivo: "GMAIL_AMBIGUO" };
       }

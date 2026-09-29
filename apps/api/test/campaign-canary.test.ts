@@ -48,6 +48,7 @@ import {
 import { chaveIdempotenciaExecucao } from "../src/campaign-execution.js";
 import { fingerprintDestinatarioCampanha } from "../src/campaign-control.js";
 import {
+  derivarFingerprintContaGmail,
   GmailAmbiguousError,
   GmailAuthError,
   GmailHttpTransport,
@@ -121,6 +122,19 @@ function tokenSintetico(semente: string): string {
 function fingerprintUnico(semente: string): string {
   return createHash("sha256").update(semente).digest("hex");
 }
+// ---------------------------------------------------------------------------
+// SLICE_03C.2A.3 — CONSTANTES SINTÉTICAS ÚNICAS (fonte única para o ambiente
+// E para a fixture OAuth — sem leitura implícita de env no helper; sem segredo
+// real; nonce com EXATAMENTE 12 bytes e auth tag com EXATAMENTE 16 bytes,
+// conforme os CHECKs do schema oauth_connection).
+// ---------------------------------------------------------------------------
+const CHAVE_FINGERPRINT_FIXTURE_B64 = Buffer.from(
+  "fp-fixture-key-03c2a3-32bytes!!!",
+  "utf8",
+).toString("base64"); // exatamente 32 bytes ao decodificar (exige HmacSha256Fingerprinter)
+const OAUTH_NONCE_FIXTURE = Buffer.from("nonce1234567", "utf8"); // exatamente 12 bytes
+const OAUTH_AUTH_TAG_FIXTURE = Buffer.alloc(16); // exatamente 16 bytes
+
 /**
  * Recomposição INDEPENDENTE (teste) do contrato vigente de hash de evento:
  * CAMPANHA_CONTROLE_HASH_V2 — HMAC-SHA256 sobre framing JSON canônico de
@@ -227,6 +241,33 @@ describe("SLICE_03C.2A.2 — contratos de fixture (fonte única, determinístico
     expect(c1).toMatch(/^[0-9a-f]{64}$/);
     expect(c2).toMatch(/^[0-9a-f]{64}$/);
     expect(c1).not.toBe(c2);
+  });
+
+  it("03C.2A.3. fingerprint default = conta esperada; divergente ≠; helper sem sufixo (fonte)", () => {
+    const fp = new HmacSha256Fingerprinter(Buffer.from(CHAVE_FINGERPRINT_FIXTURE_B64, "base64"));
+    const esperado = derivarFingerprintContaGmail(fp, "institucional.sintetico@exemplo.test");
+    const divergente = derivarFingerprintContaGmail(fp, "outra.conta@exemplo.test");
+    // DEFAULT_FINGERPRINT_MATCH=true — o default do helper deriva da MESMA
+    // conta esperada; DIVERGENT_MISMATCH=true — conta diferente ⇒ hash ≠.
+    expect(esperado).toMatch(/^[0-9a-f]{64}$/);
+    expect(divergente).toMatch(/^[0-9a-f]{64}$/);
+    expect(divergente).not.toBe(esperado);
+    // Estrutural: o helper NÃO acrescenta sufixo à conta default (a fonte do
+    // próprio teste não contém concatenação de sufixo na conta esperada).
+    const fonteTeste = readFileSync(new URL("./campaign-canary.test.ts", import.meta.url), "utf8");
+    // Construído dinamicamente para a asserção não conter o próprio literal.
+    const sufixoProibido = "CONTA_ESPERADA" + " " + '+' + " " + '"' + "+" + '"';
+    expect(fonteTeste).not.toContain(sufixoProibido);
+    expect(fonteTeste).toContain("const alvo = detalhe ?? CONTA_ESPERADA;");
+  });
+
+  it("03C.2A.3. nonce=12 bytes, authTag=16 bytes, chave de fingerprint válida (contrato do schema)", () => {
+    expect(OAUTH_NONCE_FIXTURE.length).toBe(12);
+    expect(OAUTH_AUTH_TAG_FIXTURE.length).toBe(16);
+    const decodificada = Buffer.from(CHAVE_FINGERPRINT_FIXTURE_B64, "base64");
+    expect(decodificada.length).toBe(32);
+    // A MESMA constante é usada pelo ambienteBase e pela fixture OAuth —
+    // FINGERPRINT_KEY_SOURCE_MATCH=true por construção (fonte única).
   });
 
   it("D. hashEventoTeste (V2 independente): mesmo lote + mesmo timestamp + ids distintos ⇒ hashes distintos de 64 hex", () => {
@@ -660,11 +701,20 @@ describe("SLICE_03C.2A — HTTP fail-closed (contrato determinístico)", () => {
     expect(resposta.corpo).toContain("INDIVIDUAL_OPERATOR_AUTH_REQUIRED");
   });
 
-  it("lookup indisponível (DATABASE_URL isoladamente removida) → 503 OPERATOR_IDENTITY_UNAVAILABLE", async () => {
+  it("lookup indisponível → 503 OPERATOR_IDENTITY_UNAVAILABLE (IMPORTAÇÃO ISOLADA; singleton intocado)", async () => {
+    // SERVER_SINGLETON_CROSS_TEST_LEAK=false: a instância estática
+    // (despacharSemBanco) NUNCA é usada sem DATABASE_URL. A prova do 503 usa
+    // uma importação isolada (vi.resetModules + import dinâmico) que morre no
+    // fim do teste — o cache recursos.pool da instância compartilhada fica
+    // intocado para o teste seguinte.
     const urlOriginal = process.env.DATABASE_URL;
-    delete process.env.DATABASE_URL; // isolamento determinístico do lookup
+    delete process.env.DATABASE_URL;
+    let despacharIsolado: Despachar | undefined;
     try {
-      const resposta = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
+      vi.resetModules();
+      const servidorIsolado = await import("../src/server.js");
+      despacharIsolado = servidorIsolado.despachar as Despachar;
+      const resposta = await despacharIsolado("POST", "/api/campaigns/canary-send", {
         headers: { cookie: COOKIE_SESSAO },
         corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
       });
@@ -672,15 +722,17 @@ describe("SLICE_03C.2A — HTTP fail-closed (contrato determinístico)", () => {
       expect(resposta.corpo).toContain("OPERATOR_IDENTITY_UNAVAILABLE");
     } finally {
       if (urlOriginal !== undefined) process.env.DATABASE_URL = urlOriginal;
+      vi.resetModules(); // descarta a instância contaminada (não reutilizada)
     }
   });
 
-  it("sessão em formato válido mas inexistente com banco disponível → 401 (determinístico na CI)", async () => {
+  it("sessão em formato válido mas inexistente com banco disponível → 401 (instância NÃO contaminada)", async () => {
     if (!process.env.DATABASE_URL) {
-      // Sem banco local, a indisponibilidade do lookup domina (503) — a prova
-      // do 401-determinístico é DB-gated (último teste da Parte 5).
+      // Sem banco local, a prova determinística do 401 é DB-gated (Parte 5).
       return;
     }
+    // A instância estática nunca foi usada sem DATABASE_URL (o 503 usou
+    // importação isolada) — nenhum pool envenenado aqui.
     const resposta = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
       headers: { cookie: COOKIE_SESSAO },
       corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
@@ -747,7 +799,8 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     process.env.GMAIL_OAUTH_REDIRECT_URI = "https://exemplo.test/callback";
     process.env.GMAIL_EXPECTED_ACCOUNT = CONTA_ESPERADA;
     process.env.DATA_ENCRYPTION_KEY_BASE64 = Buffer.from("0123456789abcdef0123456789abcdef").toString("base64");
-    process.env.DOCUMENT_FINGERPRINT_KEY_BASE64 = Buffer.from("fedcba9876543210fedcba9876543210").toString("base64");
+    // Fonte ÚNICA: a MESMA constante usada pela fixture OAuth (source match).
+    process.env.DOCUMENT_FINGERPRINT_KEY_BASE64 = CHAVE_FINGERPRINT_FIXTURE_B64;
   }
 
   interface CenaCanario {
@@ -843,18 +896,21 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
   // outra suíte; executa também após falha intermediária via afterEach).
   const conexoesOAuthDaSuite: string[] = [];
 
+  // 03C.2A.3 — o helper NÃO lê env implícita: usa a MESMA constante sintética
+  // do ambienteBase (FINGERPRINT_KEY_SOURCE_MATCH=true). O comportamento
+  // default persiste a conta EXATAMENTE esperada (CONTA_ESPERADA, sem
+  // sufixo) ⇒ DEFAULT_FINGERPRINT_MATCH=true. A unicidade entre chamadas já
+  // é garantida pelo cleanup OWNED por id (afterEach) — nunca por alterar a
+  // conta que deveria corresponder. O parâmetro explícito existe SOMENTE para
+  // o cenário divergente (outra.conta@exemplo.test ⇒ DIVERGENT_MISMATCH=true).
   async function conectarOAuthCorrespondente(detalhe?: string): Promise<string> {
     const { derivarFingerprintContaGmail } = await import("@integra-correios/mail");
-    const fp = new HmacSha256Fingerprinter(
-      Buffer.from(process.env.DOCUMENT_FINGERPRINT_KEY_BASE64!, "base64"),
-    );
-    // Conta sintética PRÓPRIA por chamada ⇒ (provider, conta_fingerprint)
-    // nunca se repete ⇒ zero colisão em UNIQUE(provider, conta_fingerprint).
-    const alvo = detalhe ?? (CONTA_ESPERADA + "+" + randomUUID().slice(0, 8));
+    const fp = new HmacSha256Fingerprinter(Buffer.from(CHAVE_FINGERPRINT_FIXTURE_B64, "base64"));
+    const alvo = detalhe ?? CONTA_ESPERADA;
     const fingerprintConta = derivarFingerprintContaGmail(fp, alvo);
     const inserida = await pool!.query(
       "INSERT INTO oauth_connection (provider, conta_fingerprint, scopes, access_token_ciphertext, access_token_nonce, access_token_auth_tag, chave_versao) VALUES ('GMAIL', $1, ARRAY['https://www.googleapis.com/auth/gmail.send']::text[], $2, $3, $4, 'v1-teste') RETURNING id",
-      [fingerprintConta, Buffer.from("ciphertext-sintetico"), Buffer.from("0123456789abcdef"), Buffer.alloc(16)],
+      [fingerprintConta, Buffer.from("ciphertext-sintetico"), OAUTH_NONCE_FIXTURE, OAUTH_AUTH_TAG_FIXTURE],
     );
     const id = (inserida.rows[0] as { id: string }).id;
     conexoesOAuthDaSuite.push(id);
@@ -905,12 +961,14 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(login.status).toBe(200);
     executorCookie = firstCookie(login.headers["set-cookie"]);
 
+    // ORDEM OBRIGATÓRIA (03C.2A.3): 1 cena → 2 ambiente → 3 OAuth →
+    // 4 provider DI → 5 rota (ENV_READY_BEFORE_OAUTH=true).
     const cena = await criarCenaCanario({
       operatorId: executorIdReal,
       emails: ["canario.rota.a@exemplo.test"],
     });
-    await conectarOAuthCorrespondente();
-    ambienteBase(cena.fingerprints[0]!, false); // canarySendEnabled=FALSE
+    ambienteBase(cena.fingerprints[0]!, false);
+    await conectarOAuthCorrespondente(); // canarySendEnabled=FALSE
 
     const providerEspiao = {
       nome: "ESPIA_DI",
@@ -955,12 +1013,14 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(login.status).toBe(200);
     const cookieB = firstCookie(login.headers["set-cookie"]);
 
+    // ORDEM OBRIGATÓRIA (03C.2A.3): 1 cena → 2 ambiente → 3 OAuth →
+    // 4 provider DI → 5 rota (ENV_READY_BEFORE_OAUTH=true).
     const cena = await criarCenaCanario({
       operatorId: operatorIdB,
       emails: ["canario.rota.b@exemplo.test"],
     });
-    await conectarOAuthCorrespondente();
-    ambienteBase(cena.fingerprints[0]!, true); // canarySendEnabled=TRUE
+    ambienteBase(cena.fingerprints[0]!, true);
+    await conectarOAuthCorrespondente(); // canarySendEnabled=TRUE
 
     let chamadasProvider = 0;
     injetarProvedor!({
@@ -1028,12 +1088,14 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(login.status).toBe(200);
     const cookieD = firstCookie(login.headers["set-cookie"]);
 
+    // ORDEM OBRIGATÓRIA (03C.2A.3): 1 cena → 2 ambiente → 3 OAuth →
+    // 4 provider DI → 5 rota (ENV_READY_BEFORE_OAUTH=true).
     const cena = await criarCenaCanario({
       operatorId: operatorIdD,
       emails: ["canario.rota.d@exemplo.test"],
     });
-    await conectarOAuthCorrespondente();
     ambienteBase(cena.fingerprints[0]!, true);
+    await conectarOAuthCorrespondente();
     // Corrompe a outbox: fingerprint persistido ≠ snapshot ≠ configuração.
     await pool!.query(
       "UPDATE outbox_campanha SET destinatario_fingerprint = $1 WHERE lote_campanha_id = $2",
@@ -1093,10 +1155,10 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     vi.stubGlobal("fetch", espiaoRede);
 
     // E.1 — configuração OAuth ausente ⇒ CONFIGURATION_REQUIRED.
+    ambienteBase(cena.fingerprints[0]!, false);
     for (const chave of ["GMAIL_OAUTH_CLIENT_ID", "GMAIL_OAUTH_CLIENT_SECRET", "GMAIL_OAUTH_REDIRECT_URI"]) {
       delete process.env[chave];
     }
-    ambienteBase(cena.fingerprints[0]!, false);
     for (const chave of ["GMAIL_OAUTH_CLIENT_ID", "GMAIL_OAUTH_CLIENT_SECRET", "GMAIL_OAUTH_REDIRECT_URI"]) {
       delete process.env[chave];
     }
@@ -1118,7 +1180,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(corpo.oauth.estado).toBe("NOT_CONNECTED");
 
     // E.3 — conexão persistida DIVERGENTE ⇒ NOT_CONNECTED (conta ≠ esperada).
-    await conectarOAuthCorrespondente("outra.conta@exemplo.test");
+    const idDivergente = await conectarOAuthCorrespondente("outra.conta@exemplo.test");
     resposta = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cena.campanhaId}`, {
       headers: { cookie: cookieE },
     });
@@ -1127,15 +1189,15 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(corpo.oauth.connectionStored).toBe(true);
     expect(corpo.oauth.storedAccountMatchesExpected).toBe(false);
 
-    // E.4 — conexão CORRESPONDENTE ⇒ CONNECTED (readiness, NÃO liveness).
-    // Isolamento OWNED: revoga APENAS as conexões criadas por esta suíte
-    // (nunca DELETE global; nenhum dado operacional é tocado).
-    for (const id of conexoesOAuthDaSuite) {
-      await pool!.query(
-        "UPDATE oauth_connection SET revogada_em = now() WHERE id = $1 AND provider = 'GMAIL'",
-        [id],
-      );
-    }
+    // E.4 — revoga SOMENTE a conexão divergente OWNED (cleanup por id;
+    // nunca DELETE global; nenhum dado operacional ou de outra suíte é
+    // tocado) e insere a conexão com a conta EXATAMENTE esperada ⇒ CONNECTED
+    // (readiness, NÃO liveness: zero refresh, zero rede, zero token).
+    await pool!.query(
+      "UPDATE oauth_connection SET revogada_em = now() WHERE id = $1 AND provider = 'GMAIL'",
+      [idDivergente],
+    );
+    conexoesOAuthDaSuite.splice(conexoesOAuthDaSuite.indexOf(idDivergente), 1);
     await conectarOAuthCorrespondente();
     resposta = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cena.campanhaId}`, {
       headers: { cookie: cookieE },

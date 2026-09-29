@@ -17,6 +17,17 @@ export interface OutboundMail {
   readonly confirmationId: string;
   readonly to: string;
   readonly replyTo: string;
+  /**
+   * SLICE-03C.2A — remetente neutro/injetado server-side. Ausente ⇒
+   * comportamento LEGADO do piloto (PILOT_SENDER) é preservado sem quebra.
+   * O browser NUNCA escolhe o From.
+   */
+  readonly from?: { readonly name: string; readonly address: string };
+  /**
+   * SLICE-03C.2A — tag de domínio do Message-ID da campanha (derivada do
+   * endereço institucional homologado; nunca o domínio hardcoded do piloto).
+   */
+  readonly messageTag?: string;
   readonly subject: string;
   readonly textBody: string;
   readonly htmlBody: string;

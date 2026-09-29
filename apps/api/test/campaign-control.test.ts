@@ -80,6 +80,7 @@ const politicaFechada: PfUpdateCampaignPolicy = {
   canExecute: false,
   canPrepareBatch: false,
   realSendEnabled: false,
+  canarySendEnabled: false,
 };
 
 // Fonte dos módulos — provas estruturais (Parte 2).
@@ -119,6 +120,7 @@ describe("SLICE_03B — política de preparação e elegibilidade por ação (BE
       canExecute: false,
       canPrepareBatch: false,
       realSendEnabled: false,
+      canarySendEnabled: false,
     });
   });
 
@@ -899,7 +901,7 @@ describe("SLICE_03B — estrutura de fonte (SOURCE_STRUCTURE)", () => {
     expect(FONTE_WORKSPACE).toContain("execução indisponível");
     // O botão de execução da Macroetapa 4 permanece SEMPRE desabilitado.
     const indice = FONTE_WORKSPACE.indexOf("Controle operacional (readiness)");
-    const trecho = FONTE_WORKSPACE.slice(indice, indice + 5600);
+    const trecho = FONTE_WORKSPACE.slice(indice, indice + 8600);
     // Nenhuma autoridade local dentro do painel de controle (o único
     // sessionStorage do arquivo é a limpeza legada de logout, fora daqui).
     expect(trecho).not.toMatch(/sessionStorage|localStorage/i);

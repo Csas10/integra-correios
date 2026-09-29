@@ -86,6 +86,40 @@ import {
   prepararLoteCampanha,
   autorizarExecucaoCampanha,
 } from "./campaign-control.js";
+// SLICE-03C.2A — fundação runtime do canário (preflight ZERO CLAIM,
+// provider Gmail, OAuth readiness read-only). STRICT NO SEND: o caminho só
+// arma com PF_CAMPAIGN_CANARY_SEND_ENABLED=true (política) e a UI não tem
+// handler de envio.
+import {
+  ProvedorGmailCampanha,
+  avaliarReadinessOauthCanario,
+  enviarCanarioCampanha,
+  statusOauthFromReadiness,
+} from "./campaign-canary.js";
+import type { ProvedorEnvioCampanha } from "./campaign-execution.js";
+//
+// SLICE-03C.2A.1 (Seção C) — INJEÇÃO DE PROVIDER EXCLUSIVA PARA TESTE:
+// dependency injection de fábrica, NUNCA selecionável por request (query/
+// body/header/cookie), NUNCA por variável operacional genérica, NUNCA por
+// NODE_ENV. O runtime normal SEMPRE constrói o provider Gmail real (com
+// transport/token não configurados nesta fatia ⇒ FALHA_PRE_PROVIDER).
+// TEST_PROVIDER_DEPENDENCY_INJECTION=true.
+let provedorCanarioParaTeste: ProvedorEnvioCampanha | null = null;
+export function injetarProvedorCanarioParaTeste(
+  provider: ProvedorEnvioCampanha | null,
+): void {
+  provedorCanarioParaTeste = provider;
+}
+
+function provedorCanarioRuntime(campanhaId: string): ProvedorEnvioCampanha {
+  if (provedorCanarioParaTeste) return provedorCanarioParaTeste;
+  return new ProvedorGmailCampanha({
+    pool: requireDbPool(),
+    campanhaId,
+    gateway: new GmailMailGateway(undefined, async () => undefined),
+  });
+}
+
 import {
   CampaignPersistenceError,
   listarCampanhasRetomaveis,
@@ -105,6 +139,7 @@ import {
   loadGmailOauthConfig,
   oauthStatusFromEnvironment,
   OAUTH_BINDING_COOKIE,
+  GmailMailGateway,
 } from "@integra-correios/mail";
 import {
   avaliarReadiness,
@@ -200,6 +235,7 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "POST /api/campaigns/prepare",
   "POST /api/campaigns/authorize-execution",
   "POST /api/campaigns/activate",
+  "POST /api/campaigns/canary-send",
   "POST /api/campaigns/execute-attempt",
 ]);
 
@@ -1562,6 +1598,16 @@ const ROTAS: readonly Rota[] = [
           canarySelecionado: estoque.canarySelected,
           realSendEnabled: politica.realSendEnabled,
         });
+        // SLICE-03C.2A — OAuth readiness READ-ONLY (sem rede, sem token,
+        // sem refresh): estados sanitizados + semântica CONNECTED restrita a
+        // "persistido e conta esperada correspondente".
+        const oauth = await avaliarReadinessOauthCanario(requireDbPool(), fingerprinter());
+        // SLICE-03C.2A.1 (Seção E) — a rota consome a DERIVAÇÃO CANÔNICA
+        // statusOauthFromReadiness (mesma função do gate). Readiness ≠
+        // liveness: TOKEN_REFRESHES=0, GOOGLE_NETWORK_CALLS=0, nenhum token
+        // descriptografado; CONNECTED não prova token/refresh/reachability/
+        // send-as (03C.2B1).
+        const oauthEstado = statusOauthFromReadiness(oauth);
         json(res, 200, {
           campanha: { campanhaId, estado: "LOTE_CRIADO" },
           lote: {
@@ -1575,6 +1621,7 @@ const ROTAS: readonly Rota[] = [
             canPrepareBatch: politica.canPrepareBatch,
             canExecute: politica.canExecute,
             realSendEnabled: politica.realSendEnabled,
+            canarySendEnabled: politica.canarySendEnabled,
           },
           autorizacaoHumana: {
             concedida: estoque.autorizacaoHumana.concedida,
@@ -1586,6 +1633,26 @@ const ROTAS: readonly Rota[] = [
             canarySelected: estoque.canarySelected,
             canaryReferencePresent: estoque.canaryReferencePresent,
             providerReady: estoque.providerReady,
+          },
+          // SLICE-03C.2A — campos sanitizados (nenhum e-mail, fingerprint,
+          // token ou segredo). CONNECTED ⇒ somente "persistido + conta
+          // esperada correspondente"; NÃO significa token ao vivo testado.
+          oauth: {
+            configurationReady: oauth.oauthConfigurationReady,
+            connectionStored: oauth.oauthConnectionStored,
+            expectedAccountConfigured: oauth.oauthExpectedAccountConfigured,
+            storedAccountMatchesExpected: oauth.oauthStoredAccountMatchesExpected,
+            encryptionConfigurationReady: oauth.oauthEncryptionConfigurationReady,
+            executionReady: oauth.executionReady,
+            estado: oauthEstado,
+            // Readiness é liveness-free: nenhuma prova de token ao vivo.
+            tokenRefreshes: 0,
+            googleNetworkCalls: 0,
+          },
+          envioCanario: {
+            armado: politica.canarySendEnabled,
+            providerWiringReady: estoque.providerReady || oauth.executionReady,
+            gateOperacional: "PENDING_OWNER",
           },
           acoes: {
             PREPARAR_LOTE: { permitida: preparacao.permitida, bloqueios: preparacao.bloqueios },
@@ -1601,7 +1668,9 @@ const ROTAS: readonly Rota[] = [
               ? "AUTORIZAR_EXECUCAO"
               : ativacao.permitida
                 ? "ATIVAR_LOTE"
-                : "AGUARDAR_GATES_OPERACIONAIS",
+                : politica.canarySendEnabled
+                  ? "CANARY_SEND_BLOQUEADO"
+                  : "AGUARDAR_GATES_OPERACIONAIS",
         });
       } catch (error) {
         erroControleCampanha(res, error);
@@ -1760,6 +1829,87 @@ const ROTAS: readonly Rota[] = [
       } catch (error) {
         erroControleCampanha(res, error);
       }
+    },
+  },
+  {
+    // SLICE-03C.2A — CANARY SEND (STRICT NO SEND neste gate). Corpo aceita
+    // EXCLUSIVAMENTE campanhaId (UUID); itemId/lote/destinatário/fingerprint/
+    // provas/flags/provider são reconstruídos SERVER-SIDE (evento persistido
+    // + snapshot congelado + política única). Preflight read-only OBRIGATÓRIO
+    // antes do claim: qualquer bloqueio ⇒ ZERO claim, ZERO mutação, ZERO
+    // evento, ZERO token, ZERO provider, ZERO rede. Resposta sanitizada
+    // (sem e-mail, fingerprint, HMAC, token ou segredo).
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/canary-send",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      let body: { campanhaId?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_CANARY_JSON_INVALID" });
+        return;
+      }
+      if (!operatorUuidValido(body.campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_CANARY_INVALID",
+        });
+        return;
+      }
+      const recebidas = Object.keys((body as Record<string, unknown>)).filter((k) => k !== "campanhaId");
+      if (recebidas.length > 0) {
+        json(res, 422, {
+          erro: "Somente campanhaId é aceito — nenhuma autoridade adicional do cliente.",
+          codigo: "CAMPAIGN_CANARY_BODY_AUTHORITY",
+        });
+        return;
+      }
+      const politica = carregarPoliticaCampanhaAtualizacao();
+      // SLICE-03C.2A.1 (Matriz A) — armamento ausente: gate de POLÍTICA antes
+      // de qualquer leitura de banco, evento, token ou provider (409 estável;
+      // ZERO tudo).
+      if (!politica.canarySendEnabled) {
+        json(res, 409, {
+          erro: "Envio do canário não está armado — nenhuma execução foi iniciada.",
+          codigo: "CAMPAIGN_CANARY_SEND_DISABLED",
+          bloqueios: ["CANARY_SEND_DISABLED"],
+          claims: 0,
+        });
+        return;
+      }
+      // SLICE-03C.2A.1 (Seção C) — provider via DI exclusiva para teste;
+      // runtime normal constrói o provider Gmail da campanha.
+      const resultado = await enviarCanarioCampanha(requireDbPool(), {
+        operatorId: identity.operatorId,
+        campanhaId: body.campanhaId as string,
+        politica,
+        provider: provedorCanarioRuntime(body.campanhaId as string),
+        contexto: { fingerprinter: fingerprinter() },
+      });
+      if (resultado.tipo === "BLOQUEADO") {
+        // ZERO CLAIM OBRIGATÓRIO: bloqueios do preflight, sanitizados.
+        json(res, 409, {
+          erro: "Envio do canário bloqueado — nenhuma execução foi iniciada.",
+          codigo: "CAMPAIGN_CANARY_BLOCKED",
+          bloqueios: resultado.bloqueios,
+          claims: 0,
+        });
+        return;
+      }
+      const tentativa = resultado.resultado;
+      json(res, 200, {
+        resultado: tentativa.resultado,
+        itemId: tentativa.itemId,
+        ...(tentativa.resultado === "NAO_CLAIMADO" ? { claim: tentativa.claim } : {}),
+        ...(tentativa.resultado === "ENVIADO" ? { receipt: tentativa.receipt } : {}),
+        ...(tentativa.resultado === "FALHA_PRE_PROVIDER" ||
+          tentativa.resultado === "FALHA_DEFINITIVA" ||
+          tentativa.resultado === "AMBIGUO"
+          ? { motivo: tentativa.motivo }
+          : {}),
+      });
     },
   },
   {

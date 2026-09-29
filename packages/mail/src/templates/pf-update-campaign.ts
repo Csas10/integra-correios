@@ -1,5 +1,15 @@
 import type { OutboundMail } from "../domain/message.js";
-import { PILOT_SENDER } from "./pf-pilot.js";
+
+/**
+ * SLICE-03C.2A — identidade de remetente INJETADA server-side: o template da
+ * campanha NÃO depende mais do piloto (PILOT_SENDER). O endereço institucional
+ * homologado (carteiras@crtba.org.br) é fornecido pela fronteira runtime
+ * (derivação server-side); o browser não escolhe From, Reply-To nem Message-ID.
+ */
+export interface RemetenteCampanha {
+  readonly name: string;
+  readonly address: string;
+}
 
 export const PF_UPDATE_CAMPAIGN_TEMPLATE_VERSION =
   "pf-atualizacao-cadastral-2026-v1" as const;
@@ -14,6 +24,10 @@ export interface PfUpdateCampaignMailInput {
   readonly recipient: string;
   readonly professionalName: string;
   readonly correlationCode: string;
+  /** Identidade server-side (obrigatória no caminho da campanha). */
+  readonly remetente: RemetenteCampanha;
+  /** Tag do Message-ID (ex.: "pf-campanha"); domínio vem do remetente. */
+  readonly messageTag?: string;
 }
 
 function escapeHtml(value: string): string {
@@ -40,9 +54,20 @@ const CAMPOS_RESPOSTA = [
 export function renderPfUpdateCampaignMail(input: PfUpdateCampaignMailInput): OutboundMail {
   const nome = input.professionalName.trim();
   const correlationCode = input.correlationCode.trim();
+  const remetente = input.remetente;
+  const messageTag = (input.messageTag ?? "pf-campanha").trim() || "pf-campanha";
   if (!nome) throw new Error("Nome de exibição é obrigatório");
   if (!correlationCode || /[\r\n]/.test(correlationCode)) {
     throw new Error("Código de correlação inválido");
+  }
+  if (
+    !remetente ||
+    !remetente.name.trim() ||
+    !/^[^@\s]+@[^@\s]+\.[a-z]{2,}$/.test(remetente.address.trim().toLowerCase()) ||
+    /[\r\n]/.test(remetente.name) ||
+    /[\r\n]/.test(remetente.address)
+  ) {
+    throw new Error("Remetente da campanha inválido");
   }
 
   const textBody = [
@@ -73,7 +98,9 @@ export function renderPfUpdateCampaignMail(input: PfUpdateCampaignMailInput): Ou
       `pf-update:${input.campaignId}:${input.itemId}:${PF_UPDATE_CAMPAIGN_TEMPLATE_VERSION}`,
     confirmationId: input.itemId,
     to: input.recipient,
-    replyTo: PILOT_SENDER.address,
+    from: { name: remetente.name.trim(), address: remetente.address.trim().toLowerCase() },
+    messageTag,
+    replyTo: remetente.address.trim().toLowerCase(),
     subject: PF_UPDATE_CAMPAIGN_SUBJECT,
     textBody,
     htmlBody,

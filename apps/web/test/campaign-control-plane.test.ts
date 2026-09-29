@@ -46,10 +46,35 @@ describe("SLICE_03B — Macroetapa 4: plano de controle operacional (frontend)",
 
   it("TODAS as ações de execução permanecem desabilitadas com as políticas fechadas", () => {
     const indice = FONTE_WORKSPACE.indexOf("Controle operacional (readiness)");
-    const trecho = FONTE_WORKSPACE.slice(indice, indice + 5600);
+    const trecho = FONTE_WORKSPACE.slice(indice, indice + 7800);
     expect(trecho).toMatch(/type="button"\s+disabled=\{\s*!/);
     expect(trecho).toMatch(/type="button"\s+disabled>/);
     expect(trecho).toContain("Executar (provider indisponível — envio não autorizado)");
+  });
+
+  it("SLICE_03C.2A — readiness exibe OAuth read-only, canarySendEnabled e gate operacional pendente (P)", () => {
+    const indice = FONTE_WORKSPACE.indexOf("Controle operacional (readiness)");
+    const trecho = FONTE_WORKSPACE.slice(indice, indice + 7800);
+    expect(trecho).toContain("canarySendEnabled=");
+    expect(trecho).toContain("OAuth: configuração=");
+    expect(trecho).toContain("sem\n                    teste ao vivo de token");
+    expect(trecho).toContain('envioCanario.gateOperacional');
+    expect(trecho).toContain("gateOperacional");
+  });
+
+  it("SLICE_03C.2A — Executar canário SEMPRE disabled, sem onClick e sem handler de envio (Q)", () => {
+    const indice = FONTE_WORKSPACE.indexOf('Executar canário (gate operacional pendente');
+    expect(indice).toBeGreaterThan(-1);
+    const abertura = FONTE_WORKSPACE.lastIndexOf("<button", indice);
+    const botao = FONTE_WORKSPACE.slice(abertura, indice + 200);
+    expect(botao).toContain('<button type="button" disabled>');
+    expect(botao.slice(0, botao.indexOf("Executar canário (gate"))).not.toContain("onClick");
+    // Nenhum handler de envio do canário existe no cliente.
+    const codigo = FONTE_WORKSPACE
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    expect(codigo).not.toContain("canary-send");
+    expect(codigo).not.toContain("executarCanario");
   });
 
   it("nenhuma autorização é derivada no cliente; ações refletem a capacidade do servidor", () => {

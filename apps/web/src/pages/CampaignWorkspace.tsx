@@ -53,6 +53,7 @@ type ReadinessOperacional = {
     canPrepareBatch: boolean;
     canExecute: boolean;
     realSendEnabled: boolean;
+    canarySendEnabled: boolean;
   };
   autorizacaoHumana: { concedida: boolean; referenciaPresente: boolean };
   // SLICE-03C.1 — campos de ativação (não sensíveis: nenhum fingerprint,
@@ -69,6 +70,22 @@ type ReadinessOperacional = {
     AUTORIZAR_EXECUCAO: AcaoOperacao;
     ATIVAR_LOTE: AcaoOperacao;
     EXECUTAR_ITEM: AcaoOperacao;
+  };
+  // SLICE-03C.2A — OAuth readiness read-only (estados sanitizados).CONNECTED
+  // significa SOMENTE "persistido + conta esperada correspondente" — nunca
+  // token testado ao vivo ou Gmail alcançável.
+  oauth: {
+    configurationReady: boolean;
+    connectionStored: boolean;
+    expectedAccountConfigured: boolean;
+    storedAccountMatchesExpected: boolean;
+    encryptionConfigurationReady: boolean;
+    executionReady: boolean;
+  };
+  envioCanario: {
+    armado: boolean;
+    providerWiringReady: boolean;
+    gateOperacional: string;
   };
   executavel: false;
   envioRealDesabilitado: boolean;
@@ -2020,7 +2037,15 @@ export function CampaignWorkspace() {
                   <li>
                     Políticas: canPrepareBatch={String(readiness.politicas.canPrepareBatch)} ·
                     canExecute={String(readiness.politicas.canExecute)} ·
-                    realSendEnabled={String(readiness.politicas.realSendEnabled)}
+                    realSendEnabled={String(readiness.politicas.realSendEnabled)} ·
+                    canarySendEnabled={String(readiness.politicas.canarySendEnabled)}
+                  </li>
+                  <li>
+                    OAuth: configuração={String(readiness.oauth.configurationReady)} · conexão
+                    persistida={String(readiness.oauth.connectionStored)} · conta esperada
+                    correspondente={String(readiness.oauth.storedAccountMatchesExpected)} ·
+                    estado={readiness.oauth.executionReady ? "CONNECTED" : "NÃO_CONECTADO"} (sem
+                    teste ao vivo de token)
                   </li>
                   <li>
                     Autorização humana:{" "}
@@ -2039,6 +2064,11 @@ export function CampaignWorkspace() {
                   <li>
                     Provider: indisponível nesta fase · envio real desabilitado:{" "}
                     {String(readiness.envioRealDesabilitado)}
+                  </li>
+                  <li>
+                    Canário: armado={String(readiness.envioCanario.armado)} · wiring do
+                    provider={String(readiness.envioCanario.providerWiringReady)} · gate
+                    operacional: {readiness.envioCanario.gateOperacional}
                   </li>
                   <li>Próxima ação necessária: {readiness.proximaAcao}</li>
                 </ul>
@@ -2091,9 +2121,14 @@ export function CampaignWorkspace() {
                     {acaoPendente === "ATIVAR" ? "Ativando…" : "Ativar lote"}
                   </button>
                   {/* SLICE-03C.1 — Executar permanece SEMPRE disabled, sem
-                      onClick: nenhum handler chama execute-attempt no cliente. */}
+                      onClick: nenhum handler chama execute-attempt no cliente.
+                      SLICE-03C.2A — Executar canário também é SEM handler:
+                      gate operacional do owner pendente (STRICT NO SEND). */}
                   <button type="button" disabled>
                     Executar (provider indisponível — envio não autorizado)
+                  </button>
+                  <button type="button" disabled>
+                    Executar canário (gate operacional pendente — envio não autorizado)
                   </button>
                 </div>
                 <small role="status">

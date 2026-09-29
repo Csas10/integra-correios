@@ -81,15 +81,11 @@ import {
 import {
   CampaignControlError,
   avaliarAcaoOperacaoCampanha,
-  emitirProvasServerSideCampanha,
+  ativarLoteCampanha,
   lerEstoqueOperacionalCampanha,
   prepararLoteCampanha,
   autorizarExecucaoCampanha,
 } from "./campaign-control.js";
-import {
-  executeAttemptCampanha,
-  ProvedorFakeCampanha,
-} from "./campaign-execution.js";
 import {
   CampaignPersistenceError,
   listarCampanhasRetomaveis,
@@ -203,6 +199,7 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "GET /api/campaigns/operational-readiness",
   "POST /api/campaigns/prepare",
   "POST /api/campaigns/authorize-execution",
+  "POST /api/campaigns/activate",
   "POST /api/campaigns/execute-attempt",
 ]);
 
@@ -1551,6 +1548,20 @@ const ROTAS: readonly Rota[] = [
           totalItens: estoque.totalItens,
           autorizacaoHumanaConcedida: estoque.autorizacaoHumana.concedida,
         });
+        // SLICE-03C.1 — elegibilidade da ATIVAÇÃO (sem segredo na resposta):
+        // prova exige chave dedicada; canário exige configuração server-side;
+        // ativação exige realSendEnabled=false (o envio só se arma no 03C.2).
+        const ativacao = avaliarAcaoOperacaoCampanha({
+          acao: "ATIVAR_LOTE",
+          politica,
+          loteEstado: estoque.loteEstado,
+          totalItens: estoque.totalItens,
+          autorizacaoHumanaConcedida: estoque.autorizacaoHumana.concedida,
+          proofKeyReady: estoque.proofKeyReady,
+          canaryRecipientConfigured: estoque.canaryRecipientConfigured,
+          canarySelecionado: estoque.canarySelected,
+          realSendEnabled: politica.realSendEnabled,
+        });
         json(res, 200, {
           campanha: { campanhaId, estado: "LOTE_CRIADO" },
           lote: {
@@ -1569,9 +1580,17 @@ const ROTAS: readonly Rota[] = [
             concedida: estoque.autorizacaoHumana.concedida,
             referenciaPresente: estoque.autorizacaoHumana.referencia !== null,
           },
+          ativacao: {
+            proofKeyReady: estoque.proofKeyReady,
+            canaryRecipientConfigured: estoque.canaryRecipientConfigured,
+            canarySelected: estoque.canarySelected,
+            canaryReferencePresent: estoque.canaryReferencePresent,
+            providerReady: estoque.providerReady,
+          },
           acoes: {
             PREPARAR_LOTE: { permitida: preparacao.permitida, bloqueios: preparacao.bloqueios },
             AUTORIZAR_EXECUCAO: { permitida: autorizacao.permitida, bloqueios: autorizacao.bloqueios },
+            ATIVAR_LOTE: { permitida: ativacao.permitida, bloqueios: ativacao.bloqueios },
             EXECUTAR_ITEM: { permitida: execucao.permitida, bloqueios: execucao.bloqueios },
           },
           executavel: false,
@@ -1580,7 +1599,9 @@ const ROTAS: readonly Rota[] = [
             ? "PREPARAR_LOTE"
             : autorizacao.permitida
               ? "AUTORIZAR_EXECUCAO"
-              : "AGUARDAR_GATES_OPERACIONAIS",
+              : ativacao.permitida
+                ? "ATIVAR_LOTE"
+                : "AGUARDAR_GATES_OPERACIONAIS",
         });
       } catch (error) {
         erroControleCampanha(res, error);
@@ -1742,84 +1763,88 @@ const ROTAS: readonly Rota[] = [
     },
   },
   {
-    // Entrypoint de TENTATIVA de execução (structural hook 03A). Provas são
-    // emitidas/verificadas server-side; com as flags fechadas a tentativa é
-    // bloqueada ANTES do claim/mutação/provider/Gmail. O provider é SEMPRE
-    // o fake determinístico nesta fatia e NUNCA é selecionável por request:
-    // com realSendEnabled=false a rota bloqueia antes de qualquer chamada.
+    // SLICE-03C.1 — RUNTIME HARD-DISABLE. Nenhum provider de execução existe
+    // no runtime nesta fatia: o entrypoint de TENTATIVA falha ANTES de provas,
+    // claim, mutação, INSERT de execução, provider ou Gmail — mesmo que todas
+    // as políticas estejam abertas, o lote esteja ATIVO, o item PREPARADO, a
+    // autorização vigente e o canário selecionado. O provider Gmail só será
+    // conectado no 03C.2, com nova autorização do owner. A validação de
+    // sessão/identidade permanece (a rota segue autenticada); nenhum estado
+    // operacional é lido ou escrito aqui.
     metodo: "POST",
     caminhoExato: "/api/campaigns/execute-attempt",
+    handler: async (req, res, _url, _corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      json(res, 409, {
+        erro:
+          "Execução desabilitada no runtime — nenhum provider está montado nesta fatia e nenhum item se torna executável.",
+        codigo: "CAMPAIGN_PROVIDER_DISABLED",
+        executavel: false,
+        providerReady: false,
+      });
+    },
+  },
+  {
+    // SLICE-03C.1 — ATIVAÇÃO EXPLÍCITA do lote (PREPARADO → ATIVO), com
+    // seleção durável de canário server-side na MESMA transação. O corpo
+    // aceita EXCLUSIVAMENTE campanhaId (UUID): operatorId, loteCampanhaId,
+    // itemId, e-mail, fingerprint, proofKey, estado, chave idempotente e
+    // provider são resolvidos server-side (sessão + banco + configuração) e
+    // NUNCA do cliente. A resposta não contém e-mail, fingerprint nem segredo.
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/activate",
     handler: async (req, res, _url, corpo) => {
       const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
       if (!identity) return;
-      let body: {
-        campanhaId?: unknown;
-        loteCampanhaId?: unknown;
-        itemId?: unknown;
-      };
+      let body: { campanhaId?: unknown };
       try {
         body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
       } catch {
-        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_EXEC_JSON_INVALID" });
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_ACTIVATE_JSON_INVALID" });
         return;
       }
-      const idsValidos =
-        operatorUuidValido(body.campanhaId) &&
-        operatorUuidValido(body.loteCampanhaId) &&
-        operatorUuidValido(body.itemId);
-      if (!idsValidos) {
+      if (!operatorUuidValido(body.campanhaId)) {
         json(res, 422, {
-          erro: "campanhaId, loteCampanhaId e itemId (UUID) são obrigatórios.",
-          codigo: "CAMPAIGN_EXEC_INVALID",
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_ACTIVATE_INVALID",
         });
         return;
       }
       try {
-        const provas = await emitirProvasServerSideCampanha(requireDbPool(), {
-          operatorId: identity.operatorId,
-          campanhaId: body.campanhaId as string,
-          loteCampanhaId: body.loteCampanhaId as string,
-          itemId: body.itemId as string,
-        });
-        if (!provas) {
-          // Alheio/inexistente indistinguíveis — sem mutação, sem evento.
+        const resultado = await ativarLoteCampanha(
+          requireDbPool(),
+          {
+            operatorId: identity.operatorId,
+            campanhaId: body.campanhaId as string,
+            politica: carregarPoliticaCampanhaAtualizacao(),
+            papeisOperador: identity.roles,
+          },
+        );
+        if (!resultado) {
+          // Alheio/inexistente indistinguíveis — 404 sanitizado, sem mutação.
           json(res, 404, {
-            erro: "Nenhum item para este identificador.",
-            codigo: "CAMPAIGN_EXEC_NOT_FOUND",
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
           });
           return;
         }
-        const resultado = await executeAttemptCampanha(requireDbPool(), {
-          operatorId: identity.operatorId,
-          campanhaId: body.campanhaId as string,
-          loteCampanhaId: body.loteCampanhaId as string,
-          itemId: body.itemId as string,
-          politica: carregarPoliticaCampanhaAtualizacao(),
-          provas: provas.provas,
-          // Injeção FIXA do fake determinístico (ZERO rede). Nenhuma seleção
-          // por request/config: com as políticas fechadas o fluxo nunca
-          // chega aqui (prova humana exige canExecute e emissão vigente).
-          provider: new ProvedorFakeCampanha([{ tipo: "ENVIADO" }]),
-        });
-        if (resultado.resultado === "ENVIADO") {
-          json(res, 409, {
-            erro: "Execução concluída não é esperada com as políticas atuais.",
-            codigo: "CAMPAIGN_EXEC_UNEXPECTED_SUCCESS",
-          });
-          return;
-        }
-        const bloqueios =
-          resultado.resultado === "NAO_CLAIMADO" && resultado.claim.resultado === "BLOQUEADO"
-            ? resultado.claim.bloqueios
-            : [];
-        json(res, 409, {
-          status: "CAMPAIGN_EXEC_BLOCKED",
-          resultado: resultado.resultado,
-          itemId: resultado.itemId,
-          bloqueios,
+        json(res, 200, {
+          status:
+            resultado.resultado === "ATIVADO"
+              ? "CAMPAIGN_BATCH_ACTIVATED"
+              : "CAMPAIGN_BATCH_ALREADY_ACTIVATED",
+          campanhaId: resultado.campanhaId,
+          lote: {
+            loteCampanhaId: resultado.loteCampanhaId,
+            codigo: resultado.loteCodigo,
+            totalItens: resultado.totalItens,
+          },
+          canarioReferenciaPresente: true,
           executavel: false,
+          providerReady: false,
           aviso:
-            "Tentativa bloqueada antes de claim/mutação/provider — nenhuma chamada de rede foi realizada.",
+            "Lote ATIVO permanece não executável: provider indisponível, nenhum item foi enfileirado e o Gmail não foi chamado.",
         });
       } catch (error) {
         erroControleCampanha(res, error);

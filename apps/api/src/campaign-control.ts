@@ -30,7 +30,7 @@
  *     provider válido é o injetado pelo teste em executeAttemptCampanha.
  */
 
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import type { CampanhaPool, CampanhaSqlExecutor } from "./campaign-persistence.js";
 
 export type { CampanhaPool, CampanhaSqlExecutor } from "./campaign-persistence.js";
@@ -83,6 +83,90 @@ export function fingerprintDestinatarioCampanha(
 /** Ação única autorizável nesta fatia (escopo mínimo da prova humana). */
 export const ACAO_AUTORIZADA_EXECUCAO = "EXECUTAR_ITEM_CAMPANHA" as const;
 
+type Environment = Readonly<Record<string, string | undefined>>;
+
+export interface ConfiguracaoChaveProvaCampanha {
+  /** true somente com PF_CAMPAIGN_PROOF_KEY_BASE64 válida (base64, >= 32 bytes). */
+  readonly proofKeyReady: boolean;
+  /** Chave decodificada — NUNCA logada, persistida ou ecoada em erro/resposta. */
+  readonly chave: Buffer | null;
+}
+
+/**
+ * SLICE-03C.1 — Chave dedicada das provas (fail-closed). Substitui a chave
+ * literal anterior (descontinuada): sem PF_CAMPAIGN_PROOF_KEY_BASE64 válida as
+ * emissões/verificações FALHAM (proofKeyReady=false) — nenhuma prova é
+ * emitida ou aceita. A chave NÃO reutiliza OPERATOR_TOKEN nem
+ * DOCUMENT_FINGERPRINT_KEY_BASE64 e nunca aparece em log, erro, auditoria
+ * ou resposta. Nenhuma variável é criada aqui: a configuração é lida do
+ * ambiente server-side (Vercel permanece intocada neste gate).
+ */
+export function lerConfiguracaoChaveProvaCampanha(
+  env: Environment = process.env,
+): ConfiguracaoChaveProvaCampanha {
+  const bruta = env.PF_CAMPAIGN_PROOF_KEY_BASE64?.trim() ?? "";
+  if (bruta === "") return { proofKeyReady: false, chave: null };
+  try {
+    const decodificada = Buffer.from(bruta, "base64");
+    if (decodificada.length < 32) return { proofKeyReady: false, chave: null };
+    return { proofKeyReady: true, chave: decodificada };
+  } catch {
+    return { proofKeyReady: false, chave: null };
+  }
+}
+
+export interface ConfiguracaoCanarioCampanha {
+  /** true somente com fingerprint canônico de 64 hex configurado server-side. */
+  readonly canaryRecipientConfigured: boolean;
+  /** Fingerprint configurado — NUNCA logado, persistido ou ecoado. */
+  readonly fingerprint: string | null;
+}
+
+/**
+ * SLICE-03C.1 — Destinatário canário (fail-closed, server-side). A seleção
+ * NUNCA é automática ("primeiro item") e NUNCA vem do cliente: exige
+ * PF_CAMPAIGN_CANARY_RECIPIENT_FINGERPRINT com EXATAMENTE o formato canônico
+ * (64 hex minúsculos — o mesmo derivado por fingerprintDestinatarioCampanha).
+ * Ausente/inválido mantém a seleção bloqueada. O valor nunca é impresso em
+ * log, erro, auditoria ou resposta. Nenhuma variável Vercel é criada aqui.
+ */
+export function lerConfiguracaoCanarioCampanha(
+  env: Environment = process.env,
+): ConfiguracaoCanarioCampanha {
+  const bruta = env.PF_CAMPAIGN_CANARY_RECIPIENT_FINGERPRINT?.trim() ?? "";
+  if (/^[0-9a-f]{64}$/.test(bruta)) {
+    return { canaryRecipientConfigured: true, fingerprint: bruta };
+  }
+  return { canaryRecipientConfigured: false, fingerprint: null };
+}
+
+function exigirChaveProva(chave: Buffer | undefined): Buffer {
+  if (chave && chave.length >= 32) return chave;
+  const configuracao = lerConfiguracaoChaveProvaCampanha();
+  if (!configuracao.proofKeyReady || !configuracao.chave) {
+    throw new CampaignControlError(
+      "CAMPAIGN_PROOF_KEY_UNAVAILABLE",
+      "Chave de provas indisponível — emissão e verificação permanecem bloqueadas.",
+    );
+  }
+  return configuracao.chave;
+}
+
+/**
+ * SLICE-03C.1 — Resolve a chave de prova com prioridade para a chave INJETADA
+ * (somente testes de domínio); ausente/inválida, lê a configuração server-side
+ * (fail-closed). O valor nunca é logado, persistido ou ecoado.
+ */
+function resolverChaveProva(contexto: { readonly chaveProva?: Buffer } = {}): {
+  readonly proofKeyReady: boolean;
+  readonly chave: Buffer | null;
+} {
+  if (contexto.chaveProva && contexto.chaveProva.length >= 32) {
+    return { proofKeyReady: true, chave: contexto.chaveProva };
+  }
+  return lerConfiguracaoChaveProvaCampanha();
+}
+
 export type TipoProvaCampanha = "PROVA_DESTINATARIO_CAMPANHA_V1" | "PROVA_AUTORIZACAO_HUMANA_CAMPANHA_V1";
 
 /**
@@ -93,8 +177,8 @@ export function bindingProvaCampanha(campos: readonly string[]): string {
   return campos.join("\n");
 }
 
-function hmacProva(campos: readonly string[]): string {
-  return createHmac("sha256", "campaign-proof-v1")
+function hmacProva(campos: readonly string[], chaveProva?: Buffer): string {
+  return createHmac("sha256", exigirChaveProva(chaveProva))
     .update(bindingProvaCampanha(campos))
     .digest("hex");
 }
@@ -109,16 +193,21 @@ export function emitirProvaDestinatarioCampanha(entrada: {
   readonly loteCampanhaId: string;
   readonly itemId: string;
   readonly fingerprintDestinatario: string;
+  /** Chave injetada (testes); ausente → configuração server-side fail-closed. */
+  readonly chaveProva?: Buffer;
 }): { readonly tipo: TipoProvaCampanha; readonly valor: string } {
   return {
     tipo: "PROVA_DESTINATARIO_CAMPANHA_V1",
-    valor: hmacProva([
-      "PROVA_DESTINATARIO_CAMPANHA_V1",
-      entrada.campanhaId,
-      entrada.loteCampanhaId,
-      entrada.itemId,
-      entrada.fingerprintDestinatario,
-    ]),
+    valor: hmacProva(
+      [
+        "PROVA_DESTINATARIO_CAMPANHA_V1",
+        entrada.campanhaId,
+        entrada.loteCampanhaId,
+        entrada.itemId,
+        entrada.fingerprintDestinatario,
+      ],
+      entrada.chaveProva,
+    ),
   };
 }
 
@@ -201,20 +290,25 @@ export function emitirProvaAutorizacaoHumanaCampanha(entrada: {
   readonly chaveIdempotencia: string;
   readonly acaoAutorizada: string;
   readonly nonce: string;
+  /** Chave injetada (testes); ausente → configuração server-side fail-closed. */
+  readonly chaveProva?: Buffer;
 }): ProvaAutorizacaoHumanaCampanha {
   const agora = new Date().toISOString();
   return {
     tipo: "PROVA_AUTORIZACAO_HUMANA_CAMPANHA_V1",
-    valor: hmacProva([
-      "PROVA_AUTORIZACAO_HUMANA_CAMPANHA_V1",
-      entrada.operatorId,
-      entrada.campanhaId,
-      entrada.loteCampanhaId,
-      entrada.itemId,
-      entrada.chaveIdempotencia,
-      entrada.acaoAutorizada,
-      entrada.nonce,
-    ]),
+    valor: hmacProva(
+      [
+        "PROVA_AUTORIZACAO_HUMANA_CAMPANHA_V1",
+        entrada.operatorId,
+        entrada.campanhaId,
+        entrada.loteCampanhaId,
+        entrada.itemId,
+        entrada.chaveIdempotencia,
+        entrada.acaoAutorizada,
+        entrada.nonce,
+      ],
+      entrada.chaveProva,
+    ),
     referencia: entrada.nonce,
     emitidaEm: agora,
   };
@@ -246,6 +340,7 @@ export async function verificarProvaAutorizacaoHumanaCampanha(
     readonly chaveIdempotencia: string;
   },
   apresentada: { readonly valor: string; readonly referencia: string } | null | undefined,
+  contexto: { readonly chaveProva?: Buffer } = {},
 ): Promise<VerificacaoProvaAutorizacaoHumana> {
   if (
     !apresentada ||
@@ -256,19 +351,23 @@ export async function verificarProvaAutorizacaoHumanaCampanha(
   ) {
     return { verificada: false, motivo: "FORMATO_INVALIDO" };
   }
-  const esperada = hmacProva([
-    "PROVA_AUTORIZACAO_HUMANA_CAMPANHA_V1",
-    esperado.operatorId,
-    esperado.campanhaId,
-    esperado.loteCampanhaId,
-    esperado.itemId,
-    esperado.chaveIdempotencia,
-    ACAO_AUTORIZADA_EXECUCAO,
-    apresentada.referencia,
-  ]);
+  const esperada = hmacProva(
+    [
+      "PROVA_AUTORIZACAO_HUMANA_CAMPANHA_V1",
+      esperado.operatorId,
+      esperado.campanhaId,
+      esperado.loteCampanhaId,
+      esperado.itemId,
+      esperado.chaveIdempotencia,
+      ACAO_AUTORIZADA_EXECUCAO,
+      apresentada.referencia,
+    ],
+    contexto.chaveProva,
+  );
+  // Comparação TIMING-SAFE (defesa contra canal lateral na conferência do HMAC).
   const a = Buffer.from(esperada);
   const b = Buffer.from(apresentada.valor);
-  const vinculoOk = a.length === b.length && b.equals(a);
+  const vinculoOk = a.length === b.length && timingSafeEqual(a, b);
   if (!vinculoOk) {
     // Vínculo divergente E prova sem emissão vigente são o mesmo motivo —
     // nenhum detalhe do desvio é revelado (defesa em profundidade).
@@ -295,12 +394,16 @@ export async function verificarProvaAutorizacaoHumanaCampanha(
   if ((vigente.rows[0] as { total: number } | undefined)?.total !== 1) {
     return { verificada: false, motivo: "REPRODUZIDA" };
   }
+  // SLICE-03C.1 — a AUTORIDADE de ordenação é evento_auditoria.sequencia
+  // (IDENTITY durável, 0001): o settlement só invalida a prova quando a sua
+  // sequência é POSTERIOR à do evento de autorização. Timestamps permanecem
+  // como evidência — nunca como autoridade única (imutáveis sob relógio).
   const settle = await pool.query(
     `SELECT count(*)::int AS total FROM evento_auditoria
       WHERE agregado_tipo = 'CAMPANHA_EXECUCAO'
         AND agregado_id = $1
         AND tipo IN ('EXEC_RECEIPT', 'EXEC_SETTLEMENT')
-        AND ocorreu_em > (SELECT ocorreu_em FROM evento_auditoria WHERE id = $2::uuid)`,
+        AND sequencia > (SELECT sequencia FROM evento_auditoria WHERE id = $2::uuid)`,
     [esperado.itemId, apresentada.referencia],
   );
   if ((settle.rows[0] as { total: number } | undefined)?.total !== 0) {
@@ -326,6 +429,14 @@ export interface EstoqueOperacionalCampanha {
     readonly concedida: boolean;
     readonly referencia: string | null;
   };
+  /** SLICE-03C.1 — campos não sensíveis do plano de ativação (sem segredo). */
+  readonly proofKeyReady: boolean;
+  readonly canaryRecipientConfigured: boolean;
+  /** true quando o evento CAMPANHA_CANARIO_SELECIONADO já existe no lote. */
+  readonly canarySelected: boolean;
+  readonly canaryReferencePresent: boolean;
+  /** Sempre false neste slice: nenhum provider runtime é montado. */
+  readonly providerReady: false;
 }
 
 /**
@@ -336,6 +447,7 @@ export interface EstoqueOperacionalCampanha {
 export async function lerEstoqueOperacionalCampanha(
   pool: CampanhaSqlExecutor,
   comando: { readonly operatorId: string; readonly campanhaId: string },
+  contexto: { readonly chaveProva?: Buffer } = {},
 ): Promise<EstoqueOperacionalCampanha | null> {
   const campanha = await pool.query(
     `SELECT c.id FROM campanha_persistida c
@@ -373,6 +485,15 @@ export async function lerEstoqueOperacionalCampanha(
   );
   const referenciaAutorizacao =
     (autorizacao.rows[0] as { id: string } | undefined)?.id ?? null;
+  const canario = await pool.query(
+    `SELECT id FROM evento_auditoria
+      WHERE agregado_tipo = 'CAMPANHA_EXECUCAO'
+        AND tipo = $1
+        AND agregado_id = $2
+      ORDER BY sequencia DESC LIMIT 1`,
+    [CODIGO_EVENTO_CANARIO, linha.id],
+  );
+  const canarioId = (canario.rows[0] as { id: string } | undefined)?.id ?? null;
   return {
     campanhaId: comando.campanhaId,
     loteCampanhaId: linha.id,
@@ -384,6 +505,11 @@ export async function lerEstoqueOperacionalCampanha(
       concedida: referenciaAutorizacao !== null,
       referencia: referenciaAutorizacao,
     },
+    proofKeyReady: resolverChaveProva(contexto).proofKeyReady,
+    canaryRecipientConfigured: lerConfiguracaoCanarioCampanha().canaryRecipientConfigured,
+    canarySelected: canarioId !== null,
+    canaryReferencePresent: canarioId !== null,
+    providerReady: false,
   };
 }
 
@@ -397,9 +523,16 @@ export const CODIGO_LOTE_PREPARADO_POR_ROTA = "CAMPAIGN_PREPARE_ROTA_V1" as cons
 /** Evento append-only que materializa a autorização humana vigente. */
 export const CODIGO_EVENTO_AUTORIZACAO = "CAMPANHA_EXECUCAO_AUTORIZADA" as const;
 
+/** Evento append-only do canário controlado (metadata sanitizada, sem PII). */
+export const CODIGO_EVENTO_CANARIO = "CAMPANHA_CANARIO_SELECIONADO" as const;
+
+/** Evento append-only da ativação explícita do lote (PREPARADO → ATIVO). */
+export const CODIGO_EVENTO_ATIVACAO = "CAMPANHA_LOTE_ATIVADO" as const;
+
 export type AcaoOperacaoCampanha =
   | "PREPARAR_LOTE"
   | "AUTORIZAR_EXECUCAO"
+  | "ATIVAR_LOTE"
   | "EXECUTAR_ITEM";
 
 export type MotivoBloqueioAcaoOperacao =
@@ -410,7 +543,13 @@ export type MotivoBloqueioAcaoOperacao =
   | "LOTE_NAO_ATIVO"
   | "AUTORIZACAO_HUMANA_AUSENTE"
   | "AUTORIZACAO_HUMANA_VIGENTE"
-  | "LOTE_SEM_ITENS";
+  | "LOTE_SEM_ITENS"
+  | "PROOF_KEY_UNAVAILABLE"
+  | "CANARY_RECIPIENT_NOT_CONFIGURED"
+  | "CANARY_RECIPIENT_NOT_FOUND"
+  | "CANARY_RECIPIENT_AMBIGUOUS"
+  | "CANARIO_JA_SELECIONADO"
+  | "REAL_SEND_MUST_BE_DISABLED_FOR_ACTIVATION";
 
 export interface EntradaAcaoOperacaoCampanha {
   readonly acao: AcaoOperacaoCampanha;
@@ -418,6 +557,11 @@ export interface EntradaAcaoOperacaoCampanha {
   readonly loteEstado: string;
   readonly totalItens: number;
   readonly autorizacaoHumanaConcedida: boolean;
+  /** SLICE-03C.1 — insumos de ativação (padrões: bloqueio sanitizado). */
+  readonly proofKeyReady?: boolean;
+  readonly canaryRecipientConfigured?: boolean;
+  readonly canarySelecionado?: boolean;
+  readonly realSendEnabled?: boolean;
 }
 
 export interface AvaliacaoAcaoOperacaoCampanha {
@@ -450,6 +594,20 @@ export function avaliarAcaoOperacaoCampanha(
     if (!entrada.politica.canExecute) bloqueios.push("CAMPAIGN_EXECUTE_DISABLED");
     if (entrada.loteEstado !== "PREPARADO") bloqueios.push("LOTE_NAO_PREPARADO");
     if (entrada.autorizacaoHumanaConcedida) bloqueios.push("AUTORIZACAO_HUMANA_VIGENTE");
+    return { permitida: bloqueios.length === 0, bloqueios };
+  }
+  if (entrada.acao === "ATIVAR_LOTE") {
+    // SLICE-03C.1 — ativação fail-closed: canExecute=true e realSendEnabled
+    // deve permanecer FALSE (o envio real só é armado no 03C.2, com nova
+    // autorização do owner). Prova exige chave; canário exige configuração
+    // server-side e não pode ter sido escolhido antes.
+    if (!entrada.politica.canExecute) bloqueios.push("CAMPAIGN_EXECUTE_DISABLED");
+    if (entrada.realSendEnabled !== false) bloqueios.push("REAL_SEND_MUST_BE_DISABLED_FOR_ACTIVATION");
+    if (entrada.proofKeyReady !== true) bloqueios.push("PROOF_KEY_UNAVAILABLE");
+    if (entrada.canaryRecipientConfigured !== true) bloqueios.push("CANARY_RECIPIENT_NOT_CONFIGURED");
+    if (entrada.loteEstado !== "PREPARADO") bloqueios.push("LOTE_NAO_PREPARADO");
+    if (!entrada.autorizacaoHumanaConcedida) bloqueios.push("AUTORIZACAO_HUMANA_AUSENTE");
+    if (entrada.canarySelecionado === true) bloqueios.push("CANARIO_JA_SELECIONADO");
     return { permitida: bloqueios.length === 0, bloqueios };
   }
   if (!entrada.politica.canExecute) bloqueios.push("CAMPAIGN_EXECUTE_DISABLED");
@@ -513,6 +671,7 @@ export async function emitirProvasServerSideCampanha(
     readonly loteCampanhaId: string;
     readonly itemId: string;
   },
+  contexto: { readonly chaveProva?: Buffer } = {},
 ): Promise<ResultadoProvasServerSideCampanha | null> {
   const ownership = await pool.query(
     `SELECT 1 AS ok
@@ -543,23 +702,33 @@ export async function emitirProvasServerSideCampanha(
     destinatarioFingerprint: chaveDados.destinatario_fingerprint,
     hashAprovacao: chaveDados.hash_aprovacao,
   });
+  // SLICE-03C.1 — chave DEDICADA das provas (injetada por teste ou lida da
+  // configuração server-side). Indisponível ⇒ emissão/verificação falham.
+  const { chave: chaveProva } = resolverChaveProva(contexto);
   const emissao = await pool.query(
-    `SELECT id FROM evento_auditoria
+    `SELECT id, sequencia FROM evento_auditoria
       WHERE agregado_tipo = 'CAMPANHA_EXECUCAO'
         AND tipo = $1
         AND agregado_id = $2
       ORDER BY sequencia DESC LIMIT 1`,
     [CODIGO_EVENTO_AUTORIZACAO, ids.loteCampanhaId],
   );
-  const referencia =
-    (emissao.rows[0] as { id: string } | undefined)?.id ?? null;
+  const linhaEmissao = emissao.rows[0] as
+    | { id: string; sequencia: string | number }
+    | undefined;
+  const referencia = linhaEmissao?.id ?? null;
   if (!referencia) {
+    // Fail-closed 03C.1: sem chave de prova nenhuma verificação pode ser
+    // concluída — o motivo declara a causa raiz sanitizada.
+    const { proofKeyReady } = resolverChaveProva(contexto);
     return {
       provas: {
         recipientProofVerified: provaDestinatario.verificada,
         humanAuthorizationVerified: false,
       },
-      motivo: provaDestinatario.motivo ?? "AUTORIZACAO_HUMANA_AUSENTE",
+      motivo: !proofKeyReady
+        ? "PROOF_KEY_UNAVAILABLE"
+        : (provaDestinatario.motivo ?? "AUTORIZACAO_HUMANA_AUSENTE"),
     };
   }
   const provaHumana = emitirProvaAutorizacaoHumanaCampanha({
@@ -570,6 +739,7 @@ export async function emitirProvasServerSideCampanha(
     chaveIdempotencia,
     acaoAutorizada: ACAO_AUTORIZADA_EXECUCAO,
     nonce: referencia,
+    ...(chaveProva ? { chaveProva } : {}),
   });
   const verificacao = await verificarProvaAutorizacaoHumanaCampanha(
     pool,
@@ -581,6 +751,7 @@ export async function emitirProvasServerSideCampanha(
       chaveIdempotencia,
     },
     { valor: provaHumana.valor, referencia },
+    { ...(chaveProva ? { chaveProva } : {}) },
   );
   return {
     provas: {
@@ -841,6 +1012,242 @@ export async function autorizarExecucaoCampanha(
       loteCampanhaId: linha.id,
       totalItens: Number(linha.total_itens),
       referencia: eventoId,
+    };
+  });
+  return resultado;
+}
+
+export type ResultadoAtivarLoteCampanha =
+  | {
+      readonly resultado: "ATIVADO";
+      readonly campanhaId: string;
+      readonly loteCampanhaId: string;
+      readonly loteCodigo: string;
+      readonly totalItens: number;
+      /** Referência auditada do evento CAMPANHA_CANARIO_SELECIONADO (sem PII). */
+      readonly canarioReferencia: string;
+    }
+  | {
+      readonly resultado: "JA_ATIVADO";
+      readonly campanhaId: string;
+      readonly loteCampanhaId: string;
+      readonly loteCodigo: string;
+      readonly totalItens: number;
+      readonly canarioReferencia: string;
+    };
+
+/**
+ * SLICE-03C.1 — ATIVAÇÃO EXPLÍCITA do lote (PREPARADO → ATIVO), transacional
+ * e fail-closed. A ativação NÃO envia: apenas liga o lote ao motor 03A, que
+ * permanece BLOQUEADO no runtime (execute-attempt sem provider). Contrato:
+ * ownership server-side; operador ativo com papel EXECUTOR; canExecute=true
+ * com realSendEnabled=false OBRIGATÓRIO durante a ativação; lote PREPARADO;
+ * autorização humana vigente; proofKeyReady; exatamente um destinatário
+ * canário derivado EXCLUSIVAMENTE da configuração server-side + banco
+ * (itens PREPARADO do lote do operador); eventos append-only
+ * CAMPANHA_CANARIO_SELECIONADO e CAMPANHA_LOTE_ATIVADO na MESMA transação;
+ * CAS PREPARADO → ATIVO; itens permanecem PREPARADO (nenhum ENFILEIRADO);
+ * idempotente (lote ATIVO devolve o MESMO canário sem duplicar eventos);
+ * alheio/inexistente → null → 404 sanitizado; HOLD/CANCELADO bloqueados;
+ * concorrência (FOR UPDATE) concede exatamente uma ativação. A metadata do
+ * canário contém apenas item_id/ordem/esquema — NUNCA e-mail ou fingerprint.
+ */
+export async function ativarLoteCampanha(
+  pool: CampanhaPool,
+  comando: {
+    readonly operatorId: string;
+    readonly campanhaId: string;
+    /** Política da fronteira ÚNICA (carregarPoliticaCampanhaAtualizacao). */
+    readonly politica: PfUpdateCampaignPolicy;
+    /** Papéis do operador resolvidos server-side pela sessão (rota). */
+    readonly papeisOperador: readonly string[];
+  },
+  contexto: { readonly chaveProva?: Buffer } = {},
+): Promise<ResultadoAtivarLoteCampanha | null> {
+  if (!comando.papeisOperador.includes("EXECUTOR")) {
+    throw new CampaignControlError(
+      "CAMPAIGN_ACTIVATE_ROLE_REQUIRED",
+      "Ativação exige papel operacional EXECUTOR.",
+    );
+  }
+  const configuracaoChave = resolverChaveProva(contexto);
+  const configuracaoCanario = lerConfiguracaoCanarioCampanha();
+  let resultado: ResultadoAtivarLoteCampanha | null = null;
+  await executarTransacao(pool, async (transaction) => {
+    // Ordem de bloqueio consistente lote→outbox/eventos: campanha primeiro.
+    const campanha = await transaction.query(
+      `SELECT id FROM campanha_persistida c
+        WHERE c.id = $1 AND c.operator_id = $2
+        FOR UPDATE OF c`,
+      [comando.campanhaId, comando.operatorId],
+    );
+    if (!campanha.rows[0]) {
+      resultado = null;
+      return;
+    }
+    const lote = await transaction.query(
+      `SELECT id, codigo, estado, total_itens FROM lote_campanha
+        WHERE campanha_id = $1
+        FOR UPDATE`,
+      [comando.campanhaId],
+    );
+    const linha = lote.rows[0] as
+      | { id: string; codigo: string; estado: string; total_itens: number }
+      | undefined;
+    if (!linha) {
+      resultado = null;
+      return;
+    }
+    if (linha.estado === "ATIVO") {
+      // Idempotência: devolve o MESMO canário, sem duplicar evento nenhum.
+      const canarioExistente = await transaction.query(
+        `SELECT id FROM evento_auditoria
+          WHERE agregado_tipo = 'CAMPANHA_EXECUCAO'
+            AND tipo = $1
+            AND agregado_id = $2
+          ORDER BY sequencia DESC LIMIT 1`,
+        [CODIGO_EVENTO_CANARIO, linha.id],
+      );
+      const referenciaCanario =
+        (canarioExistente.rows[0] as { id: string } | undefined)?.id ?? null;
+      if (!referenciaCanario) {
+        throw new CampaignControlError(
+          "CAMPAIGN_ACTIVATE_INCONSISTENTE",
+          "Lote ATIVO sem canário selecionado — estado inconsistente recusado.",
+        );
+      }
+      resultado = {
+        resultado: "JA_ATIVADO",
+        campanhaId: comando.campanhaId,
+        loteCampanhaId: linha.id,
+        loteCodigo: linha.codigo,
+        totalItens: Number(linha.total_itens),
+        canarioReferencia: referenciaCanario,
+      };
+      return;
+    }
+    const canarioPrevio = await transaction.query(
+      `SELECT id FROM evento_auditoria
+        WHERE agregado_tipo = 'CAMPANHA_EXECUCAO'
+          AND tipo = $1
+          AND agregado_id = $2
+        LIMIT 1`,
+      [CODIGO_EVENTO_CANARIO, linha.id],
+    );
+    const autorizacao = await transaction.query(
+      `SELECT id FROM evento_auditoria
+        WHERE agregado_tipo = 'CAMPANHA_EXECUCAO'
+          AND tipo = $1
+          AND agregado_id = $2
+        ORDER BY sequencia DESC LIMIT 1`,
+      [CODIGO_EVENTO_AUTORIZACAO, linha.id],
+    );
+    const referenciaVigente =
+      (autorizacao.rows[0] as { id: string } | undefined)?.id ?? null;
+    const acao = avaliarAcaoOperacaoCampanha({
+      acao: "ATIVAR_LOTE",
+      politica: comando.politica,
+      loteEstado: linha.estado,
+      totalItens: Number(linha.total_itens),
+      autorizacaoHumanaConcedida: referenciaVigente !== null,
+      proofKeyReady: configuracaoChave.proofKeyReady,
+      canaryRecipientConfigured: configuracaoCanario.canaryRecipientConfigured,
+      canarySelecionado: canarioPrevio.rows.length > 0,
+      realSendEnabled: comando.politica.realSendEnabled,
+    });
+    if (!acao.permitida) {
+      throw new CampaignControlError(
+        "CAMPAIGN_ACTIVATE_BLOCKED",
+        "Ativação bloqueada por política/estado/configuração: " + acao.bloqueios.join(","),
+      );
+    }
+    // EXATAMENTE UM destinatário controlado: apenas itens PREPARADO do lote
+    // do operador, pela fingerprint canônica configurada server-side. Zero
+    // correspondências e múltiplas correspondências bloqueiam (sanitizado).
+    const candidatos = await transaction.query(
+      `SELECT i.id, i.ordem FROM outbox_campanha i
+        WHERE i.lote_campanha_id = $1
+          AND i.estado = 'PREPARADO'
+          AND i.destinatario_fingerprint = $2
+        ORDER BY i.ordem
+        LIMIT 2`,
+      [linha.id, configuracaoCanario.fingerprint],
+    );
+    if (candidatos.rows.length === 0) {
+      throw new CampaignControlError(
+        "CANARY_RECIPIENT_NOT_FOUND",
+        "Nenhum item corresponde ao destinatário canário configurado.",
+      );
+    }
+    if (candidatos.rows.length > 1) {
+      throw new CampaignControlError(
+        "CANARY_RECIPIENT_AMBIGUOUS",
+        "Mais de um item corresponde ao destinatário canário — seleção bloqueada.",
+      );
+    }
+    const canario = candidatos.rows[0] as { id: string; ordem: number };
+    const agora = new Date().toISOString();
+    // Evento do canário (metadata SANITIZADA: item_id/ordem/esquema — sem
+    // e-mail, sem fingerprint, sem valor de configuração).
+    const eventoCanarioId = randomUUID();
+    await transaction.query(
+      `INSERT INTO evento_auditoria (
+        id, agregado_tipo, agregado_id, tipo, operator_id, ator_operator_id,
+        ocorreu_em, metadados, hash_anterior, hash_evento
+      ) VALUES ($1, 'CAMPANHA_EXECUCAO', $2, $3, $4, $4, $5, $6::jsonb, NULL, $7)`,
+      [
+        eventoCanarioId,
+        linha.id,
+        CODIGO_EVENTO_CANARIO,
+        comando.operatorId,
+        agora,
+        JSON.stringify({
+          esquema: "CAMPANHA_CANARIO_V1",
+          item_id: canario.id,
+          ordem: Number(canario.ordem),
+        }),
+        hashEventoControle(linha.id, agora),
+      ],
+    );
+    // CAS durável PREPARADO → ATIVO (defesa adicional ao FOR UPDATE).
+    const cas = await transaction.query(
+      `UPDATE lote_campanha SET estado = 'ATIVO'
+        WHERE id = $1 AND estado = 'PREPARADO'`,
+      [linha.id],
+    );
+    if ((cas.rowCount ?? 0) !== 1) {
+      throw new CampaignControlError(
+        "CAMPAIGN_ACTIVATE_CONCORRENTE",
+        "Ativação concorrente detectada — apenas uma é concedida.",
+      );
+    }
+    await transaction.query(
+      `INSERT INTO evento_auditoria (
+        id, agregado_tipo, agregado_id, tipo, operator_id, ator_operator_id,
+        ocorreu_em, metadados, hash_anterior, hash_evento
+      ) VALUES ($1, 'CAMPANHA_EXECUCAO', $2, $3, $4, $4, $5, $6::jsonb, NULL, $7)`,
+      [
+        randomUUID(),
+        linha.id,
+        CODIGO_EVENTO_ATIVACAO,
+        comando.operatorId,
+        agora,
+        JSON.stringify({
+          esquema: "CAMPANHA_CONTROLE_V1",
+          acao: "ATIVAR_LOTE",
+          total_itens: Number(linha.total_itens),
+          canario_ordem: Number(canario.ordem),
+        }),
+        hashEventoControle(linha.id, agora),
+      ],
+    );
+    resultado = {
+      resultado: "ATIVADO",
+      campanhaId: comando.campanhaId,
+      loteCampanhaId: linha.id,
+      loteCodigo: linha.codigo,
+      totalItens: Number(linha.total_itens),
+      canarioReferencia: eventoCanarioId,
     };
   });
   return resultado;

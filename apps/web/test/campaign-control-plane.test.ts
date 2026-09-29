@@ -46,16 +46,15 @@ describe("SLICE_03B — Macroetapa 4: plano de controle operacional (frontend)",
 
   it("TODAS as ações de execução permanecem desabilitadas com as políticas fechadas", () => {
     const indice = FONTE_WORKSPACE.indexOf("Controle operacional (readiness)");
-    const trecho = FONTE_WORKSPACE.slice(indice, indice + 4200);
-    expect(trecho).toContain('type="button" disabled={!readiness.acoes.PREPARAR_LOTE.permitida}');
-    expect(trecho).toContain('type="button" disabled={!readiness.acoes.AUTORIZAR_EXECUCAO.permitida}');
-    expect(trecho).toContain('type="button" disabled');
-    expect(trecho).toContain("Executar (bloqueada");
+    const trecho = FONTE_WORKSPACE.slice(indice, indice + 5600);
+    expect(trecho).toMatch(/type="button"\s+disabled=\{\s*!/);
+    expect(trecho).toMatch(/type="button"\s+disabled>/);
+    expect(trecho).toContain("Executar (provider indisponível — envio não autorizado)");
   });
 
   it("nenhuma autorização é derivada no cliente; ações refletem a capacidade do servidor", () => {
     const indice = FONTE_WORKSPACE.indexOf("Controle operacional (readiness)");
-    const trecho = FONTE_WORKSPACE.slice(indice, indice + 4200);
+    const trecho = FONTE_WORKSPACE.slice(indice, indice + 5600);
     expect(trecho).toContain("readiness.acoes.PREPARAR_LOTE.permitida");
     expect(trecho).toContain("readiness.acoes.AUTORIZAR_EXECUCAO.permitida");
     expect(trecho).not.toMatch(/canExecute\s*=\s*true/);

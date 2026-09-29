@@ -55,9 +55,19 @@ type ReadinessOperacional = {
     realSendEnabled: boolean;
   };
   autorizacaoHumana: { concedida: boolean; referenciaPresente: boolean };
+  // SLICE-03C.1 — campos de ativação (não sensíveis: nenhum fingerprint,
+  // nenhuma chave, nenhum e-mail).
+  ativacao: {
+    proofKeyReady: boolean;
+    canaryRecipientConfigured: boolean;
+    canarySelected: boolean;
+    canaryReferencePresent: boolean;
+    providerReady: boolean;
+  };
   acoes: {
     PREPARAR_LOTE: AcaoOperacao;
     AUTORIZAR_EXECUCAO: AcaoOperacao;
+    ATIVAR_LOTE: AcaoOperacao;
     EXECUTAR_ITEM: AcaoOperacao;
   };
   executavel: false;
@@ -311,6 +321,40 @@ async function obterReadinessOperacional(campanhaId: string): Promise<ReadinessO
   return resposta;
 }
 
+// SLICE-03C.1 — Ações mutáveis do plano de controle: cada função chama
+// SOMENTE a sua rota, com corpo restrito a { campanhaId }. Nenhum operatorId,
+// loteCampanhaId, itemId, e-mail, fingerprint, proofKey, estado, chave
+// idempotente ou provider é enviado pelo cliente; o resultado exibido é
+// SEMPRE o status sanitizado devolvido pelo servidor.
+type ResultadoControleCampanha = {
+  status: string;
+  aviso?: string;
+};
+
+async function prepararLoteOperacional(campanhaId: string): Promise<ResultadoControleCampanha> {
+  return fetchJson<ResultadoControleCampanha>("/api/campaigns/prepare", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ campanhaId }),
+  });
+}
+
+async function autorizarExecucaoOperacional(campanhaId: string): Promise<ResultadoControleCampanha> {
+  return fetchJson<ResultadoControleCampanha>("/api/campaigns/authorize-execution", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ campanhaId }),
+  });
+}
+
+async function ativarLoteOperacional(campanhaId: string): Promise<ResultadoControleCampanha> {
+  return fetchJson<ResultadoControleCampanha>("/api/campaigns/activate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ campanhaId }),
+  });
+}
+
 async function obterCampanhaDetalhe(campanhaId: string): Promise<CampanhaPersistida> {
   const resposta = await fetchJson<{ campanha: CampanhaPersistida }>(
     `/api/campaigns/detail?campanhaId=${encodeURIComponent(campanhaId)}`,
@@ -382,6 +426,10 @@ export function CampaignWorkspace() {
   // (read-only). Sem Session Storage; nenhuma autorização é decidida aqui.
   const [readiness, setReadiness] = useState<ReadinessOperacional | null>(null);
   const [readinessErro, setReadinessErro] = useState("");
+  // SLICE-03C.1 — guarda de duplo clique e feedback das ações mutáveis.
+  const [acaoPendente, setAcaoPendente] = useState<"PREPARAR" | "AUTORIZAR" | "ATIVAR" | null>(null);
+  const [acaoMensagem, setAcaoMensagem] = useState("");
+  const [acaoErro, setAcaoErro] = useState("");
 
   async function loadMe(): Promise<boolean> {
     try {
@@ -1014,6 +1062,57 @@ export function CampaignWorkspace() {
       ativo = false;
     };
   }, [campanha?.campanhaId]);
+
+  // SLICE-03C.1 — handler das ações mutáveis do plano de controle: chama
+  // SOMENTE a rota da ação, exige confirmação humana explícita, impede duplo
+  // clique, exibe o resultado sanitizado devolvido pelo servidor e recarrega
+  // o readiness (fonte única de verdade). Nenhum sucesso é inferido no
+  // cliente: sem confirmação do servidor não há mensagem de sucesso.
+  async function executarAcaoControle(
+    acao: "PREPARAR" | "AUTORIZAR" | "ATIVAR",
+  ): Promise<void> {
+    if (!campanha?.campanhaId || acaoPendente) return;
+    const perguntas: Record<typeof acao, string> = {
+      PREPARAR:
+        "Preparar o lote? Os itens saem de HOLD para PREPARADO. Nenhum envio é realizado.",
+      AUTORIZAR:
+        "Autorizar a execução? Um registro auditado da autorização humana será criado. Nenhum envio é realizado.",
+      ATIVAR:
+        "Ativar o lote? O lote sai de PREPARADO para ATIVO com um canário selecionado pelo servidor. O provider permanece indisponível — nada é enviado.",
+    };
+    const resposta = window.confirm(perguntas[acao]);
+    if (!resposta) {
+      setAcaoMensagem("");
+      setAcaoErro("");
+      return;
+    }
+    setAcaoPendente(acao);
+    setAcaoMensagem("");
+    setAcaoErro("");
+    try {
+      const corpo =
+        acao === "PREPARAR"
+          ? await prepararLoteOperacional(campanha.campanhaId)
+          : acao === "AUTORIZAR"
+            ? await autorizarExecucaoOperacional(campanha.campanhaId)
+            : await ativarLoteOperacional(campanha.campanhaId);
+      // Recarrega o readiness server-driven ANTES de exibir o resultado: o
+      // estado exibido passa a refletir o banco, não a resposta da ação.
+      const corpoReadiness = await obterReadinessOperacional(campanha.campanhaId);
+      setReadiness(corpoReadiness);
+      setReadinessErro("");
+      setAcaoMensagem(corpo.status + (corpo.aviso ? " — " + corpo.aviso : ""));
+    } catch (error: unknown) {
+      setAcaoMensagem("");
+      setAcaoErro(
+        error instanceof ApiCampanhaError
+          ? error.message
+          : "Ação operacional indisponível.",
+      );
+    } finally {
+      setAcaoPendente(null);
+    }
+  }
 
   // UX-FLOW-01A — a macroetapa visível é DERIVADA do estado operacional
   // (sessão, base, aprovação, campanha/lote). A navegação representa o
@@ -1930,11 +2029,25 @@ export function CampaignWorkspace() {
                       : "ausente"}
                   </li>
                   <li>
+                    Ativação: proofKeyReady=
+                    {String(readiness.ativacao.proofKeyReady)} ·
+                    canaryRecipientConfigured=
+                    {String(readiness.ativacao.canaryRecipientConfigured)} ·
+                    canarySelected={String(readiness.ativacao.canarySelected)} ·
+                    providerReady={String(readiness.ativacao.providerReady)}
+                  </li>
+                  <li>
                     Provider: indisponível nesta fase · envio real desabilitado:{" "}
                     {String(readiness.envioRealDesabilitado)}
                   </li>
                   <li>Próxima ação necessária: {readiness.proximaAcao}</li>
                 </ul>
+                {acaoMensagem ? (
+                  <p role="status" className="campaign-actions-note">{acaoMensagem}</p>
+                ) : null}
+                {acaoErro ? (
+                  <p role="alert" className="campaign-session-error">{acaoErro}</p>
+                ) : null}
                 {readiness.lote.estado === "HOLD" || readiness.lote.estado === "PREPARADO" ? (
                   <p className="campaign-actions-note">
                     <strong>
@@ -1947,19 +2060,46 @@ export function CampaignWorkspace() {
                   </p>
                 ) : null}
                 <div className="campaign-panel-actions">
-                  <button type="button" disabled={!readiness.acoes.PREPARAR_LOTE.permitida}>
-                    Preparar lote
+                  <button
+                    type="button"
+                    disabled={
+                      !readiness.acoes.PREPARAR_LOTE.permitida ||
+                      acaoPendente !== null
+                    }
+                    onClick={() => void executarAcaoControle("PREPARAR")}
+                  >
+                    {acaoPendente === "PREPARAR" ? "Preparando…" : "Preparar lote"}
                   </button>
-                  <button type="button" disabled={!readiness.acoes.AUTORIZAR_EXECUCAO.permitida}>
-                    Autorizar execução
+                  <button
+                    type="button"
+                    disabled={
+                      !readiness.acoes.AUTORIZAR_EXECUCAO.permitida ||
+                      acaoPendente !== null
+                    }
+                    onClick={() => void executarAcaoControle("AUTORIZAR")}
+                  >
+                    {acaoPendente === "AUTORIZAR" ? "Autorizando…" : "Autorizar execução"}
                   </button>
+                  <button
+                    type="button"
+                    disabled={
+                      !readiness.acoes.ATIVAR_LOTE.permitida ||
+                      acaoPendente !== null
+                    }
+                    onClick={() => void executarAcaoControle("ATIVAR")}
+                  >
+                    {acaoPendente === "ATIVAR" ? "Ativando…" : "Ativar lote"}
+                  </button>
+                  {/* SLICE-03C.1 — Executar permanece SEMPRE disabled, sem
+                      onClick: nenhum handler chama execute-attempt no cliente. */}
                   <button type="button" disabled>
-                    Executar (bloqueada — nada é enviado)
+                    Executar (provider indisponível — envio não autorizado)
                   </button>
                 </div>
                 <small role="status">
-                  Ações refletem a capacidade retornada pelo servidor. Com as políticas atuais
-                  todas permanecem desabilitadas; nenhuma mutação operacional acontece nesta fase.
+                  Ações refletem a capacidade retornada pelo servidor; cada uma chama somente a
+                  sua rota e recarrega o readiness. Executar permanece indisponível — nenhum
+                  provider está montado nesta fatia e nada é enviado.
                 </small>
               </>
             ) : null}

@@ -18,7 +18,7 @@
  * explícita em executeAttemptCampanha (03A) — e a rota HTTP bloqueia antes.
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -1451,6 +1451,15 @@ describeDb("SLICE_03C.1 — ativação controlada do lote (POSTGRESQL_INTEGRATIO
     }
   }
 
+  // Normalização temporal canônica (TESTE ONLY): o driver PostgreSQL
+  // materializa timestamptz como Date enquanto o contrato V2 persistiu uma
+  // string ISO. Recupera a MESMA representação ISO originalmente persistida
+  // — sem alterar precisão, timezone ou timestamp para fazer o teste passar.
+  const instanteIso = (valor: Date | string): string =>
+    valor instanceof Date
+      ? valor.toISOString()
+      : new Date(valor).toISOString();
+
   function comandoAtivar(cena: CenaAtivacao) {
     return {
       operatorId: operadorId,
@@ -1926,7 +1935,7 @@ describeDb("SLICE_03C.1 — ativação controlada do lote (POSTGRESQL_INTEGRATIO
     expect(linhas.rows.length).toBe(2);
     const eventos = linhas.rows as {
       id: string; agregado_tipo: string; agregado_id: string;
-      tipo: string; ocorreu_em: string; hash_evento: string;
+      tipo: string; ocorreu_em: Date | string; hash_evento: string;
     }[];
     const ids = new Set(eventos.map((e) => e.id));
     const hashes = new Set(eventos.map((e) => e.hash_evento));
@@ -1936,7 +1945,9 @@ describeDb("SLICE_03C.1 — ativação controlada do lote (POSTGRESQL_INTEGRATIO
       expect(e.hash_evento).toMatch(/^[0-9a-f]{64}$/);
       expect(e.agregado_tipo).toBe("CAMPANHA_EXECUCAO");
       expect(e.agregado_id).toBe(cena.loteCampanhaId);
-      expect(e.ocorreu_em).toBe(eventos[0]!.ocorreu_em);
+      // Igualdade TEMPORAL canônica (o driver materializa Date; toBe()
+      // compararia referência de objeto, não o instante).
+      expect(instanteIso(e.ocorreu_em)).toBe(instanteIso(eventos[0]!.ocorreu_em));
     }
     // Identidade persistida do canário = canarioReferencia retornado.
     const referenciaCanario = eventos.find((e) => e.tipo === CODIGO_EVENTO_CANARIO)!.id;
@@ -1964,22 +1975,23 @@ describeDb("SLICE_03C.1 — ativação controlada do lote (POSTGRESQL_INTEGRATIO
     );
     const eventos = linhas.rows as {
       id: string; agregado_tipo: string; agregado_id: string;
-      tipo: string; ocorreu_em: string; hash_evento: string;
+      tipo: string; ocorreu_em: Date | string; hash_evento: string;
     }[];
     expect(eventos.length).toBe(2);
     for (const e of eventos) {
-      // Recomputação INDEPENDENTE (mesmo contrato V2 documentado): o teste
-      // deriva o hash a partir da linha persistida — sem helper interno
-      // exportado de produção.
-      const recomputado = createHash("sha256")
-        .update(JSON.stringify([
-          "CAMPANHA_CONTROLE_HASH_V2",
-          e.id,
-          e.agregado_tipo,
-          e.agregado_id,
-          e.tipo,
-          e.ocorreu_em,
-        ]))
+      // Recomputação INDEPENDENTE do contrato V2 documentado: HMAC-SHA256
+      // com a chave legada deste contrato, sobre a representação canônica
+      // persistida — sem chamar o helper privado de produção.
+      const payload = JSON.stringify([
+        "CAMPANHA_CONTROLE_HASH_V2",
+        e.id,
+        e.agregado_tipo,
+        e.agregado_id,
+        e.tipo,
+        instanteIso(e.ocorreu_em),
+      ]);
+      const recomputado = createHmac("sha256", "audit-chain")
+        .update(payload)
         .digest("hex");
       expect(recomputado).toBe(e.hash_evento);
     }

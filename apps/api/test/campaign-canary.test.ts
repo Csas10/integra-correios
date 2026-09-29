@@ -26,7 +26,7 @@
 
 import { readFileSync } from "node:fs";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
   carregarPoliticaCampanhaAtualizacao,
   type PfUpdateCampaignPolicy,
@@ -41,7 +41,10 @@ import {
   statusOauthFromReadiness,
   enviarCanarioCampanha,
 } from "../src/campaign-canary.js";
-import { despachar as despacharSemBanco } from "../src/server.js";
+import {
+  despachar as despacharSemBanco,
+  injetarProvedorCanarioParaTeste,
+} from "../src/server.js";
 import { chaveIdempotenciaExecucao } from "../src/campaign-execution.js";
 import { fingerprintDestinatarioCampanha } from "../src/campaign-control.js";
 import {
@@ -100,8 +103,54 @@ const CHAVES_SINTETICAS = [
   "DATA_ENCRYPTION_KEY_BASE64",
   "DOCUMENT_FINGERPRINT_KEY_BASE64",
   "CAMPAIGN_SENDER_ADDRESS",
+  "PF_CAMPAIGN_EXECUTE_ENABLED",
+  "PF_CAMPAIGN_PREPARE_ENABLED",
+  "REAL_SEND_ENABLED",
 ] as const;
+
+// ---------------------------------------------------------------------------
+// SLICE_03C.2A.2 — fixtures DETERMINÍSTICAS (fonte única, sem literais soltos)
+// ---------------------------------------------------------------------------
+/** Token sintético ÚNICO por semente: 43–128 chars, [A-Za-z0-9_-]. */
+function tokenSintetico(semente: string): string {
+  const base = "Op_abcdefghijklmnopqrstuvwxyz0123456789"; // 40 chars (padrão 03B)
+  const sufixo = createHash("sha256").update("token-" + semente).digest("base64url").slice(0, 24);
+  return base + sufixo; // 64 chars, único por semente
+}
+/** Hex de 64 caracteres, determinístico e único por semente. */
+function fingerprintUnico(semente: string): string {
+  return createHash("sha256").update(semente).digest("hex");
+}
+/**
+ * Recomposição INDEPENDENTE (teste) do contrato vigente de hash de evento:
+ * CAMPANHA_CONTROLE_HASH_V2 — HMAC-SHA256 sobre framing JSON canônico de
+ * (eventoId, agregadoTipo, agregadoId, tipo, ocorreuEm). NÃO chama helper
+ * privado de produção. Ids distintos ⇒ hashes distintos (mesmo lote/timestamp).
+ */
+function hashEventoTeste(eventoId: string, agregadoId: string, tipo: string, ocorreuEm: string): string {
+  const payload = JSON.stringify([
+    "CAMPANHA_CONTROLE_HASH_V2",
+    eventoId,
+    "CAMPANHA_EXECUCAO",
+    agregadoId,
+    tipo,
+    ocorreuEm,
+  ]);
+  return createHmac("sha256", "audit-chain").update(payload).digest("hex");
+}
+
+// Instância reimportada (vi.resetModules) do describeDb — afterEach precisa
+// limpar AMBAS as referências (o import estático aponta para a instância
+// original carregada no topo do arquivo).
+let injetarProvedorAtivo:
+  | ((provider: import("../src/campaign-execution.js").ProvedorEnvioCampanha | null) => void)
+  | undefined;
+
 afterEach(() => {
+  // F — limpeza GARANTIDA após CADA teste (inclusive falha intermediária):
+  // provider fake nunca vaza para o teste seguinte (PROVIDER_DI_LEAK=false).
+  injetarProvedorCanarioParaTeste(null);
+  injetarProvedorAtivo?.(null);
   for (const chave of CHAVES_SINTETICAS) delete process.env[chave];
   for (const [chave, valor] of Object.entries(ambienteOriginal)) {
     if (CHAVES_SINTETICAS.includes(chave as (typeof CHAVES_SINTETICAS)[number])) {
@@ -155,6 +204,43 @@ describe("SLICE_03C.2A — correlationCode (server-side, estável, opaco, sem PI
     const codigo = correlationCodeCanario({ chaveIdempotencia: chave, itemId: ids.itemId });
     expect(codigo).not.toContain(ids.destinatarioFingerprint);
     expect(codigo).not.toMatch(/[a-z]/);
+  });
+});
+
+describe("SLICE_03C.2A.2 — contratos de fixture (fonte única, determinísticos)", () => {
+  it("A. tokenSintetico: 43–128 chars, [A-Za-z0-9_-], único por semente, mesmo valor para hash e login", () => {
+    const a1 = tokenSintetico("canary-a");
+    const a2 = tokenSintetico("canary-a");
+    const b = tokenSintetico("canary-b");
+    expect(a1).toBe(a2); // determinístico
+    expect(a1).not.toBe(b); // único por cenário
+    expect(a1.length).toBeGreaterThanOrEqual(43);
+    expect(a1.length).toBeLessThanOrEqual(128);
+    expect(a1).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(new Set([tokenSintetico("canary-a"), tokenSintetico("canary-b"), tokenSintetico("canary-d"), tokenSintetico("canary-e")]).size).toBe(4);
+    // SYNTHETIC_TOKEN_UNIQUE_PER_SCENARIO=true; SYNTHETIC_TOKEN_PATTERN_MATCH=true.
+  });
+
+  it("C. fingerprintUnico: 64 hex, determinístico e distinto por semente (cenas consecutivas sem colisão)", () => {
+    const c1 = fingerprintUnico("arquivo-" + randomUUID());
+    const c2 = fingerprintUnico("arquivo-" + randomUUID());
+    expect(c1).toMatch(/^[0-9a-f]{64}$/);
+    expect(c2).toMatch(/^[0-9a-f]{64}$/);
+    expect(c1).not.toBe(c2);
+  });
+
+  it("D. hashEventoTeste (V2 independente): mesmo lote + mesmo timestamp + ids distintos ⇒ hashes distintos de 64 hex", () => {
+    const lote = randomUUID();
+    const agora = new Date().toISOString();
+    const h1 = hashEventoTeste(randomUUID(), lote, "CAMPANHA_CANARIO_SELECIONADO", agora);
+    const h2 = hashEventoTeste(randomUUID(), lote, "CAMPANHA_LOTE_ATIVADO", agora);
+    const h3 = hashEventoTeste(randomUUID(), lote, "CAMPANHA_EXECUCAO_AUTORIZADA", agora);
+    for (const h of [h1, h2, h3]) {
+      expect(h).toMatch(/^[0-9a-f]{64}$/);
+    }
+    expect(new Set([h1, h2, h3]).size).toBe(3);
+    // Os três tipos coexistem na mesma cena ⇒ UNIQUE(hash_evento) respeitado
+    // (o helper NÃO importa nada de produção).
   });
 });
 
@@ -565,25 +651,53 @@ describe("SLICE_03C.2A — estrutura de fonte (SOURCE_STRUCTURE)", () => {
 // ---------------------------------------------------------------------------
 // Parte 4 — HTTP_ROUTES (sem banco): fail-closed de autenticação
 // ---------------------------------------------------------------------------
-describe("SLICE_03C.2A — HTTP fail-closed (sem banco)", () => {
-  it("canary-send sem sessão → 401; com sessão mas sem banco → 503; corpo extra nunca 200", async () => {
-    const semSessao = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
+describe("SLICE_03C.2A — HTTP fail-closed (contrato determinístico)", () => {
+  it("sem sessão → 401 INDIVIDUAL_OPERATOR_AUTH_REQUIRED (zero claim/evento/provider/rede)", async () => {
+    const resposta = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
       corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
     });
-    expect(semSessao.status).toBe(401);
+    expect(resposta.status).toBe(401);
+    expect(resposta.corpo).toContain("INDIVIDUAL_OPERATOR_AUTH_REQUIRED");
+  });
 
-    const comSessao = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
+  it("lookup indisponível (DATABASE_URL isoladamente removida) → 503 OPERATOR_IDENTITY_UNAVAILABLE", async () => {
+    const urlOriginal = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL; // isolamento determinístico do lookup
+    try {
+      const resposta = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
+        headers: { cookie: COOKIE_SESSAO },
+        corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+      });
+      expect(resposta.status).toBe(503);
+      expect(resposta.corpo).toContain("OPERATOR_IDENTITY_UNAVAILABLE");
+    } finally {
+      if (urlOriginal !== undefined) process.env.DATABASE_URL = urlOriginal;
+    }
+  });
+
+  it("sessão em formato válido mas inexistente com banco disponível → 401 (determinístico na CI)", async () => {
+    if (!process.env.DATABASE_URL) {
+      // Sem banco local, a indisponibilidade do lookup domina (503) — a prova
+      // do 401-determinístico é DB-gated (último teste da Parte 5).
+      return;
+    }
+    const resposta = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
       headers: { cookie: COOKIE_SESSAO },
       corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
     });
-    expect(comSessao.status).toBe(503);
-    expect(comSessao.corpo).toContain("OPERATOR_IDENTITY_UNAVAILABLE");
+    expect(resposta.status).toBe(401);
+    expect(resposta.corpo).toContain("INDIVIDUAL_OPERATOR_AUTH_REQUIRED");
+  });
 
+  it("corpo com autoridade adicional → 401 (auth precede validação do corpo); nunca 200", async () => {
     const comExtras = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
       headers: { cookie: COOKIE_SESSAO },
       corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID(), itemId: randomUUID() })),
     });
     expect(comExtras.status).not.toBe(200);
+    if (comExtras.status === 422) {
+      expect(comExtras.corpo).toContain("CAMPAIGN_CANARY_BODY_AUTHORITY");
+    }
   });
 });
 
@@ -606,6 +720,12 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
   let adminCookie = "";
   let executorCookie = "";
   let executorIdReal: string = operadorId;
+  // A — credenciais sintéticas ÚNICAS por cenário (43–128, [A-Za-z0-9_-]),
+  // mesmo valor para credentialHash e login (nunca segredo operacional).
+  const TOKEN_CANARIO_A = tokenSintetico("canary-a");
+  const TOKEN_CANARIO_B = tokenSintetico("canary-b");
+  const TOKEN_CANARIO_D = tokenSintetico("canary-d");
+  const TOKEN_CANARIO_E = tokenSintetico("canary-e");
 
   beforeAll(async () => {
     process.env.DATABASE_URL = DB_URL_AMBIENTE;
@@ -613,6 +733,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     const servidor = await import("../src/server.js");
     despachar = servidor.despachar;
     injetarProvedor = servidor.injetarProvedorCanarioParaTeste;
+    injetarProvedorAtivo = servidor.injetarProvedorCanarioParaTeste;
     const { NodePostgresPool } = await import("@integra-correios/persistence");
     pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE!, max: 4 });
   });
@@ -645,7 +766,10 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     const campanhaId = randomUUID();
     const loteCampanhaId = randomUUID();
     const agora = new Date().toISOString();
-    const hashAprovacao = "c".repeat(64);
+    // C — identidade ÚNICA da cena (hex 64): evita colisão em
+    // UNIQUE(fingerprint_arquivo, hash_aprovacao) entre cenas consecutivas.
+    const hashAprovacao = fingerprintUnico("aprovacao-" + campanhaId);
+    const fingerprintArquivo = fingerprintUnico("arquivo-" + campanhaId);
     const registros = params.emails.map((email, indice) => ({
       profissional_id: "PF-CNR-" + String(indice + 1).padStart(4, "0"),
       nome: "Sintetico Canary " + String(indice + 1),
@@ -654,7 +778,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     }));
     await p.query(
       "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'CNR_TESTE_V1', $4, $5::jsonb, $6, $6, 0, $6, 'LOTE_CRIADO', $7, $7)",
-      [campanhaId, params.operatorId, hashAprovacao, hashAprovacao, JSON.stringify({ registros, total: registros.length }), registros.length, agora],
+      [campanhaId, params.operatorId, fingerprintArquivo, hashAprovacao, JSON.stringify({ registros, total: registros.length }), registros.length, agora],
     );
     await p.query(
       "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'CNR_TESTE_V1', $4, $5, $6)",
@@ -674,6 +798,9 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
         [itemId, loteCampanhaId, ordem, fingerprint, JSON.stringify({ ordem }), "PREPARADO", agora],
       );
     }
+    // D — hash por IDENTIDADE do evento (contrato V2, recomposto
+    // independentemente): ids distintos ⇒ hashes distintos mesmo com o MESMO
+    // lote e o MESMO ocorreu_em ⇒ UNIQUE(hash_evento) respeitado.
     for (const tipo of ["CAMPANHA_CANARIO_SELECIONADO", "CAMPANHA_LOTE_ATIVADO"] as const) {
       const eventoId = randomUUID();
       await p.query(
@@ -689,7 +816,7 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
               ? { esquema: "CAMPANHA_CANARIO_V1", item_id: itemIds[0], ordem: 1 }
               : { esquema: "CAMPANHA_CONTROLE_V1", acao: "ATIVAR_LOTE" },
           ),
-          "d".repeat(64),
+          hashEventoTeste(eventoId, loteCampanhaId, tipo, agora),
         ],
       );
     }
@@ -704,25 +831,42 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
           params.operatorId,
           agora,
           JSON.stringify({ esquema: "CAMPANHA_CONTROLE_V1", acao: "AUTORIZAR_EXECUCAO", lote_estado: "ATIVO" }),
-          "d".repeat(64),
+          hashEventoTeste(eventoId, loteCampanhaId, "CAMPANHA_EXECUCAO_AUTORIZADA", agora),
         ],
       );
     }
     return { campanhaId, loteCampanhaId, fingerprints };
   }
 
-  async function conectarOAuthCorrespondente(detalhe?: string): Promise<void> {
+  // E — conexões OAuth SÃO PROPRIEDADE DA SUÍTE: ids capturados via
+  // RETURNING; limpeza por id (nunca DELETE global; nunca toca dados de
+  // outra suíte; executa também após falha intermediária via afterEach).
+  const conexoesOAuthDaSuite: string[] = [];
+
+  async function conectarOAuthCorrespondente(detalhe?: string): Promise<string> {
     const { derivarFingerprintContaGmail } = await import("@integra-correios/mail");
     const fp = new HmacSha256Fingerprinter(
       Buffer.from(process.env.DOCUMENT_FINGERPRINT_KEY_BASE64!, "base64"),
     );
-    const alvo = detalhe ?? CONTA_ESPERADA;
+    // Conta sintética PRÓPRIA por chamada ⇒ (provider, conta_fingerprint)
+    // nunca se repete ⇒ zero colisão em UNIQUE(provider, conta_fingerprint).
+    const alvo = detalhe ?? (CONTA_ESPERADA + "+" + randomUUID().slice(0, 8));
     const fingerprintConta = derivarFingerprintContaGmail(fp, alvo);
-    await pool!.query(
-      "INSERT INTO oauth_connection (provider, conta_fingerprint, scopes, access_token_ciphertext, access_token_nonce, access_token_auth_tag, chave_versao) VALUES ('GMAIL', $1, ARRAY['https://www.googleapis.com/auth/gmail.send']::text[], $2, $3, $4, 'v1-teste')",
+    const inserida = await pool!.query(
+      "INSERT INTO oauth_connection (provider, conta_fingerprint, scopes, access_token_ciphertext, access_token_nonce, access_token_auth_tag, chave_versao) VALUES ('GMAIL', $1, ARRAY['https://www.googleapis.com/auth/gmail.send']::text[], $2, $3, $4, 'v1-teste') RETURNING id",
       [fingerprintConta, Buffer.from("ciphertext-sintetico"), Buffer.from("0123456789abcdef"), Buffer.alloc(16)],
     );
+    const id = (inserida.rows[0] as { id: string }).id;
+    conexoesOAuthDaSuite.push(id);
+    return id;
   }
+
+  afterEach(async () => {
+    // Limpeza OWNED: somente as linhas criadas por esta suíte (por id).
+    for (const id of conexoesOAuthDaSuite.splice(0)) {
+      await pool?.query("DELETE FROM oauth_connection WHERE id = $1 AND provider = 'GMAIL'", [id]);
+    }
+  });
 
   async function contagensExec(loteCampanhaId: string): Promise<Record<string, number>> {
     const eventos = await pool!.query(
@@ -749,14 +893,14 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
         code: "OP-CNR-" + randomUUID().slice(0, 8),
         displayName: "Operador Canary A",
         roles: ["EXECUTOR"],
-        credentialHash: createHash("sha256").update("cred-canary-a-sintetica").digest("hex"),
+        credentialHash: createHash("sha256").update(TOKEN_CANARIO_A).digest("hex"),
       })),
     });
     expect(admin.status).toBe(201);
     executorIdReal = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
     const login = await despachar("POST", "/api/operator/identity/session", {
       headers: { "content-type": "application/json" },
-      corpo: Buffer.from(JSON.stringify({ token: "cred-canary-a-sintetica" })),
+      corpo: Buffer.from(JSON.stringify({ token: TOKEN_CANARIO_A })),
     });
     expect(login.status).toBe(200);
     executorCookie = firstCookie(login.headers["set-cookie"]);
@@ -799,14 +943,14 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
         code: "OP-CNR-" + randomUUID().slice(0, 8),
         displayName: "Operador Canary B",
         roles: ["EXECUTOR"],
-        credentialHash: createHash("sha256").update("cred-canary-b-sintetica").digest("hex"),
+        credentialHash: createHash("sha256").update(TOKEN_CANARIO_B).digest("hex"),
       })),
     });
     expect(admin.status).toBe(201);
     const operatorIdB = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
     const login = await despachar("POST", "/api/operator/identity/session", {
       headers: { "content-type": "application/json" },
-      corpo: Buffer.from(JSON.stringify({ token: "cred-canary-b-sintetica" })),
+      corpo: Buffer.from(JSON.stringify({ token: TOKEN_CANARIO_B })),
     });
     expect(login.status).toBe(200);
     const cookieB = firstCookie(login.headers["set-cookie"]);
@@ -872,14 +1016,14 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
         code: "OP-CNR-" + randomUUID().slice(0, 8),
         displayName: "Operador Canary D",
         roles: ["EXECUTOR"],
-        credentialHash: createHash("sha256").update("cred-canary-d-sintetica").digest("hex"),
+        credentialHash: createHash("sha256").update(TOKEN_CANARIO_D).digest("hex"),
       })),
     });
     expect(admin.status).toBe(201);
     const operatorIdD = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
     const login = await despachar("POST", "/api/operator/identity/session", {
       headers: { "content-type": "application/json" },
-      corpo: Buffer.from(JSON.stringify({ token: "cred-canary-d-sintetica" })),
+      corpo: Buffer.from(JSON.stringify({ token: TOKEN_CANARIO_D })),
     });
     expect(login.status).toBe(200);
     const cookieD = firstCookie(login.headers["set-cookie"]);
@@ -928,14 +1072,14 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
         code: "OP-CNR-" + randomUUID().slice(0, 8),
         displayName: "Operador Canary E",
         roles: ["EXECUTOR"],
-        credentialHash: createHash("sha256").update("cred-canary-e-sintetica").digest("hex"),
+        credentialHash: createHash("sha256").update(TOKEN_CANARIO_E).digest("hex"),
       })),
     });
     expect(admin.status).toBe(201);
     const operatorIdE = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
     const login = await despachar("POST", "/api/operator/identity/session", {
       headers: { "content-type": "application/json" },
-      corpo: Buffer.from(JSON.stringify({ token: "cred-canary-e-sintetica" })),
+      corpo: Buffer.from(JSON.stringify({ token: TOKEN_CANARIO_E })),
     });
     expect(login.status).toBe(200);
     const cookieE = firstCookie(login.headers["set-cookie"]);
@@ -984,7 +1128,14 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(corpo.oauth.storedAccountMatchesExpected).toBe(false);
 
     // E.4 — conexão CORRESPONDENTE ⇒ CONNECTED (readiness, NÃO liveness).
-    await pool!.query("DELETE FROM oauth_connection");
+    // Isolamento OWNED: revoga APENAS as conexões criadas por esta suíte
+    // (nunca DELETE global; nenhum dado operacional é tocado).
+    for (const id of conexoesOAuthDaSuite) {
+      await pool!.query(
+        "UPDATE oauth_connection SET revogada_em = now() WHERE id = $1 AND provider = 'GMAIL'",
+        [id],
+      );
+    }
     await conectarOAuthCorrespondente();
     resposta = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cena.campanhaId}`, {
       headers: { cookie: cookieE },

@@ -112,6 +112,13 @@ export interface PfUpdateCampaignPolicy {
    */
   readonly canPrepareBatch: boolean;
   readonly realSendEnabled: boolean;
+  /**
+   * Slice-03C.2A: armar o caminho de envio do CANÁRIO (pré-condição
+   * necessária, NUNCA suficiente). Leitura exclusiva desta fronteira —
+   * nenhum outro módulo lê o ambiente diretamente para este flag. Default
+   * fail-closed: ausente/vazio/"1"/"TRUE"/qualquer outro valor ⇒ false.
+   */
+  readonly canarySendEnabled: boolean;
 }
 
 type Environment = Readonly<Record<string, string | undefined>>;
@@ -128,6 +135,7 @@ export function carregarPoliticaCampanhaAtualizacao(
     canExecute: env.PF_CAMPAIGN_EXECUTE_ENABLED === "true",
     canPrepareBatch: env.PF_CAMPAIGN_PREPARE_ENABLED === "true",
     realSendEnabled: env.REAL_SEND_ENABLED === "true",
+    canarySendEnabled: env.PF_CAMPAIGN_CANARY_SEND_ENABLED === "true",
   };
 }
 

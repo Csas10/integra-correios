@@ -448,7 +448,10 @@ export function composeMimeMessage(message: OutboundMail): string {
     if (/[\r\n]/.test(valor)) throw new Error("Cabeçalho MIME inválido (CRLF detectado)");
     return valor;
   };
-  const from = headerSanitize(`${PILOT_SENDER.name} <${PILOT_SENDER.address}>`);
+  // SLICE-03C.2A — From: remetente injetado da campanha quando presente;
+  // ausente ⇒ comportamento LEGADO do piloto preservado (PILOT_SENDER).
+  const remetente = message.from ?? PILOT_SENDER;
+  const from = headerSanitize(`${remetente.name} <${remetente.address}>`);
   const replyTo = headerSanitize(message.replyTo);
   const to = headerSanitize(message.to);
   const subject = headerSanitize(message.subject);
@@ -457,7 +460,18 @@ export function composeMimeMessage(message: OutboundMail): string {
   // Seção 6 — Message-ID determinístico por communication_id (RFC 5322
   // msg-id sem aspas angulares, reservado ao provedor): permite detecção de
   // duplicidade e reconstrução do MIME em casos ambíguos.
-  const messageIdentifier = `${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}.pf-confirmation@pilot.crtba.org.br`;
+  // SLICE-03C.2A — caminho da CAMPANHA (message.from presente): o domínio do
+  // Message-ID é derivado do REMETENTE injetado server-side (nunca domínio
+  // hardcoded do piloto). Comportamento LEGADO do piloto (sem from) é
+  // preservado byte-a-byte (pf-confirmation@pilot.crtba.org.br).
+  const caminhoCampanha = message.from !== undefined;
+  const dominioMensagem = caminhoCampanha
+    ? message.from!.address.split("@")[1]!.trim().toLowerCase()
+    : "pilot.crtba.org.br";
+  const tagMensagem = caminhoCampanha
+    ? (message.messageTag ?? "pf-campanha").replace(/[^a-zA-Z0-9-]/g, "")
+    : "pf-confirmation";
+  const messageIdentifier = `${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}.${tagMensagem}@${dominioMensagem}`;
 
   return [
     `From: ${from}`,
@@ -506,13 +520,14 @@ export class GmailHttpTransport {
         // Seção 7 — timeout: rede lenta não pode segurar o lease indefinidamente.
         signal: AbortSignal.timeout(GMAIL_SEND_TIMEOUT_MS),
       });
-    } catch (error) {
-      // Timeout/abort é ambíguo: a requisição pode ter chegado ao Gmail.
-      // Classe dedicada para o worker classificar como DELIVERY_UNKNOWN.
-      if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
-        throw new GmailAmbiguousError("messages.send");
-      }
-      throw new MailProviderRequestError("GMAIL", "messages.send (rede)");
+    } catch {
+      // SLICE-03C.2A.1 (A.3) — QUALQUER exceção de transporte de
+      // messages.send que NÃO produziu um Response é AMBÍGUA: timeout, abort,
+      // ECONNRESET, DNS, conexão encerrada ou erro genérico de fetch. Não é
+      // possível provar que a requisição não alcançou o Google — nenhuma
+      // distinção entre timeout e demais falhas de rede. A operação descreve
+      // a fronteira ("rede sem Response") mantendo a mensagem sanitizada.
+      throw new GmailAmbiguousError("messages.send (rede sem Response)");
     }
     if (!response.ok) {
       // Erro sanitizado: classe por status + código curto; corpo da resposta
@@ -535,9 +550,17 @@ export class GmailHttpTransport {
       }
       throw new MailProviderRequestError("GMAIL", `messages.send (HTTP ${response.status})`);
     }
-    const data = (await response.json()) as GmailSendResponse;
+    // SLICE-03C.2A.1 (A.4) — 2xx sem messageId NÃO é rejeição conclusiva: o
+    // Gmail pode ter aceitado a mensagem sem receipt suficiente para
+    // settlement seguro ⇒ resultado INCERTO (AMBIGUO), nunca FALHA_DEFINITIVA.
+    let data: GmailSendResponse;
+    try {
+      data = (await response.json()) as GmailSendResponse;
+    } catch {
+      throw new GmailAmbiguousError("messages.send (2xx sem corpo válido)");
+    }
     if (!data?.id) {
-      throw new MailProviderRequestError("GMAIL", "messages.send (resposta sem id)");
+      throw new GmailAmbiguousError("messages.send (2xx sem id)");
     }
     return {
       provider: "GMAIL" as const,

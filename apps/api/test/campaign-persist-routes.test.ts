@@ -429,42 +429,94 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
       expect(persistida.status).toBe(201);
 
       // 2. MUTAÇÃO de um campo ⇒ hash recalculado diverge do congelado ⇒ 409.
-      //    templateVersion e templateContentHash: o registry é imutável e
-      //    versão desconhecida falha ANTES (422 fail-closed na seleção) —
-      //    provado no caso final.
-      const mutacoes: readonly (readonly [string, Record<string, string>, string])[] = [
-        ["telefone", { telefone: "(00) 00000-9999" }, "exibicao"],
-        ["cep", { cep: "00000-999" }, "exibicao"],
-        ["logradouro", { logradouro: "Rua Alterada" }, "exibicao"],
-        ["numero", { numero: "999" }, "exibicao"],
-        ["complemento", { complemento: "AP 99" }, "exibicao"],
-        ["bairro", { bairro: "Bairro Alterado" }, "exibicao"],
-        ["cidade", { cidade: "Feira de Santana" }, "exibicao"],
-        ["uf", { uf: "PE" }, "exibicao"],
-        ["nome", {}, "Ana Sintetica ALTERADA"],
-        ["email_normalizado", {}, "ana.alterada@exemplo.test"],
-      ];
-      for (const [campo, deltaExibicao, modo] of mutacoes) {
-        const mutados = REGISTROS.map((registro, indice) => {
-          if (indice !== 0) return registro;
-          if (modo === "exibicao") {
-            return { ...registro, exibicao: { ...(registro.exibicao ?? {}), ...deltaExibicao } };
+      //    União DISCRIMINADA (nada de nome de propriedade dinâmico) + provas:
+      //    cópia profunda, original intacto, alvo alterado, caminho único.
+      type Mutacao =
+        | {
+            tipo: "EXIBICAO";
+            campo: "telefone" | "cep" | "logradouro" | "numero" | "complemento" | "bairro" | "cidade" | "uf";
+            valor: string;
           }
-          return { ...registro, [modo]: deltaExibicao };
-        });
+        | { tipo: "REGISTRO"; campo: "nome" | "email_normalizado"; valor: string };
+
+      const mutacoes: readonly Mutacao[] = [
+        { tipo: "EXIBICAO", campo: "telefone", valor: "(00) 00000-9999" },
+        { tipo: "EXIBICAO", campo: "cep", valor: "00000-999" },
+        { tipo: "EXIBICAO", campo: "logradouro", valor: "Rua Alterada" },
+        { tipo: "EXIBICAO", campo: "numero", valor: "999" },
+        { tipo: "EXIBICAO", campo: "complemento", valor: "AP 99" },
+        { tipo: "EXIBICAO", campo: "bairro", valor: "Bairro Alterado" },
+        { tipo: "EXIBICAO", campo: "cidade", valor: "Feira de Santana" },
+        { tipo: "EXIBICAO", campo: "uf", valor: "PE" },
+        { tipo: "REGISTRO", campo: "nome", valor: "Ana Sintetica ALTERADA" },
+        { tipo: "REGISTRO", campo: "email_normalizado", valor: "ana.alterada@exemplo.test" },
+      ];
+
+      for (const mutacao of mutacoes) {
+        // Cópia profunda: original e mutado NUNCA compartilham `exibicao`.
+        const original = structuredClone(REGISTROS[0]!);
+        const mutado = structuredClone(REGISTROS[0]!);
+        const antesOriginal = JSON.stringify(original);
+        let caminhoAlterado = "";
+        switch (mutacao.tipo) {
+          case "EXIBICAO":
+            mutado.exibicao = { ...(mutado.exibicao ?? {}), [mutacao.campo]: mutacao.valor };
+            caminhoAlterado = `exibicao.${mutacao.campo}`;
+            break;
+          case "REGISTRO":
+            mutado[mutacao.campo] = mutacao.valor;
+            caminhoAlterado = mutacao.campo;
+            break;
+        }
+        // ORIGINAL_RECORD_UNCHANGED / MUTATION_TARGET_CHANGED /
+        // ONLY_EXPECTED_PATH_CHANGED / DYNAMIC_REPLACEMENT_PROPERTY_CREATED=false
+        expect(JSON.stringify(original)).toBe(antesOriginal);
+        if (mutacao.tipo === "EXIBICAO") {
+          expect((original.exibicao ?? {})[mutacao.campo]).not.toBe(mutacao.valor);
+          expect((mutado.exibicao ?? {})[mutacao.campo]).toBe(mutacao.valor);
+        } else {
+          expect(original[mutacao.campo]).not.toBe(mutacao.valor);
+          expect(mutado[mutacao.campo]).toBe(mutacao.valor);
+        }
+        expect(Object.keys(mutado).filter((chave) => chave === mutacao.valor)).toEqual([]);
+        if (mutacao.tipo === "EXIBICAO") {
+          expect(Object.keys(mutado.exibicao ?? {})).toEqual(
+            expect.arrayContaining(Object.keys(original.exibicao ?? {})),
+          );
+        }
+
         const stale = await despachar("POST", "/api/campaigns/persist", {
           headers: { cookie: operador.cookie, "content-type": "application/json" },
           corpo: Buffer.from(JSON.stringify({
             fingerprintArquivo: sha(`outro-arquivo-${randomUUID()}`),
             templateVersao: TEMPLATE_V2,
             conteudoHash: aprovado.conteudoHash,
-            registros: mutados,
+            registros: [
+              mutado,
+              ...REGISTROS.slice(1).map((registro) => structuredClone(registro)),
+            ],
             decisoes: [],
           })),
         });
-        expect(stale.status, `campo ${campo} deveria invalidar a aprovação`).toBe(409);
+        expect(
+          stale.status,
+          `campo ${caminhoAlterado} deveria invalidar a aprovação`,
+        ).toBe(409);
         expect(stale.corpo).toContain("CAMPAIGN_APPROVAL_STALE");
       }
+
+      // CONTROL_UNCHANGED_PERSISTS: conteúdo IDÊNTICO ao autorizado persiste.
+      const controle = await despachar("POST", "/api/campaigns/persist", {
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          fingerprintArquivo: sha(`controle-inalterado-${randomUUID()}`),
+          templateVersao: TEMPLATE_V2,
+          conteudoHash: aprovado.conteudoHash,
+          registros: REGISTROS.map((registro) => structuredClone(registro)),
+          decisoes: [],
+        })),
+      });
+      expect(controle.status).toBe(201);
 
       // RENDERED_DATA_CHANGE_INVALIDATES_APPROVAL / TEMPLATE_CHANGE: versão
       // diferente da autorizada nunca persiste (fail-closed na seleção).
@@ -744,12 +796,16 @@ describeDb("CAMPAIGN_RESUMABLE_ROUTES — retomada real (PostgreSQL 16)", () => 
     { profissional_id: "PF-R-0001", nome: "Ana Sintetica", email_normalizado: "ana@exemplo.test", status_validacao: "APTO" },
     { profissional_id: "PF-R-0002", nome: "Bruno Sintetico", email_normalizado: "bruno@exemplo.test", status_validacao: "APTO" },
   ];
+  // GF-2 CI CORRECTIVE-01 — seleção EXPLÍCITA da versão (v1 RETIRED; NENHUM
+  // default implícito): o servidor resolve a entrada APPROVED do registry.
+  const TEMPLATE_V2 = "pf-expedicao-carteira-2026-v2";
 
   async function persistirCampanha(cookie: string, fingerprint: string) {
     const resposta = await despachar("POST", "/api/campaigns/persist", {
       headers: { cookie, "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({
         fingerprintArquivo: fingerprint,
+        templateVersao: TEMPLATE_V2,
         registros: REGISTROS,
         decisoes: [],
       })),

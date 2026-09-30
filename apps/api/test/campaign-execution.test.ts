@@ -25,7 +25,13 @@ import {
   type CampanhaPool,
   type PoliticaExecucaoCampanha,
 } from "../src/campaign-execution.js";
-import { carregarPoliticaCampanhaAtualizacao } from "../src/campaigns.js";
+import { carregarPoliticaCampanhaAtualizacao, hashAprovacaoCampanha } from "../src/campaigns.js";
+import { fingerprintDestinatarioCampanha } from "../src/campaign-control.js";
+import {
+  contentHashDoTemplate,
+  metadadosTemplate,
+  TEMPLATE_V2_VERSION,
+} from "@integra-correios/mail";
 
 const DB_URL_AMBIENTE = process.env.DATABASE_URL;
 
@@ -942,6 +948,63 @@ interface CenaLote {
   readonly campanhaId: string;
   readonly loteCampanhaId: string;
   readonly hashAprovacao: string;
+  readonly templateContentHash: string;
+  readonly registros: readonly RegistroFixtureCampanha[];
+}
+
+interface RegistroFixtureCampanha {
+  readonly profissional_id: string;
+  readonly nome: string;
+  readonly email_normalizado: string;
+  readonly status_validacao: string;
+}
+
+const TEMPLATE_V2_FIXTURE = TEMPLATE_V2_VERSION;
+
+/**
+ * GF-2 CI CORRECTIVE-01 — snapshot V2 GOVERNADO da fixture (fonte única,
+ * usada pelo builder de cena e pela prova independente): contentHash obtido
+ * da entrada APPROVED do registry (nunca literal duplicado), marcador
+ * approval_hash_version, um registro sintético POR ORDEM (registro do item =
+ * registros[ordem - 1]) e hash de aprovação V2 recalculado pelo helper
+ * canônico sobre EXATAMENTE o snapshot persistido. 100% sintético (.test,
+ * UUIDs sintéticos, sem PII).
+ */
+function cenarioV2Sintetico(quantidade: number): {
+  readonly registros: readonly RegistroFixtureCampanha[];
+  readonly templateContentHash: string;
+  readonly snapshot: {
+    readonly template_versao: string;
+    readonly template_content_hash: string;
+    readonly approval_hash_version: "CAMPANHA_APROVACAO_V2";
+    readonly registros: readonly RegistroFixtureCampanha[];
+  };
+  readonly hashAprovacao: string;
+} {
+  const templateContentHash = contentHashDoTemplate(TEMPLATE_V2_FIXTURE);
+  if (!templateContentHash) {
+    throw new Error("Fixture: registry v2 sem contentHash canônico.");
+  }
+  const registros: RegistroFixtureCampanha[] = Array.from({ length: quantidade }, (_, indice) => ({
+    profissional_id: `00000000-0000-4000-8000-${String(indice + 1).padStart(12, "0")}`,
+    nome: `Profissional Sintetico Exec ${indice + 1}`,
+    email_normalizado: `prof.exec.fixture.${indice + 1}@exemplo.test`,
+    status_validacao: "APTO",
+  }));
+  const snapshot = {
+    template_versao: TEMPLATE_V2_FIXTURE,
+    template_content_hash: templateContentHash,
+    approval_hash_version: "CAMPANHA_APROVACAO_V2" as const,
+    registros,
+  };
+  // Helper público/canônico (contrato V2) sobre o snapshot EXATO persistido.
+  const hashAprovacao = hashAprovacaoCampanha({
+    contrato: "CAMPANHA_APROVACAO_V2",
+    templateVersao: TEMPLATE_V2_FIXTURE,
+    templateContentHash,
+    registros,
+  });
+  return { registros, templateContentHash, snapshot, hashAprovacao };
 }
 
 /** Campanha + lote + itens sintéticos (UNIQUE por execução; NUNCA dados reais). */
@@ -957,34 +1020,102 @@ async function criarCenaLote(
   const campanhaId = randomUUID();
   const loteCampanhaId = randomUUID();
   const agora = new Date().toISOString();
-  const hashAprovacao = createHash("sha256").update("exec-fixture-" + campanhaId).digest("hex");
-  const fingerprint = createHash("sha256").update("dest-exec-" + campanhaId).digest("hex");
+  const cenario = cenarioV2Sintetico(params.itens.length);
+  const fingerprintArquivo = createHash("sha256").update("exec-fixture-" + campanhaId).digest("hex");
   await pool.query(
-    "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'pf-expedicao-carteira-2026-v2', $4, $5::jsonb, $6, 0, 0, 0, 'LOTE_CRIADO', $7, $7)",
+    "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, 0, $8, 'LOTE_CRIADO', $9, $9)",
     [
       campanhaId,
       params.operatorId,
-      hashAprovacao,
-      hashAprovacao,
-      JSON.stringify({ registros: [], total: params.itens.length }),
-      params.itens.length,
+      fingerprintArquivo,
+      cenario.snapshot.template_versao,
+      cenario.hashAprovacao,
+      JSON.stringify(cenario.snapshot),
+      cenario.registros.length,
+      cenario.registros.length,
       agora,
     ],
   );
   await pool.query(
-    "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'pf-expedicao-carteira-2026-v2', $4, $5, $6)",
-    [loteCampanhaId, campanhaId, params.codigoLote ?? "EXEC_LOTE_SINTETICO", params.estadoLote, params.itens.length, agora],
+    "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, $4, $5, $6, $7)",
+    [loteCampanhaId, campanhaId, params.codigoLote ?? "EXEC_LOTE_SINTETICO", TEMPLATE_V2_FIXTURE, params.estadoLote, params.itens.length, agora],
   );
   let ordem = 0;
   for (const item of params.itens) {
     ordem += 1;
+    // Resolução EXATA do contrato: registro do item = registros[ordem - 1];
+    // destinatario_fingerprint canônico do e-mail normalizado do registro.
+    const registro = cenario.registros[ordem - 1]!;
     await pool.query(
       "INSERT INTO outbox_campanha (id, lote_campanha_id, ordem, destinatario_fingerprint, payload_snapshot, estado, criada_em) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)",
-      [item.id, loteCampanhaId, ordem, fingerprint, JSON.stringify({ template_versao: "pf-expedicao-carteira-2026-v2", ordem }), item.estado, agora],
+      [
+        item.id,
+        loteCampanhaId,
+        ordem,
+        fingerprintDestinatarioCampanha(registro.email_normalizado),
+        JSON.stringify({ template_versao: TEMPLATE_V2_FIXTURE, template_content_hash: cenario.templateContentHash, ordem }),
+        item.estado,
+        agora,
+      ],
     );
   }
-  return { campanhaId, loteCampanhaId, hashAprovacao };
+  return { campanhaId, loteCampanhaId, hashAprovacao: cenario.hashAprovacao, templateContentHash: cenario.templateContentHash, registros: cenario.registros };
 }
+
+/**
+ * GF-2 CI CORRECTIVE-01 — prova INDEPENDENTE do preflight de execução
+ * (FIXTURE_VALIDATION_INDEPENDENT): as asserções abaixo usam APENAS o
+ * registry público (metadados/contentHash) e o helper canônico do hash para
+ * CONSTRUIR a fixture — nunca o verificador de snapshot da execução.
+ */
+describe("SLICE_03A.1 — fixture V2 governada (prova independente do preflight)", () => {
+  const cenario = cenarioV2Sintetico(5);
+
+  it("EXEC_FIXTURE_TEMPLATE_APPROVED: v2 registrada e APPROVED no registry público", () => {
+    const meta = metadadosTemplate(TEMPLATE_V2_FIXTURE);
+    expect(meta.ok).toBe(true);
+    if (!meta.ok) return expect.unreachable();
+    expect(meta.status).toBe("APPROVED");
+    expect(meta.scope).toBe("PF_CAMPAIGN");
+    expect(meta.dataMode).toBe("PREFILLED_CONFIRMATION");
+  });
+
+  it("EXEC_FIXTURE_CONTENT_HASH_MATCH: contentHash da fixture = contentHash canônico do registry", () => {
+    expect(cenario.templateContentHash).toBe(contentHashDoTemplate(TEMPLATE_V2_FIXTURE));
+    expect(cenario.snapshot.template_content_hash).toBe(cenario.templateContentHash);
+  });
+
+  it("EXEC_FIXTURE_VALID_V2_SNAPSHOT: versão/marcador/tamanho/ordem coerentes e sintéticos", () => {
+    expect(cenario.snapshot.template_versao).toBe(TEMPLATE_V2_FIXTURE);
+    expect(cenario.snapshot.approval_hash_version).toBe("CAMPANHA_APROVACAO_V2");
+    expect(cenario.snapshot.registros.length).toBe(5);
+    for (const registro of cenario.snapshot.registros) {
+      expect(registro.status_validacao).toBe("APTO");
+      expect(registro.email_normalizado.endsWith(".test")).toBe(true);
+      expect(registro.profissional_id).toMatch(/^[0-9a-f-]{36}$/);
+    }
+  });
+
+  it("EXEC_FIXTURE_APPROVAL_HASH_MATCH: hash V2 recalculado sobre o snapshot = hash persistido", () => {
+    expect(cenario.hashAprovacao).toMatch(/^[0-9a-f]{64}$/);
+    expect(cenario.hashAprovacao).toBe(
+      hashAprovacaoCampanha({
+        contrato: "CAMPANHA_APROVACAO_V2",
+        templateVersao: cenario.snapshot.template_versao,
+        templateContentHash: cenario.snapshot.template_content_hash,
+        registros: cenario.snapshot.registros,
+      }),
+    );
+  });
+
+  it("EXEC_FIXTURE_ORDER_RESOLVES_RECORD + EXEC_FIXTURE_RECIPIENT_FP_MATCH: item da ordem N resolve registros[N-1] com fingerprint canônico", () => {
+    for (let ordem = 1; ordem <= 5; ordem += 1) {
+      const registro = cenario.snapshot.registros[ordem - 1]!;
+      expect(registro.email_normalizado).toBe(`prof.exec.fixture.${ordem}@exemplo.test`);
+      expect(fingerprintDestinatarioCampanha(registro.email_normalizado)).toMatch(/^[0-9a-f]{64}$/);
+    }
+  });
+})
 
 describeDb("SLICE_03A.1 — jornada e gates (POSTGRESQL_INTEGRATION)", () => {
   let pool: PoolTipado | undefined;

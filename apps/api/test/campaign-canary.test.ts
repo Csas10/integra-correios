@@ -46,6 +46,12 @@ import {
   injetarProvedorCanarioParaTeste,
 } from "../src/server.js";
 import { chaveIdempotenciaExecucao } from "../src/campaign-execution.js";
+// GF-3 CORRECTIVE-02 (F8) — a fixture V2 é construída com os helpers
+// canônicos de PRODUÇÃO (mesmo padrão da fixture do campaign-execution).
+import {
+  contentHashDoTemplateSelecionado,
+  hashAprovacaoCampanha,
+} from "../src/campaigns.js";
 import {
   ACAO_AUTORIZADA_EXECUCAO,
   fingerprintDestinatarioCampanha,
@@ -1077,17 +1083,38 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     const agora = new Date().toISOString();
     // C — identidade ÚNICA da cena (hex 64): evita colisão em
     // UNIQUE(fingerprint_arquivo, hash_aprovacao) entre cenas consecutivas.
-    const hashAprovacao = fingerprintUnico("aprovacao-" + campanhaId);
-    const fingerprintArquivo = fingerprintUnico("arquivo-" + campanhaId);
+    // GF-3 CORRECTIVE-02 (F8) — a fixture é V2 CONSISTENTE: snapshot com
+    // versão + contentHash + marcador de contrato, e hash_aprovacao
+    // recalculado pelo dispatcher canônico de produção sobre EXATAMENTE o
+    // snapshot persistido (RECOMPUTATION_INPUT_COMPLETE; nada de hash
+    // sintético a-CANÔNICO). Única fonte de unicidade: o e-mail sintético
+    // (contentHash/registros derivam dele; campanhaId entra no
+    // fingerprint_arquivo para a UNIQUE do schema).
     const registros = params.emails.map((email, indice) => ({
       profissional_id: "PF-CNR-" + String(indice + 1).padStart(4, "0"),
       nome: "Sintetico Canary " + String(indice + 1),
       email_normalizado: email,
       status_validacao: "APTO",
     }));
+    const contentHashCanario = contentHashDoTemplateSelecionado("pf-expedicao-carteira-2026-v2") ?? "";
+    const snapshot = {
+      template_versao: "pf-expedicao-carteira-2026-v2",
+      template_content_hash: contentHashCanario,
+      approval_hash_version: "CAMPANHA_APROVACAO_V2" as const,
+      registros,
+    };
+    // Hash da aprovação: dispatcher canônico de PRODUÇÃO sobre o snapshot
+    // EXATO persistido (GF-3 CORRECTIVE-02/F8 — RECOMPUTATION_INPUT_COMPLETE).
+    const hashAprovacao = hashAprovacaoCampanha({
+      contrato: "CAMPANHA_APROVACAO_V2" as const,
+      templateVersao: snapshot.template_versao,
+      templateContentHash: snapshot.template_content_hash,
+      registros,
+    });
+    const fingerprintArquivo = fingerprintUnico("arquivo-" + campanhaId);
     await p.query(
       "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'pf-expedicao-carteira-2026-v2', $4, $5::jsonb, $6, $6, 0, $6, 'LOTE_CRIADO', $7, $7)",
-      [campanhaId, params.operatorId, fingerprintArquivo, hashAprovacao, JSON.stringify({ registros, total: registros.length }), registros.length, agora],
+      [campanhaId, params.operatorId, fingerprintArquivo, hashAprovacao, JSON.stringify(snapshot), registros.length, agora],
     );
     await p.query(
       "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'pf-expedicao-carteira-2026-v2', $4, $5, $6)",

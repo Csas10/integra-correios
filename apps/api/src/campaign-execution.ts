@@ -65,6 +65,16 @@ import {
   resolverRendererTemplate,
   type TemplateErrorCode,
 } from "@integra-correios/mail";
+// GF-3 CORRECTIVE-02 (F8) — dispatcher canônico do hash de aprovação
+// (produção): a revalidação pré-claim NÃO duplica algoritmo, resolve o
+// contrato FAIL-CLOSED e recalcula sobre o snapshot congelado.
+import {
+  CAMPANHA_APROVACAO_V1,
+  CAMPANHA_APROVACAO_V2,
+  hashDoSnapshotCampanha,
+  resolverContratoHashAprovacao,
+  type CampaignPersistSnapshot,
+} from "./campaigns.js";
 
 export type BloqueioExecucao =
   | "EXECUTE_DISABLED"
@@ -76,7 +86,8 @@ export type BloqueioExecucao =
   | "PROVA_DESTINATARIO_AUSENTE"
   | "AUTORIZACAO_HUMANA_AUSENTE"
   | TemplateErrorCode
-  | "SNAPSHOT_CORROMPIDO";
+  | "SNAPSHOT_CORROMPIDO"
+  | "APPROVAL_REVALIDACAO_FALHOU";
 
 export interface EntradaElegibilidadeExecucao {
   readonly politica: PoliticaExecucaoCampanha;
@@ -362,6 +373,8 @@ interface LinhaItemExecucao {
   readonly lote_codigo: string;
   readonly hash_aprovacao: string;
   readonly operator_id: string;
+  /** GF-3 CORRECTIVE-02 (F8) — versão congelada na CAMPANHA (c.template_versao). */
+  readonly campanha_template_versao?: unknown;
   /** Versão congelada do template (autoridade da resolução do provider). */
   readonly template_versao?: string;
   /** Snapshot congelado da campanha (preflight estrutural — GF-2 FINAL). */
@@ -371,18 +384,37 @@ interface LinhaItemExecucao {
 }
 
 /**
+ * GF-3 CORRECTIVE-02 (F8) — INVENTÁRIO DE INPUTS DO HASH DE APROVAÇÃO V2
+ * (RECOMPUTATION_INPUT_COMPLETE): os inputs canônicos do dispatcher de
+ * produção (hashAprovacaoCampanha → hashAprovacaoCampanhaV2) são
+ *   (1) templateVersao,
+ *   (2) templateContentHash,
+ *   (3) por registro: profissional_id, nome, email_normalizado,
+ *       status_validacao, source_record_key?, exibicao? (8 campos PREFILLED).
+ * O snapshot congelado persistido (snapshotCampanha, campaigns.ts) grava
+ * EXATAMENTE estes inputs: template_versao, template_content_hash,
+ * approval_hash_version e registros[] (com source_record_key?/exibicao?
+ * inteiros). Portanto RECOMPUTATION_INPUT_COMPLETE = true — nenhum input
+ * durável está ausente, nenhuma migração é necessária e NENHUM hash é
+ * inventado. A validação estrutural abaixo rejeita (fail-closed) snapshot
+ * sem qualquer um destes inputs.
+ *
  * GF-2 FINAL — preflight estrutural do item (exigido ANTES do claim, sem
  * mutação/evento em nenhuma falha): versão registrada/APPROVED no escopo,
  * contentHash do registry presente e snapshot íntegro para a ORDEM do item.
- * O provider repete verificações apenas como defesa em profundidade.
+ * GF-3 CORRECTIVE-02 (F8) — REVALIDAÇÃO DA APROVAÇÃO antes de
+ * claim/evento/token/provider: aprovação recém-computada ≠ hash persistido ⇒
+ * BLOQUEADO (CLAIMS=0, EXEC_EVENTS=0, TOKEN_LOADS=0, PROVIDER_CALLS=0,
+ * GMAIL_CALLS=0).
  * Retorno: undefined = OK; string = código de bloqueio sanitizado.
  */
 function preflightEstruturalItemExecucao(linha: {
   readonly template_versao?: unknown;
+  readonly campanha_template_versao?: unknown;
   readonly hash_aprovacao?: unknown;
   readonly snapshot_registros?: unknown;
   readonly ordem?: unknown;
-}): TemplateErrorCode | "SNAPSHOT_CORROMPIDO" | undefined {
+}): TemplateErrorCode | "SNAPSHOT_CORROMPIDO" | "APPROVAL_REVALIDACAO_FALHOU" | undefined {
   const resolucaoTemplate = resolverRendererTemplate(
     typeof linha.template_versao === "string" ? linha.template_versao : "",
   );
@@ -401,10 +433,93 @@ function preflightEstruturalItemExecucao(linha: {
   ) {
     return "SNAPSHOT_CORROMPIDO";
   }
+  // Visão tipada do snapshot congelado para a revalidação de aprovação (F8).
+  const snapshotDados = snapshot as CampaignPersistSnapshot;
   const registros = (snapshot as { registros: readonly unknown[] }).registros;
   const ordem = typeof linha.ordem === "number" ? Math.trunc(linha.ordem) : Number.NaN;
   if (!Number.isInteger(ordem) || ordem < 1 || ordem > registros.length) {
     return "SNAPSHOT_CORROMPIDO";
+  }
+  // -------------------------------------------------------------------------
+  // GF-3 CORRECTIVE-02 (F8) — REVALIDAÇÃO DA APROVAÇÃO ANTES DO CLAIM.
+  // Ordem estrita (nenhuma mutação/evento/token/provider pode ocorrer depois
+  // de uma divergência): (1) approval_hash_version; (2) estrutura completa do
+  // snapshot (todos os inputs canônicos presentes); (3) versões template
+  // campanha = lote = snapshot; (4)/(5) contentHash do registry = congelado;
+  // (6)/(7) hash recalculado PELO DISPATCHER DE PRODUÇÃO = hash persistido.
+  // -------------------------------------------------------------------------
+  let contrato: ReturnType<typeof resolverContratoHashAprovacao>;
+  try {
+    contrato = resolverContratoHashAprovacao({
+      templateVersao: linha.template_versao as string,
+      approvalHashVersion: snapshotDados.approval_hash_version,
+    });
+  } catch {
+    return "APPROVAL_REVALIDACAO_FALHOU";
+  }
+  if (contrato !== CAMPANHA_APROVACAO_V2 && contrato !== CAMPANHA_APROVACAO_V1) {
+    return "APPROVAL_REVALIDACAO_FALHOU";
+  }
+  // Estrutura completa do snapshot (RECOMPUTATION_INPUT_COMPLETE=true):
+  // sem template_content_hash durável ou registro sem campos canônicos ⇒
+  // BLOQUEADO (nada é inventado, nenhuma migração é adicionada aqui).
+  if (typeof snapshotDados.template_content_hash !== "string") {
+    return "APPROVAL_REVALIDACAO_FALHOU";
+  }
+  for (const candidato of registros) {
+    if (typeof candidato !== "object" || candidato === null) {
+      return "APPROVAL_REVALIDACAO_FALHOU";
+    }
+    const candidatoDados = candidato as {
+      profissional_id?: unknown;
+      nome?: unknown;
+      email_normalizado?: unknown;
+      status_validacao?: unknown;
+      source_record_key?: unknown;
+      exibicao?: unknown;
+    };
+    if (
+      typeof candidatoDados.profissional_id !== "string" ||
+      typeof candidatoDados.nome !== "string" ||
+      typeof candidatoDados.email_normalizado !== "string" ||
+      typeof candidatoDados.status_validacao !== "string"
+    ) {
+      return "APPROVAL_REVALIDACAO_FALHOU";
+    }
+    if (
+      candidatoDados.source_record_key !== undefined &&
+      typeof candidatoDados.source_record_key !== "string"
+    ) {
+      return "APPROVAL_REVALIDACAO_FALHOU";
+    }
+    if (
+      candidatoDados.exibicao !== undefined &&
+      (typeof candidatoDados.exibicao !== "object" || candidatoDados.exibicao === null)
+    ) {
+      return "APPROVAL_REVALIDACAO_FALHOU";
+    }
+  }
+  // (3) versões: campanha (linha do SELECT) = lote = snapshot congelado.
+  if (
+    linha.campanha_template_versao !== linha.template_versao ||
+    linha.template_versao !== snapshotDados.template_versao
+  ) {
+    return "APPROVAL_REVALIDACAO_FALHOU";
+  }
+  // (4)/(5) contentHash canônico ATUAL do registry = congelado no snapshot.
+  if (
+    contentHashDoTemplate(linha.template_versao as string) !==
+    snapshotDados.template_content_hash
+  ) {
+    return "APPROVAL_REVALIDACAO_FALHOU";
+  }
+  // (6)/(7) hash do snapshot pelo dispatcher DE PRODUÇÃO = hash persistido.
+  // O cast é seguro: a checagem estrutural acima exigiu os inputs canônicos
+  // (RECOMPUTATION_INPUT_COMPLETE) e resolverContratoHashAprovacao é
+  // fail-closed para o contrato.
+  const snapshotCanonicamenteValido = snapshot as CampaignPersistSnapshot;
+  if (hashDoSnapshotCampanha(snapshotCanonicamenteValido) !== linha.hash_aprovacao) {
+    return "APPROVAL_REVALIDACAO_FALHOU";
   }
   return undefined;
 }
@@ -471,7 +586,7 @@ async function claimItemInterno(
   try {
     await transaction.query("BEGIN");
     const linhas = await transaction.query(
-      "SELECT i.estado AS item_estado, i.destinatario_fingerprint, l.estado AS lote_estado, l.codigo AS lote_codigo, c.hash_aprovacao, c.operator_id, l.template_versao, c.snapshot_registros, i.ordem FROM lote_campanha l JOIN campanha_persistida c ON c.id = l.campanha_id JOIN outbox_campanha i ON i.lote_campanha_id = l.id WHERE i.id = $1 AND l.id = $2 AND c.id = $3 FOR UPDATE OF l, i",
+      "SELECT i.estado AS item_estado, i.destinatario_fingerprint, l.estado AS lote_estado, l.codigo AS lote_codigo, c.hash_aprovacao, c.operator_id, l.template_versao, c.template_versao AS campanha_template_versao, c.snapshot_registros, i.ordem FROM lote_campanha l JOIN campanha_persistida c ON c.id = l.campanha_id JOIN outbox_campanha i ON i.lote_campanha_id = l.id WHERE i.id = $1 AND l.id = $2 AND c.id = $3 FOR UPDATE OF l, i",
       [comando.itemId, comando.loteCampanhaId, comando.campanhaId],
     );
     const linha = linhas.rows[0] as

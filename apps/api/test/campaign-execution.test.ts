@@ -25,7 +25,11 @@ import {
   type CampanhaPool,
   type PoliticaExecucaoCampanha,
 } from "../src/campaign-execution.js";
-import { carregarPoliticaCampanhaAtualizacao, hashAprovacaoCampanha } from "../src/campaigns.js";
+import {
+  carregarPoliticaCampanhaAtualizacao,
+  hashAprovacaoCampanha,
+  hashDoSnapshotCampanha,
+} from "../src/campaigns.js";
 import { fingerprintDestinatarioCampanha } from "../src/campaign-control.js";
 import {
   contentHashDoTemplate,
@@ -302,6 +306,7 @@ function poolSentinela(): CampanhaPool {
                 hash_aprovacao: "bb".repeat(32),
                 operator_id: "3c3d3e3f-4a5b-4c6d-8e7f-0a1b2c3d4e5f",
                 template_versao: "v-sentinel-nao-registrada-2B1D",
+                campanha_template_versao: "v-sentinel-nao-registrada-2B1D",
               },
             ],
             rowCount: 1,
@@ -730,14 +735,47 @@ function criarExecutorDeAuditoriaSpy(opcoes: { readonly rowCountCas: number }): 
               destinatario_fingerprint: "aa".repeat(32),
               lote_estado: "ATIVO",
               lote_codigo: "CAMPANHA_PF_SINTETICA",
-              hash_aprovacao: "bb".repeat(32),
+              hash_aprovacao: hashDoSnapshotCampanha({
+                template_versao: "pf-expedicao-carteira-2026-v2",
+                template_content_hash: contentHashDoTemplate("pf-expedicao-carteira-2026-v2") ?? "",
+                approval_hash_version: "CAMPANHA_APROVACAO_V2",
+                total_registros: 1,
+                total_aptos: 1,
+                total_bloqueados: 0,
+                total_aprovados: 1,
+                registros: [
+                  {
+                    profissional_id: "00000000-0000-4000-8000-000000000001",
+                    nome: "Profissional Sintetico Fluxo",
+                    email_normalizado: "s@exemplo.test",
+                    status_validacao: "APTO",
+                  },
+                ],
+                decisoes_humanas: [],
+              }),
               operator_id: operadorDoFluxo,
               // SLICE_03C.2B1D / GF-2 FINAL — versão registrada/APPROVED no
               // fake (v2 do registry): as provas D/E validam aridade e fluxo
               // do claim; snapshot estrutural + ordem válida para o preflight.
+              // GF-3 CORRECTIVE-02 (F8) — fixture V2 CONSISTENTE: o snapshot
+              // contém os inputs canônicos completos, contentHash do registry
+              // e hash_aprovacao recalculado pelo dispatcher de produção
+              // (hashDoSnapshotCampanha) — o preflight F8 passa e o fluxo
+              // D/E prossegue inalterado.
               template_versao: "pf-expedicao-carteira-2026-v2",
+              campanha_template_versao: "pf-expedicao-carteira-2026-v2",
               snapshot_registros: {
-                registros: [{ nome: "S", email_normalizado: "s@exemplo.test" }],
+                template_versao: "pf-expedicao-carteira-2026-v2",
+                template_content_hash: contentHashDoTemplate("pf-expedicao-carteira-2026-v2"),
+                approval_hash_version: "CAMPANHA_APROVACAO_V2",
+                registros: [
+                  {
+                    profissional_id: "00000000-0000-4000-8000-000000000001",
+                    nome: "Profissional Sintetico Fluxo",
+                    email_normalizado: "s@exemplo.test",
+                    status_validacao: "APTO",
+                  },
+                ],
               },
               ordem: 1,
             },
@@ -898,12 +936,30 @@ describe("SLICE_03A.3 — aridade e mapeamento SQL (regressão local do binding)
                 destinatario_fingerprint: "aa".repeat(32),
                 lote_estado: "ATIVO",
                 lote_codigo: "EXEC_LOTE_SINTETICO",
-                hash_aprovacao: "bb".repeat(32),
+                hash_aprovacao: hashDoSnapshotCampanha({
+                  template_versao: "pf-expedicao-carteira-2026-v2",
+                  template_content_hash: contentHashDoTemplate("pf-expedicao-carteira-2026-v2") ?? "",
+                  approval_hash_version: "CAMPANHA_APROVACAO_V2",
+                  total_registros: 1,
+                  total_aptos: 1,
+                  total_bloqueados: 0,
+                  total_aprovados: 1,
+                  registros: [
+                    {
+                      profissional_id: "00000000-0000-4000-8000-000000000001",
+                      nome: "Profissional Sintetico",
+                      email_normalizado: "prof.settlement@exemplo.test",
+                      status_validacao: "APTO",
+                    },
+                  ],
+                  decisoes_humanas: [],
+                }),
                 operator_id: operadorDoFluxo,
                 template_versao: "pf-expedicao-carteira-2026-v2",
+                campanha_template_versao: "pf-expedicao-carteira-2026-v2",
                 snapshot_registros: {
                   template_versao: "pf-expedicao-carteira-2026-v2",
-                  template_content_hash: "cc".repeat(32),
+                  template_content_hash: contentHashDoTemplate("pf-expedicao-carteira-2026-v2"),
                   approval_hash_version: "CAMPANHA_APROVACAO_V2",
                   registros: [
                     {
@@ -1709,5 +1765,175 @@ describeDb("SLICE_03A.1 — corridas, falhas e restart (POSTGRESQL_INTEGRATION)"
     } finally {
       await poolNovaInstancia.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02 (F8) — APPROVAL_REVALIDATED_BEFORE_CLAIM (PostgreSQL 16):
+// antes de claim/evento/token/provider, o preflight revalida a aprovação
+// congelada. Tampering de QUALQUER input canônico ⇒ BLOQUEADO estável com
+// CLAIMS=0, EXEC_EVENTS=0, TOKEN_LOADS=0, PROVIDER_CALLS=0 (GMAIL_CALLS=0 —
+// provider é fake injetado e a rede é fisicamente ausente neste módulo).
+// Snapshot válido ⇒ execução EXISTENTE inalterada (cenas acima).
+// ---------------------------------------------------------------------------
+describeDb("GF3 C2 F8 — revalidação da aprovação antes do claim (PostgreSQL 16)", () => {
+  let pool: PoolTipado | undefined;
+  const operadorId = randomUUID();
+  const itemSaoId = randomUUID();
+  const itemPrefilledId = randomUUID();
+  const itemTamperHashId = randomUUID();
+  const itemTamperHashVersionId = randomUUID();
+  const itemTamperFpId = randomUUID();
+  const itemValidoId = randomUUID();
+  let cenaOk: CenaLote;
+  let cenaTamper: CenaLote;
+  let cenaTamperFp: CenaLote;
+
+  beforeAll(async () => {
+    const { NodePostgresPool } = await import("@integra-correios/persistence");
+    pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE!, max: 4 });
+    await criarOperadorSintetico(pool, operadorId, "EXEC-F8");
+    // Cena ÍNTEGRA: claim e execução existentes INALTERADOS (prova negativa).
+    cenaOk = await criarCenaLote(pool, {
+      operatorId: operadorId,
+      estadoLote: "ATIVO",
+      itens: [
+        { id: itemSaoId, estado: "PREPARADO" },
+        { id: itemValidoId, estado: "PREPARADO" },
+      ],
+    });
+    // Cena ADULTERADA no snapshot (campo prefilled + template_content_hash)
+    // e no hash persistido (campanha e approval_hash_version):
+    cenaTamper = await criarCenaLote(pool, {
+      operatorId: operadorId,
+      estadoLote: "ATIVO",
+      itens: [
+        { id: itemPrefilledId, estado: "PREPARADO" },
+        { id: itemTamperHashId, estado: "PREPARADO" },
+        { id: itemTamperHashVersionId, estado: "PREPARADO" },
+      ],
+    });
+    // Tampering 1: campo PREFILLED do snapshot (nome do registro ordem 1).
+    await pool.query(
+      "UPDATE campanha_persistida SET snapshot_registros = jsonb_set(snapshot_registros, '{registros,0,nome}', to_jsonb('Nome Adulterado F8'::text)) WHERE id = $1",
+      [cenaTamper.campanhaId],
+    );
+    // Tampering 2: hash_aprovacao persistido diverge do snapshot congelado.
+    await pool.query(
+      "UPDATE campanha_persistida SET hash_aprovacao = $2 WHERE id = $1",
+      [cenaTamper.campanhaId, createHash("sha256").update("f8-tamper-hash").digest("hex")],
+    );
+    // Tampering 3: approval_hash_version inválido (contrato desconhecido).
+    await pool.query(
+      "UPDATE campanha_persistida SET snapshot_registros = jsonb_set(snapshot_registros, '{approval_hash_version}', to_jsonb('CAMPANHA_APROVACAO_V9'::text)) WHERE id = $1",
+      [cenaTamper.campanhaId],
+    );
+    // Cena ADULTERADA no template_content_hash (versão de outra fixture):
+    cenaTamperFp = await criarCenaLote(pool, {
+      operatorId: operadorId,
+      estadoLote: "ATIVO",
+      itens: [{ id: itemTamperFpId, estado: "PREPARADO" }],
+    });
+    await pool.query(
+      "UPDATE campanha_persistida SET snapshot_registros = jsonb_set(snapshot_registros, '{template_content_hash}', to_jsonb($2::text)) WHERE id = $1",
+      [cenaTamperFp.campanhaId, createHash("sha256").update("f8-tamper-contenthash").digest("hex")],
+    );
+  });
+
+  afterAll(async () => {
+    await pool?.close();
+  });
+
+  it("snapshot válido: execução existente INALTERADA (claim → provider → receipt → settlement)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaOk.campanhaId,
+      loteCampanhaId: cenaOk.loteCampanhaId,
+      itemId: itemValidoId,
+    });
+    expect(resultado.resultado).toBe("ENVIADO");
+    expect(provider.chamadas).toBe(1);
+    expect(await contarEventos(pool!, itemValidoId, "EXEC_CLAIM")).toBe(1);
+    expect(await estadoDoItem(pool!, itemValidoId)).toBe("ENVIADO");
+  });
+
+  it("tampering de campo PREFILLED do snapshot ⇒ BLOQUEADO, CLAIMS=0/EXEC_EVENTS=0/PROVIDER=0", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const eventosAntes = await pool!.query(
+      "SELECT count(*)::int AS total FROM evento_auditoria WHERE agregado_id = $1",
+      [itemPrefilledId],
+    );
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaTamper.campanhaId,
+      loteCampanhaId: cenaTamper.loteCampanhaId,
+      itemId: itemPrefilledId,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["APPROVAL_REVALIDACAO_FALHOU"]);
+    expect(provider.chamadas).toBe(0); // PROVIDER_CALLS=0
+    expect(await estadoDoItem(pool!, itemPrefilledId)).toBe("PREPARADO"); // CLAIMS=0
+    const eventosDepois = await pool!.query(
+      "SELECT count(*)::int AS total FROM evento_auditoria WHERE agregado_id = $1",
+      [itemPrefilledId],
+    );
+    expect(
+      (eventosDepois.rows[0] as { total: number }).total,
+    ).toBe((eventosAntes.rows[0] as { total: number }).total); // EXEC_EVENTS=0
+  });
+
+  it("tampering de campanha.hash_aprovacao ⇒ BLOQUEADO (hash revalidado ≠ persistido)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaTamper.campanhaId,
+      loteCampanhaId: cenaTamper.loteCampanhaId,
+      itemId: itemTamperHashId,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["APPROVAL_REVALIDACAO_FALHOU"]);
+    expect(provider.chamadas).toBe(0);
+    expect(await estadoDoItem(pool!, itemTamperHashId)).toBe("PREPARADO");
+  });
+
+  it("approval_hash_version inválido ⇒ BLOQUEADO (fail-closed, sem downgrade)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaTamper.campanhaId,
+      loteCampanhaId: cenaTamper.loteCampanhaId,
+      itemId: itemTamperHashVersionId,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["APPROVAL_REVALIDACAO_FALHOU"]);
+    expect(provider.chamadas).toBe(0);
+    expect(await estadoDoItem(pool!, itemTamperHashVersionId)).toBe("PREPARADO");
+  });
+
+  it("tampering de template_content_hash do snapshot ⇒ BLOQUEADO (registry ≠ congelado)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaTamperFp.campanhaId,
+      loteCampanhaId: cenaTamperFp.loteCampanhaId,
+      itemId: itemTamperFpId,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["APPROVAL_REVALIDACAO_FALHOU"]);
+    expect(provider.chamadas).toBe(0);
+    expect(await estadoDoItem(pool!, itemTamperFpId)).toBe("PREPARADO");
   });
 });

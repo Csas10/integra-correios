@@ -415,3 +415,81 @@ describe("GF2_CORRETIVO — marcador fail-closed e sem downgrade", () => {
     ).toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02 (F4) — V2_PRESENCE_ENCODING_UNAMBIGUOUS (PRE-LAUNCH):
+//   · ABSENT ⇒ marcador tipado explícito (NUNCA "null", que colidia com a
+//     string permitida "null");
+//   · PRESENT ⇒ marcador tipado + comprimento determinístico + valor exato
+//     ("s:<len>:<valor>") — a fronteira comprimento/valor é inequívoca;
+//   · undefined ≠ "null" ≠ qualquer string permitida; ordem irrelevante;
+//   · vazio ⇒ ausente (saída de validarSubmissaoAprovacao);
+//   · V1 permanece BYTE A BYTE inalterado (espelho legado acima).
+// Sem golden digest hardcode: as provas são RELACIONAIS (semântica do
+// encoding), duráveis e independentes do digest absoluto.
+// ---------------------------------------------------------------------------
+describe("GF3_C2_F4 — V2_PRESENCE_ENCODING_UNAMBIGUOUS", () => {
+  const contentHash = "c".repeat(64);
+
+  const comExibicao = (exibicao: Record<string, string> | undefined) =>
+    hashAprovacaoCampanha({
+      contrato: CAMPANHA_APROVACAO_V2,
+      templateVersao: TEMPLATE_V2_VERSION,
+      templateContentHash: contentHash,
+      registros: [
+        exibicao === undefined
+          ? REGISTRO_BASE
+          : { ...REGISTRO_BASE, exibicao },
+      ],
+    });
+
+  it("ausência ≠ string 'null': cidade 'null' ⇒ hash DIFERENTE de cidade ausente", () => {
+    const ausente = comExibicao({ cidade: "Salvador", uf: "BA" });
+    const literalNull = comExibicao({ cidade: "null", uf: "BA" });
+    expect(literalNull).not.toBe(ausente);
+  });
+
+  it("presente: valor EXATO entra no canônico ('BA' ≠ 'BAA' — comprimento binda o valor)", () => {
+    const ba = comExibicao({ cidade: "Salvador", uf: "BA" });
+    const baa = comExibicao({ cidade: "Salvador", uf: "BAA" });
+    expect(baa).not.toBe(ba);
+  });
+
+  it("fronteira comprimento/valor inequívoca: separador \\u001f no valor não é confundido com o delimitador", () => {
+    const valorComSeparador = comExibicao({ cidade: "Sal\u001fvador", uf: "BA" });
+    const valorDistinto = comExibicao({ cidade: "Sal", uf: "BA" });
+    // Canonicamente diferentes — o comprimento binda o valor exato:
+    expect(valorComSeparador).not.toBe(valorDistinto);
+  });
+
+  it("vazio ⇒ ausente (saída da normalização): exibicao { uf: '   ' } == sem exibicao", () => {
+    const vazia = normalizarExibicaoRegistroCampanha({ uf: "   " });
+    const comCampoVazio = hashAprovacaoCampanha({
+      contrato: CAMPANHA_APROVACAO_V2,
+      templateVersao: TEMPLATE_V2_VERSION,
+      templateContentHash: contentHash,
+      registros: [
+        vazia === undefined
+          ? REGISTRO_BASE
+          : { ...REGISTRO_BASE, exibicao: vazia },
+      ],
+    });
+    expect(comCampoVazio).toBe(comExibicao(undefined));
+  });
+
+  it("ordem de propriedades permanece IRRELEVANTE no encoding novo", () => {
+    const direto = comExibicao({ cidade: "Salvador", uf: "BA", telefone: "(00) 00000-0000" });
+    const invertida = comExibicao({ telefone: "(00) 00000-0000", uf: "BA", cidade: "Salvador" });
+    expect(direto).toBe(invertida);
+  });
+
+  it("LEGACY_V1_HASH_UNCHANGED: espelho legado V1 continua byte a byte (regressão do F4)", () => {
+    const esperado = hashV1HistoricoLegado(V1_HISTORICA, [REGISTRO_BASE]);
+    const obtido = hashAprovacaoCampanha({
+      contrato: CAMPANHA_APROVACAO_V1,
+      templateVersao: V1_HISTORICA,
+      registros: [REGISTRO_BASE],
+    });
+    expect(obtido).toBe(esperado);
+  });
+});

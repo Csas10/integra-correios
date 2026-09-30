@@ -222,7 +222,7 @@ describe("CAMPAIGN_PERSISTENCE — snapshot, hash e validação de entrada (unit
 /**
  * Espelha o contrato canônico V2 (implementação independente da de produção,
  * sem depender do ciclo de import): namespace/versão + ordem fixa de campos,
- * null canônico para campos de exibição ausentes.
+ * encoding de presença tipado para campos ausentes (GF-3 CORRECTIVE-02/F4).
  */
 function hashDoSnapshotLocal(snapshot: {
   template_versao: string;
@@ -246,15 +246,17 @@ function hashDoSnapshotLocal(snapshot: {
         registro.nome,
         registro.email_normalizado,
         registro.status_validacao,
-        "null", // source_record_key (ausente neste fluxo)
-        "null", // telefone
-        "null", // cep
-        "null", // logradouro
-        "null", // numero
-        "null", // complemento
-        "null", // bairro
-        "null", // cidade
-        "null", // uf
+        // GF-3 CORRECTIVE-02 (F4) — encoding de PRESENÇA tipado: ausente ⇒
+        // marcador explícito (nunca "null"); presente ⇒ s:<len>:<valor>.
+        "\u0000AUSENTE\u0000", // source_record_key (ausente neste fluxo)
+        "\u0000AUSENTE\u0000", // telefone
+        "\u0000AUSENTE\u0000", // cep
+        "\u0000AUSENTE\u0000", // logradouro
+        "\u0000AUSENTE\u0000", // numero
+        "\u0000AUSENTE\u0000", // complemento
+        "\u0000AUSENTE\u0000", // bairro
+        "\u0000AUSENTE\u0000", // cidade
+        "\u0000AUSENTE\u0000", // uf
       ].join("\u001f") + "\n",
     );
   }

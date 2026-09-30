@@ -459,6 +459,9 @@ export function CampaignWorkspace() {
   // re-deriva tudo do servidor para o próximo login — ownership permanece
   // autoridade SERVER-SIDE e nenhuma request pendente de A restaura estado
   // para B (o efeito é cancelado pelo cleanup `ativo` ao trocar `me`).
+  // GF-3 CORRECTIVE-02 (F5) — o reset completo passa a cobrir TAMBÉM os
+  // estados de template/prévia (templatesSelecionaveis, templateSelecionada,
+  // previaMensagemServidor, previaIndice, previaCarregando, previaErro).
   // NENHUMA persistência/localStorage para estes dados.
   const limparEstadoOperador = () => {
     setArquivo(null);
@@ -479,6 +482,17 @@ export function CampaignWorkspace() {
     setCampanha(null);
     setRetomada(LIMPEZA_RETOMADA.retomada);
     setModoRetomada(LIMPEZA_RETOMADA.modo);
+    // GF-3 CORRECTIVE-02 (F5) — estados de TEMPLATE/PRÉVIA também são
+    // ligados ao operador montado: catálogo, seleção, prévia renderizada,
+    // índice, carregando e erro. Nada de catálogo/seleção/prévia do
+    // operador A sobrevive ao logout confirmado para o operador B. Sem
+    // localStorage/sessionStorage (prova estrutural dedicada).
+    setTemplatesSelecionaveis([]);
+    setTemplateSelecionada("");
+    setPreviaMensagemServidor(null);
+    setPreviaIndice(0);
+    setPreviaCarregando(false);
+    setPreviaErro("");
   };
   const [painelAdmin, setPainelAdmin] = useState(false);
   const [operadores, setOperadores] = useState<readonly OperatorListEntry[]>([]);
@@ -505,6 +519,9 @@ export function CampaignWorkspace() {
   // Prévia server-side (mesmo renderer do provider) para o registro selecionado.
   const [previaMensagemServidor, setPreviaMensagemServidor] = useState<PreviaRegistro | null>(null);
   const [previaCarregando, setPreviaCarregando] = useState(false);
+  // GF-3 CORRECTIVE-02 (F5) — erro da prévia é estado do operador (limpo no
+  // logout e na troca de template/registro).
+  const [previaErro, setPreviaErro] = useState("");
   const [painelAtividade, setPainelAtividade] = useState(false);
   const [etapaConsulta, setEtapaConsulta] = useState<Etapa>(1);
   // UX-FLOW-01B — retomada server-driven (descoberta por operator_id).
@@ -571,7 +588,17 @@ export function CampaignWorkspace() {
 
   // GF-2 FINAL — catálogo de templates selecionáveis vem SEMPRE do servidor
   // (registry: APPROVED no escopo PF_CAMPAIGN). Nenhum default implícito.
+  // GF-3 CORRECTIVE-02 (F6) — ciclo de vida LIGADO À SESSÃO: sem `me` ⇒
+  // catálogo limpo e NENHUMA request; ao autenticar ⇒ request; troca de
+  // operador/logout/login ⇒ cleanup cancela a resposta stale (`ativo`),
+  // catálogo anterior é limpo e a recarga ocorre para a sessão atual. Sem
+  // polling (dependência única `me`).
   useEffect(() => {
+    if (!me) {
+      setTemplatesSelecionaveis([]);
+      setTemplateSelecionada("");
+      return;
+    }
     let ativo = true;
     void fetchJson<{ templates: readonly TemplateSelecionavel[] }>(
       "/api/campaigns/template-selecionaveis",
@@ -585,7 +612,7 @@ export function CampaignWorkspace() {
     return () => {
       ativo = false;
     };
-  }, []);
+  }, [me]);
 
   useEffect(() => {
     if (!me) {
@@ -1147,25 +1174,54 @@ export function CampaignWorkspace() {
     [base, excluidos],
   );
 
-  // GF-2 FINAL — prévia server-side (PREVIEW_RENDERER_EQUALS_SEND_RENDERER):
-  // o browser envia APENAS identificadores autorizados (campanhaId + linha);
-  // valores/assunto vêm do snapshot congelado via o mesmo renderer do envio.
-  // Antes da persistência não há snapshot — a prévia completa é apresentada
-  // após o congelamento (o cliente NUNCA é autoridade de conteúdo).
+  // GF-2 FINAL — prévia server-side (PREVIEW_RENDERER_EQUALS_SEND_RENDERER).
+  // GF-3 CORRECTIVE-02 (F7) — PRÉVIA PRÉ-APROVAÇÃO: o efeito usa
+  // POST /api/campaigns/template-preview com o MESMO payload pendente do
+  // authorize (templateSelecionada + aptosParaAprovacao) e o índice
+  // navegável previaIndice — nada de registro fixo na linha 1 do snapshot.
+  // Valores/assunto vêm SEMPRE do servidor (mesmo registry/renderer do
+  // provider); o browser NUNCA fornece subject/texto/HTML/remetente/
+  // Reply-To. O preview PÓS-persistência (GET /api/campaigns/
+  // preview-registro, snapshot congelado) permanece uma rota/fluxo
+  // separado. Cleanup `ativo` cancela a resposta stale; erro de prévia é
+  // estado próprio (F5).
   useEffect(() => {
     setPreviaMensagemServidor(null);
-    const campanhaId = campanha?.campanhaId;
-    if (templateSelecionada === "" || !campanhaId) return;
+    setPreviaErro("");
+    if (templateSelecionada === "" || aptosParaAprovacao.length === 0) return;
+    const indiceSolicitado = Math.min(previaIndice, aptosParaAprovacao.length - 1);
+    if (indiceSolicitado < 0) return;
     let ativo = true;
     setPreviaCarregando(true);
-    void fetchJson<PreviaRegistro>(
-      `/api/campaigns/preview-registro?campanhaId=${encodeURIComponent(campanhaId)}&linha=1`,
-    )
+    void fetchJson<PreviaRegistro>("/api/campaigns/template-preview", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        templateVersao: templateSelecionada,
+        previaIndice: indiceSolicitado + 1,
+        registros: aptosParaAprovacao.map((registro) => ({
+          profissional_id: registro.profissional_id,
+          nome: registro.nome,
+          email_normalizado: registro.email_normalizado,
+          status_validacao: registro.status_validacao,
+          ...(registro.source_record_key === undefined
+            ? {}
+            : { source_record_key: registro.source_record_key }),
+          ...(registro.exibicao === undefined ? {} : { exibicao: registro.exibicao }),
+        })),
+      }),
+    })
       .then((corpo) => {
         if (ativo) setPreviaMensagemServidor(corpo);
       })
-      .catch(() => {
-        if (ativo) setPreviaMensagemServidor(null);
+      .catch((error: unknown) => {
+        if (!ativo) return;
+        setPreviaMensagemServidor(null);
+        setPreviaErro(
+          error instanceof ApiCampanhaError
+            ? error.message
+            : "Não foi possível gerar a prévia no servidor.",
+        );
       })
       .finally(() => {
         if (ativo) setPreviaCarregando(false);
@@ -1173,7 +1229,8 @@ export function CampaignWorkspace() {
     return () => {
       ativo = false;
     };
-  }, [templateSelecionada, campanha]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [templateSelecionada, previaIndice, aptosParaAprovacao]);
 
   const acoesAtivas = new Set(status?.availableActions ?? []);
   const podeImportar = acoesAtivas.has("IMPORTAR_E_MAPEAR");
@@ -2005,6 +2062,8 @@ export function CampaignWorkspace() {
               </pre>
             ) : previaCarregando ? (
               <p role="status">Carregando prévia do servidor…</p>
+            ) : previaErro !== "" ? (
+              <p role="alert">{previaErro}</p>
             ) : templateSelecionada === "" ? (
               <p>Selecione um template registrado (APPROVED) para visualizar a prévia.</p>
             ) : (
@@ -2045,6 +2104,7 @@ export function CampaignWorkspace() {
                   setTemplateSelecionada(event.target.value);
                   setAprovacao(null);
                   setPreviaMensagemServidor(null);
+                  setPreviaErro("");
                 }}
               >
                 <option value="">— selecione explicitamente —</option>

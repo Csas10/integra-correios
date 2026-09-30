@@ -389,3 +389,124 @@ describe("GF3 F6 — ciclo de vida do blob URL da credencial", () => {
     expect(fonteComponente).not.toContain("href={URL.createObjectURL");
   });
 });
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02 (F5) — CROSS_OPERATOR_TEMPLATE_STATE / PREVIEW_STATE:
+// o logout confirmado limpa TAMBÉM os estados de template/prévia (catálogo,
+// seleção, prévia renderizada, índice, carregando, erro). Nenhum localStorage/
+// sessionStorage. Prova estrutural sobre a fonte real (mesmo mecanismo GF3 F2).
+// ---------------------------------------------------------------------------
+describe("GF3 C2 F5 — logout isola estados de template/prévia entre operadores", () => {
+  const blocoLimpeza = (): string => {
+    const inicio = fonteComponente.indexOf("const limparEstadoOperador = () => {");
+    const fim = fonteComponente.indexOf("const [painelAdmin, setPainelAdmin]");
+    expect(inicio).toBeGreaterThan(0);
+    expect(fim).toBeGreaterThan(inicio);
+    return fonteComponente.slice(inicio, fim);
+  };
+
+  it("limparEstadoOperador cobre os estados de template/prévia (F5)", () => {
+    const bloco = blocoLimpeza();
+    for (const chamada of [
+      "setTemplatesSelecionaveis([]);",
+      "setTemplateSelecionada(\"\");",
+      "setPreviaMensagemServidor(null);",
+      "setPreviaIndice(0);",
+      "setPreviaCarregando(false);",
+      "setPreviaErro(\"\");",
+    ]) {
+      expect(bloco).toContain(chamada);
+    }
+  });
+
+  it("logout SIGNED_OUT segue pela limpeza canônica (sem resets paralelos de template/prévia)", () => {
+    const blocoLogout = mid('if (campaignLogoutDisposition(response.status) === "SIGNED_OUT")');
+    const recorte = blocoLogout.slice(0, blocoLogout.indexOf("setFeedback"));
+    expect(recorte.split("limparEstadoOperador();").length - 1).toBe(1);
+    // Nenhum reset de template/prévia fora da limpeza canônica:
+    for (const proibido of [
+      "setTemplatesSelecionaveis([]);",
+      "setTemplateSelecionada(\"\");",
+      "setPreviaMensagemServidor(null);",
+    ]) {
+      expect(recorte).not.toContain(proibido);
+    }
+  });
+
+  it("sem persistência/localStorage de catálogo/seleção/prévia", () => {
+    expect(fonteComponente).not.toContain("localStorage.");
+    expect(fonteComponente).not.toContain("templatesSelecionaveis`");
+    expect(fonteComponente.split("sessionStorage.").length - 1).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02 (F6) — TEMPLATE_CATALOG_FOLLOWS_SESSION: o catálogo só
+// é requisitado com sessão autenticada; sem `me` ⇒ catálogo limpo e NENHUMA
+// request; troca de operador ⇒ resposta stale ignorada (cleanup `ativo`) e
+// recarga. Sem polling (dependência única [me]).
+// ---------------------------------------------------------------------------
+describe("GF3 C2 F6 — catálogo segue o ciclo de vida da sessão", () => {
+  it("efeito do catálogo depende de `me` (sem request desautenticado; sem polling)", () => {
+    const inicio = fonteComponente.indexOf("catálogo de templates selecionáveis vem SEMPRE do servidor");
+    expect(inicio).toBeGreaterThan(0);
+    const fim = fonteComponente.indexOf("}, [me]);", inicio);
+    expect(fim).toBeGreaterThan(inicio);
+    const bloco = fonteComponente.slice(inicio, fim + "}, [me]);".length);
+    expect(bloco).toContain("if (!me) {");
+    expect(bloco).toContain("setTemplatesSelecionaveis([]);");
+    expect(bloco).toContain('"/api/campaigns/template-selecionaveis"');
+    expect(bloco).toContain("let ativo = true;");
+    expect(bloco).toContain("ativo = false;");
+    // Dependência ÚNICA [me] — sem polling:
+    expect(bloco.endsWith("}, [me]);")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02 (F7-UI) — PREVIEW_INDEX_FOLLOWS_NAVIGATION: a prévia
+// pré-aprovação usa POST /api/campaigns/template-preview com o MESMO payload
+// pendente do authorize e o índice navegável previaIndice — nada de linha=1
+// fixa. O browser NUNCA fornece subject/texto/HTML/remetente/Reply-To.
+// ---------------------------------------------------------------------------
+describe("GF3 C2 F7-UI — prévia pré-aprovação navega por previaIndice (server-rendered)", () => {
+  it("efeito da prévia usa POST template-preview + previaIndice (sem linha=1)", () => {
+    const inicio = fonteComponente.indexOf("PRÉVIA PRÉ-APROVAÇÃO");
+    expect(inicio).toBeGreaterThan(0);
+    const fim = fonteComponente.indexOf("}, [templateSelecionada, previaIndice, aptosParaAprovacao]);", inicio);
+    expect(fim).toBeGreaterThan(inicio);
+    const bloco = fonteComponente.slice(inicio, fim);
+    expect(bloco).toContain('"/api/campaigns/template-preview"');
+    expect(bloco).toContain("method: \"POST\"");
+    expect(bloco).toContain("previaIndice: indiceSolicitado + 1");
+    expect(bloco).toContain("templateVersao: templateSelecionada");
+    expect(bloco).toContain("registros: aptosParaAprovacao.map");
+    // NUNCA mais chamada GET do preview-registro (com query) nem linha=1
+    // no fluxo pré-aprovação (a menção no comentário é do fluxo separado):
+    expect(bloco).not.toContain("preview-registro?");
+    expect(bloco).not.toContain("linha=1");
+    // O browser não fornece conteúdo de mensagem:
+    expect(bloco).not.toContain("subject:");
+    expect(bloco).not.toContain("textBody:");
+    expect(bloco).not.toContain("htmlBody:");
+    expect(bloco).not.toContain("replyTo");
+    // Cleanup stale presente:
+    expect(bloco).toContain("ativo = false;");
+  });
+
+  it("fonte: nenhuma CHAMADA ao preview-registro permanece e linha=1 foi extinta", () => {
+    expect(fonteComponente).not.toContain("preview-registro?");
+    expect(fonteComponente).not.toContain("linha=1");
+    // As únicas menções restantes são comentários de contrato (fluxo
+    // pós-persist separado no servidor):
+    for (const mencao of fonteComponente.split("preview-registro")) {
+      // nenhuma menção é uma chamada fetchJson direta
+      expect(mencao.startsWith("fetchJson")).toBe(false);
+    }
+  });
+
+  it("erro de prévia é estado do operador e é renderizado (role=alert)", () => {
+    expect(fonteComponente).toContain("const [previaErro, setPreviaErro] = useState(\"\");");
+    expect(fonteComponente).toContain('role="alert">{previaErro}</p>');
+  });
+});

@@ -281,9 +281,24 @@ function hashAprovacaoCampanhaV1(input: {
   return sha256.digest("hex");
 }
 
-/** Valor canônico V2: campo ausente/undefined ⇒ null explícito (estável). */
+/**
+ * GF-3 CORRECTIVE-02 (F4) — encoding de PRESENÇA tipado e inequívoco no
+ * canônico V2 (PRE-LAUNCH: nenhuma campanha/outbox operacional V2 existe —
+ * invariante do owner; sem migration, sem backfill).
+ *   ABSENT  ⇒ marcador tipado explícito (NUNCA "null": colidia com a string
+ *             permitida "null");
+ *   PRESENT ⇒ marcador tipado + comprimento determinístico + valor EXATO
+ *             ("s:<len>:<valor>"): a fronteira comprimento/valor é inequívoca
+ *             mesmo com separador \u001f no valor, e undefined ≠ qualquer
+ *             string permitida ≠ ausência.
+ * A saída de validarSubmissaoAprovacao NUNCA contém string vazia (vazio ⇒
+ * ausente), e a ordem de propriedades permanece irrelevante (escrita fixa).
+ */
+const MARCADOR_AUSENCIA_V2 = "\u0000AUSENTE\u0000";
+const MARCADOR_PRESENCA_V2 = "s:";
+
 function valorCanonicov2(valor: string | undefined): string {
-  return valor === undefined ? "null" : valor;
+  return valor === undefined ? MARCADOR_AUSENCIA_V2 : `${MARCADOR_PRESENCA_V2}${valor.length}:${valor}`;
 }
 
 /**
@@ -291,7 +306,10 @@ function valorCanonicov2(valor: string | undefined): string {
  * campos por registro (sem HMAC/secret; templateContentHash, snapshotHash e
  * recipientFingerprint permanecem contratos DISTINTOS). Ordem incidental de
  * propriedades NÃO afeta o hash (escrita em ordem fixa); CR/LF/TAB já chegam
- * normalizados pela fronteira (whitespace → espaço único).
+ * normalizados pela fronteira (whitespace → espaço único). GF-3
+ * CORRECTIVE-02 (F4): campos ausentes usam marcador tipado de ausência e
+ * campos presentes usam marcador tipado + comprimento — V1 permanece
+ * byte-a-byte inalterado.
  */
 function hashAprovacaoCampanhaV2(input: {
   readonly templateVersao: string;

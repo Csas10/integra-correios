@@ -198,8 +198,15 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
           registro.nome,
           registro.email_normalizado,
           registro.status_validacao,
-          registro.source_record_key === undefined ? "null" : (registro.source_record_key as string),
-          ...CHAVES.map((chave) => (registro.exibicao?.[chave] === undefined ? "null" : (registro.exibicao[chave] as string))),
+          // GF-3 CORRECTIVE-02 (F4) — encoding de PRESENÇA tipado.
+          registro.source_record_key === undefined
+            ? "\u0000AUSENTE\u0000"
+            : `s:${(registro.source_record_key as string).length}:${registro.source_record_key}`,
+          ...CHAVES.map((chave) =>
+            registro.exibicao?.[chave] === undefined
+              ? "\u0000AUSENTE\u0000"
+              : `s:${(registro.exibicao[chave] as string).length}:${registro.exibicao[chave]}`,
+          ),
         ].join("\u001f") + "\n",
       );
     }

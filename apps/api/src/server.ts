@@ -281,6 +281,15 @@ const CAMPAIGN_OPERATIONAL_ROLES: readonly OperatorRole[] = [
   "SUPERVISOR",
 ];
 
+/**
+ * GF-3 CORRECTIVE-01 (F1) — autoridade do canário REAL: somente EXECUTOR
+ * autoriza `POST /api/campaigns/canary-send` ANTES de qualquer preflight,
+ * claim, resolução de token, provider ou Gmail. Reutiliza o contrato existente
+ * de `exigirOperadorCampanha` (403 OPERATOR_ROLE_FORBIDDEN) — nenhum segundo
+ * framework de autorização.
+ */
+const CAMPAIGN_EXECUTOR_ROLES: readonly OperatorRole[] = ["EXECUTOR"];
+
 /** Pool do banco operacional (mesma fonte do requireDb, sem repository). */
 function requireDbPool(): NodePostgresPool {
   return requireDb().pool;
@@ -2020,7 +2029,10 @@ const ROTAS: readonly Rota[] = [
     metodo: "POST",
     caminhoExato: "/api/campaigns/canary-send",
     handler: async (req, res, _url, corpo) => {
-      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      // GF-3 CORRECTIVE-01 (F1) — papel EXECUTOR exigido ANTES do preflight:
+      // PREPARADOR/REVISOR/APROVADOR/SUPERVISOR ⇒ 403 estável com
+      // CLAIMS=0, TOKEN_LOADS=0, PROVIDER_CALLS=0, GMAIL_CALLS=0.
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_EXECUTOR_ROLES);
       if (!identity) return;
       let body: { campanhaId?: unknown };
       try {

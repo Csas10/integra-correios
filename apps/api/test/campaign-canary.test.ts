@@ -852,6 +852,20 @@ describe("SLICE_03C.2A — HTTP fail-closed (contrato determinístico)", () => {
     expect(resposta.corpo).toContain("INDIVIDUAL_OPERATOR_AUTH_REQUIRED");
   });
 
+  it("GF3 F1 — canary-send exige EXECUTOR: 403 OPERATOR_ROLE_FORBIDDEN ANTES de política/preflight (zero claim/token/provider/rede)", async () => {
+    // Sessão com formato válido (cookie __Host-): a resolução de identidade
+    // exige banco; sem DATABASE_URL a rota responde 401/503 — a prova
+    // determinística dos 403 por papel é DB-gated (Parte 5). Aqui provamos
+    // APENAS que a rota NUNCA responde 409 CAMPAIGN_CANARY_SEND_DISABLED sem
+    // sessão EXECUTOR (a guarda de papel precede a checagem de política).
+    const resposta = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
+      headers: { cookie: COOKIE_SESSAO },
+      corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+    });
+    expect(resposta.status).not.toBe(409);
+    expect(resposta.corpo).not.toContain("CAMPAIGN_CANARY_SEND_DISABLED");
+  });
+
   it("corpo com autoridade adicional → 401 (auth precede validação do corpo); nunca 200", async () => {
     const comExtras = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
       headers: { cookie: COOKIE_SESSAO },
@@ -945,6 +959,49 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE!, max: 4 });
   });
 
+  // GF-3 CORRECTIVE-01 (F1) — matriz de autoridade do canário: somente
+  // EXECUTOR passa da guarda de papel. Qualquer outro papel ⇒ 403 estável
+  // ANTES de preflight/claim/token/provider (zero claim, zero rede).
+  it("2B1A-F1. CANARY_REQUIRES_EXECUTOR: PREPARADOR/REVISOR/APROVADOR/SUPERVISOR ⇒ 403; EXECUTOR segue para os gates normais", async () => {
+    adminCookie = await bootstrapAdmin();
+    const preparador = await provisionarOperadorPapeis(["PREPARADOR"]);
+    const revisor = await provisionarOperadorPapeis(["REVISOR"]);
+    const aprovador = await provisionarOperadorPapeis(["APROVADOR"]);
+    const supervisor = await provisionarOperadorPapeis(["SUPERVISOR"]);
+    const executor = await provisionarOperadorPapeis(["EXECUTOR"]);
+
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    try {
+      for (const [rotulo, cookie] of [
+        ["PREPARADOR", preparador],
+        ["REVISOR", revisor],
+        ["APROVADOR", aprovador],
+        ["SUPERVISOR", supervisor],
+      ] as const) {
+        const resposta = await despachar("POST", "/api/campaigns/canary-send", {
+          headers: { cookie, "content-type": "application/json" },
+          corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+        });
+        expect(resposta.status, `papel ${rotulo} deveria ser 403`).toBe(403);
+        expect(resposta.corpo).toContain("OPERATOR_ROLE_FORBIDDEN");
+      }
+      // EXECUTOR: a guarda de papel é SUPERADA — a execução segue para os
+      // gates normais (política canarySendEnabled fechada por padrão ⇒ 409
+      // CAMPAIGN_CANARY_SEND_DISABLED é a resposta esperada neste cenário).
+      const executorResposta = await despachar("POST", "/api/campaigns/canary-send", {
+        headers: { cookie: executor, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+      });
+      expect(executorResposta.status).toBe(409);
+      expect(executorResposta.corpo).toContain("CAMPAIGN_CANARY_SEND_DISABLED");
+      // Nenhuma chamada de rede em NENHUM cenário da matriz.
+      expect(espiaoRede).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   // 03C.2A.4 — registro da cena (prova estrutural; nenhuma variável de
   // repositório é lida ou alterada — a matriz é constante do próprio teste).
   let matrizCenarioRegistrada: readonly [CenarioCanario, boolean, boolean, boolean] | undefined;
@@ -982,6 +1039,30 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     /** ID do item canário — agregado dos eventos EXEC_* em produção. */
     readonly itemCanarioId: string;
     fingerprints: readonly string[];
+  }
+
+  /**
+   * GF3 F1 — provisiona operador com papéis EXATOS e devolve o cookie de
+   * sessão (mesmo contrato admin/provision + session dos testes 2B1A-H*).
+   */
+  async function provisionarOperadorPapeis(papeis: readonly string[]): Promise<string> {
+    const credencial = tokenSintetico("f1-" + papeis.join("-"));
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: adminCookie, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-F1-" + randomUUID().slice(0, 8),
+        displayName: "Operador F1 " + papeis.join("+"),
+        roles: [...papeis],
+        credentialHash: createHash("sha256").update(credencial).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencial })),
+    });
+    expect(login.status).toBe(200);
+    return firstCookie(login.headers["set-cookie"]);
   }
 
   async function criarCenaCanario(params: {

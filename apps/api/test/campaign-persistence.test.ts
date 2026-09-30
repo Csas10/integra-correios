@@ -57,7 +57,10 @@ describe("CAMPAIGN_PERSISTENCE — snapshot, hash e validação de entrada (unit
     expect(snapshot.total_registros).toBe(3);
     expect(snapshot.total_aptos).toBe(2);
     expect(snapshot.total_bloqueados).toBe(1);
-    expect(snapshot.total_aprovados).toBe(1);
+    // GF-3 CORRECTIVE-01 (F4) — decisões são trilha de auditoria; os
+    // registros submetidos JÁ são os finais pós-exclusão humana:
+    // total_aprovados = snapshot.registros.length (sem dupla subtração).
+    expect(snapshot.total_aprovados).toBe(snapshot.registros.length);
     expect(snapshot.registros.every((r) => r.status_validacao === "APTO")).toBe(true);
     expect(snapshot.decisoes_humanas).toHaveLength(1);
   });

@@ -877,6 +877,97 @@ describe("SLICE_03A.3 — aridade e mapeamento SQL (regressão local do binding)
     ).toBe(false);
   });
 
+  // GF-3 CORRECTIVE-01 (F5) — SETTLEMENT_ERROR_ROLLBACK: falha no COMMIT da
+  // via de settlement (registrarEventoExecucao/COMMIT — aqui exercitada na
+  // transação do RECEIPT, mesmo padrão BEGIN → evento → COMMIT do bloco de
+  // settlement de executeAttemptCampanha) ⇒ ROLLBACK emitido, conexão liberada
+  // SEM transação aberta e causa original preservada. Prova BEHAVIORAL (sem
+  // banco) sobre pool falso que percorre o fluxo REAL.
+  it("F: falha no COMMIT da via de settlement (receipt) ⇒ ROLLBACK + release + causa original (conexão não volta com transação aberta)", async () => {
+    const chamadas: ChamadaSql[] = [];
+    const liberada: boolean[] = [];
+    const falhaCommit = new Error("commit settlement falhou (sintético)");
+    const transacao = {
+      query: async (text: string): Promise<{ rows: readonly unknown[]; rowCount: number | null }> => {
+        chamadas.push({ text, values: [] });
+        if (text.includes("SELECT i.estado") && text.includes("template_versao") && text.includes("snapshot_registros")) {
+          return {
+            rows: [
+              {
+                item_estado: "PREPARADO",
+                destinatario_fingerprint: "aa".repeat(32),
+                lote_estado: "ATIVO",
+                lote_codigo: "EXEC_LOTE_SINTETICO",
+                hash_aprovacao: "bb".repeat(32),
+                operator_id: operadorDoFluxo,
+                template_versao: "pf-expedicao-carteira-2026-v2",
+                snapshot_registros: {
+                  template_versao: "pf-expedicao-carteira-2026-v2",
+                  template_content_hash: "cc".repeat(32),
+                  approval_hash_version: "CAMPANHA_APROVACAO_V2",
+                  registros: [
+                    {
+                      profissional_id: "00000000-0000-4000-8000-000000000001",
+                      nome: "Profissional Sintetico",
+                      email_normalizado: "prof.settlement@exemplo.test",
+                      status_validacao: "APTO",
+                    },
+                  ],
+                },
+                ordem: 1,
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (text.includes("SELECT destinatario_fingerprint FROM outbox_campanha WHERE id")) {
+          return { rows: [{ destinatario_fingerprint: "aa".repeat(32) }], rowCount: 1 };
+        }
+        if (text.includes("SELECT estado FROM outbox_campanha")) {
+          // registrarReceiptInterno: item ENFILEIRADO segue para receipt+CAS.
+          return { rows: [{ estado: "ENFILEIRADO" }], rowCount: 1 };
+        }
+        if (text === "COMMIT" && chamadas.filter((c) => c.text === "COMMIT").length > 2) {
+          // Terceiro COMMIT = transação de settlement (1º = claim, 2º =
+          // EXEC_TENTATIVA_INICIADA) ⇒ falha sintética exatamente lá.
+          throw falhaCommit;
+        }
+        return { rows: [], rowCount: 1 };
+      },
+      release: (): void => {
+        liberada.push(true);
+      },
+    };
+    const pool: CampanhaPool = {
+      query: async () => ({ rows: [], rowCount: 0 }),
+      connect: async () => transacao,
+    };
+    await expect(
+      executeAttemptCampanha(pool, {
+        ...comando,
+        provas: provasSinteticas,
+        provider: new ProvedorFakeCampanha(),
+      }),
+    ).rejects.toBe(falhaCommit); // causa original preservada (sem mascarar)
+    // BEGIN → ... → COMMIT (claim, ok) → BEGIN (settlement) → evento →
+    // COMMIT falha → ROLLBACK (settlement) — a conexão foi liberada exatamente
+    // uma vez por transação (claim + tentativa + settlement) e o último
+    // statement da transação com falha é ROLLBACK, nunca COMMIT pendente.
+    // A transação que falhou no COMMIT é a do RECEIPT (registrarReceiptInterno
+    // — mesmo padrão BEGIN → evento → COMMIT): ROLLBACK foi emitido, a conexão
+    // foi liberada e a settlement NUNCA iniciou (a causa propagou antes).
+    const indiceBeginRecebimento = chamadas.map((c) => c.text).lastIndexOf("BEGIN");
+    const aposBegin = chamadas.slice(indiceBeginRecebimento).map((c) => c.text);
+    expect(aposBegin.some((t) => t.includes("INSERT INTO evento_auditoria"))).toBe(true);
+    expect(aposBegin[aposBegin.length - 1]).toBe("ROLLBACK");
+    // 3 conexões usadas (claim, tentativa, receipt-falho); 3 COMMITs emitidos
+    // (claim + tentativa OK; o 3º, do receipt, FALHOU) e 1 ROLLBACK da
+    // transação quebrada — a conexão não volta ao pool com transação aberta.
+    expect(liberada.length).toBe(3);
+    expect(chamadas.filter((c) => c.text === "COMMIT").length).toBe(3);
+    expect(chamadas.filter((c) => c.text === "ROLLBACK").length).toBe(1);
+  });
+
   it("fonte do módulo: array de valores do INSERT de auditoria tem exatamente 7 elementos", () => {
     const inicio = FONTE_EXECUCAO.indexOf("INSERT INTO evento_auditoria");
     const trecho = FONTE_EXECUCAO.slice(inicio, FONTE_EXECUCAO.indexOf("],", inicio));

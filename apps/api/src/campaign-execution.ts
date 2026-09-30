@@ -864,6 +864,17 @@ export async function executeAttemptCampanha(
         agora: new Date().toISOString(),
       });
       await settleTransaction.query("COMMIT");
+    } catch (error) {
+      // GF-3 CORRECTIVE-01 (F5) — mesma disciplina de rollback do restante do
+      // módulo: a conexão NUNCA retorna ao pool com transação aberta/abortada
+      // (falha em registrarEventoExecucao OU no COMMIT). A causa original é
+      // preservada; o release permanece no finally.
+      try {
+        await settleTransaction.query("ROLLBACK");
+      } catch {
+        // Preserva a causa original.
+      }
+      throw error;
     } finally {
       settleTransaction.release();
     }

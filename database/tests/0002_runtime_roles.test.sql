@@ -59,6 +59,31 @@ BEGIN
     END LOOP;
   END LOOP;
 
+  -- GF-3 CORRECTIVE-01 (F3) — RUNTIME_CAMPAIGN_GRANTS_AFTER_REAPPLY: 0002
+  -- reaplicada DEPOIS de 0007 (REVOKE ALL + regrant condicional) deve deixar
+  -- o runtime com SELECT/INSERT/UPDATE nas tabelas da campanha — e NUNCA
+  -- DELETE/TRUNCATE/REFERENCES/TRIGGER.
+  FOREACH tabela IN ARRAY ARRAY[
+    'campanha_persistida', 'campanha_decisao', 'campanha_lote',
+    'lote_campanha', 'outbox_campanha'
+  ] LOOP
+    IF EXISTS (
+      SELECT 1 FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name = tabela
+    ) THEN
+      FOREACH privilegio IN ARRAY ARRAY['SELECT', 'INSERT', 'UPDATE'] LOOP
+        IF NOT has_table_privilege(runtime_role, format('public.%I', tabela), privilegio) THEN
+          RAISE EXCEPTION 'runtime deve ter % em % (campanha, pós-reapply)', privilegio, tabela;
+        END IF;
+      END LOOP;
+      FOREACH privilegio IN ARRAY ARRAY['DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'] LOOP
+        IF has_table_privilege(runtime_role, format('public.%I', tabela), privilegio) THEN
+          RAISE EXCEPTION 'runtime não pode ter % em % (campanha)', privilegio, tabela;
+        END IF;
+      END LOOP;
+    END IF;
+  END LOOP;
+
   IF NOT has_table_privilege(runtime_role, 'public.evento_auditoria', 'SELECT') OR
      NOT has_table_privilege(runtime_role, 'public.evento_auditoria', 'INSERT') THEN
     RAISE EXCEPTION 'runtime deve ter SELECT e INSERT em evento_auditoria';
@@ -200,6 +225,33 @@ UPDATE outbox_email SET status = 'PROCESSING', bloqueada_por = 'worker-sintetico
 WHERE id = '70000000-0000-4000-8000-000000000001';
 
 SELECT count(*) AS registros_operacionais_visiveis FROM outbox_email;
+
+-- GF-3 CORRECTIVE-01 (F3) — prova operacional das grants de campanha sob o
+-- login herdado: INSERT + SELECT + UPDATE em campanha_persistida (DELETE
+-- permanece bloqueado — provado abaixo).
+INSERT INTO campanha_persistida (
+  id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao,
+  snapshot_registros, total_registros, total_aptos, total_bloqueados,
+  total_aprovados, estado, criada_em, atualizada_em
+) VALUES (
+  '72000000-0000-4000-8000-000000000001', '72000000-0000-4000-8000-0000000000f1',
+  repeat('7', 64), 'pf-expedicao-carteira-2026-v2', repeat('8', 64),
+  '{"registros":[]}'::jsonb, 0, 0, 0, 0, 'APROVADA', now(), now()
+);
+
+SELECT count(*) AS campanhas_runtime_visiveis FROM campanha_persistida
+WHERE id = '72000000-0000-4000-8000-000000000001';
+
+UPDATE campanha_persistida SET estado = 'APROVADA'
+WHERE id = '72000000-0000-4000-8000-000000000001';
+
+DO $$
+BEGIN
+  DELETE FROM campanha_persistida
+  WHERE id = '72000000-0000-4000-8000-000000000001';
+  RAISE EXCEPTION 'DELETE em campanha deveria ser bloqueado';
+EXCEPTION WHEN insufficient_privilege THEN NULL;
+END $$;
 
 INSERT INTO evento_auditoria (
   id, agregado_tipo, agregado_id, tipo, ocorreu_em, hash_evento

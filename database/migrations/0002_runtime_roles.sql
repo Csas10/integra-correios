@@ -117,6 +117,30 @@ BEGIN
 END
 $operator_grant$;
 
+-- GF-3 CORRECTIVE-01 (F3) — REGRANT CONDICIONAL das tabelas da campanha
+-- (SLICE-02 / 0007): 0002 pode ser reaplicada DEPOIS de 0007 (padrão de CI e
+-- de operações) e o REVOKE ALL acima apagaria os grants de runtime, deixando
+-- o runtime da campanha fail-closed SEM acesso. Mesmo padrão do regrant do
+-- operador: condicional à existência da tabela. Somente SELECT/INSERT/UPDATE
+-- — NUNCA DELETE/TRUNCATE/REFERENCES/TRIGGER (fronteira mantida pelo teste
+-- 0002_runtime_roles.test.sql).
+DO $campaign_grant$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'campanha_persistida'
+  ) THEN
+    GRANT SELECT, INSERT, UPDATE ON
+      campanha_persistida,
+      campanha_decisao,
+      campanha_lote,
+      lote_campanha,
+      outbox_campanha
+    TO integra_runtime;
+  END IF;
+END
+$campaign_grant$;
+
 -- Provisionamento fora do Git (exemplo sem credencial):
 --   CREATE ROLE integra_app_login LOGIN ...;
 --   GRANT integra_runtime TO integra_app_login;

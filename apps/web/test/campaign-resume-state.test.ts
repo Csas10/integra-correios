@@ -184,13 +184,14 @@ describe("GATE: SERVER-DRIVEN RECOVERY AUTHORITY — efeito legado removido (fon
     expect(recorte).not.toContain("/api/campaigns/persisted");
   });
 
-  it("B·D: efeitos são EXATAMENTE 6 (GF-2 FINAL: +catálogo server-driven +prévia server-side) — sem efeito de hash (request por hash não pode iniciar nem concorrer)", () => {
+  it("B·D: efeitos são EXATAMENTE 7 (GF-2 FINAL: +catálogo server-driven +prévia server-side; GF-3 F6: +blob URL da credencial) — sem efeito de hash (request por hash não pode iniciar nem concorrer)", () => {
     // UX-FLOW-01B.1: loadMe, workspace/status, descoberta + readiness 03B.
     // GF-2 FINAL: efeitos read-only de /api/campaigns/template-selecionaveis
     // (catálogo do registry) e de /api/campaigns/preview-registro (prévia
-    // pelo MESMO renderer do envio). Nenhum efeito de hash legado.
+    // pelo MESMO renderer do envio). GF-3 CORRECTIVE-01 (F6): ciclo de vida
+    // do blob URL da credencial (create/revoke). Nenhum efeito de hash legado.
     const usos = fonteComponente.split("useEffect(").length - 1;
-    expect(usos).toBe(6);
+    expect(usos).toBe(7);
   });
 
   it("C·F: ciclo de hash EXTINTO — zero leitura e zero gravação de ic_campanha_hash (UX-FLOW-01B.1)", () => {
@@ -283,5 +284,108 @@ describe("GATE: ciclo de hash extinto — Session Storage não é autoridade", (
     const recorte = fonteComponente.slice(janela, fimJanela);
     expect(recorte).not.toContain("/api/campaigns/persisted");
     expect(recorte).not.toContain("fetch(");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-01 (F2) — CROSS_OPERATOR_WORKSPACE_STATE = ISOLATED:
+// o logout confirmado limpa TODO o estado ligado ao operador montado. Prova
+// estrutural sobre a fonte real (mesmo mecanismo dos gates anteriores —
+// ambiente node, sem jsdom): a função canônica limparEstadoOperador é
+// declarada UMA vez, referenciada pelo logout SIGNED_OUT, e cobre cada
+// setter do estado do operador. Nenhuma persistência/localStorage.
+// ---------------------------------------------------------------------------
+describe("GF3 F2 — isolamento de estado entre operadores no logout", () => {
+  const blocoLimpeza = (): string => {
+    const inicio = fonteComponente.indexOf("const limparEstadoOperador = () => {");
+    const fim = fonteComponente.indexOf("const [painelAdmin, setPainelAdmin]");
+    expect(inicio).toBeGreaterThan(0);
+    expect(fim).toBeGreaterThan(inicio);
+    return fonteComponente.slice(inicio, fim);
+  };
+
+  it("PREVIOUS_OPERATOR_DATA_VISIBLE=false: limparEstadoOperador cobre os 18 estados do operador", () => {
+    const bloco = blocoLimpeza();
+    for (const chamada of [
+      "setArquivo(null);",
+      "setAvaliacaoArquivo(null);",
+      "setMapeamento({});",
+      "setBase(null);",
+      "setAprovacao(null);",
+      "setConfirmacaoAprovacao(\"\");",
+      "setExcluidos([]);",
+      "setPreviaIndice(0);",
+      "setErroEtapa(\"\");",
+      "setPainelAdmin(false);",
+      "setOperadores([]);",
+      "setCredencialUnica(null);",
+      "setCredencialSalvaConfirmada(false);",
+      "setAcaoMensagem(\"\");",
+      "setAcaoErro(\"\");",
+      "setCampanha(null);",
+      "setRetomada(LIMPEZA_RETOMADA.retomada);",
+      "setModoRetomada(LIMPEZA_RETOMADA.modo);",
+    ]) {
+      expect(bloco).toContain(chamada);
+    }
+  });
+
+  it("logout SIGNED_OUT invoca a limpeza canônica UMA vez + me/token; operador anterior não sobrevive", () => {
+    const blocoLogout = mid('if (campaignLogoutDisposition(response.status) === "SIGNED_OUT")');
+    const fimLogout = blocoLogout.indexOf("setFeedback(\"Não foi possível confirmar a saída");
+    const recorte = fimLogout > 0 ? blocoLogout.slice(0, fimLogout) : blocoLogout;
+    expect(recorte.split("limparEstadoOperador();").length - 1).toBe(1);
+    expect(recorte).toContain("setMe(null);");
+    expect(recorte).toContain('setToken("");');
+    // Nenhum setter operacional sobrevive fora da limpeza canônica no logout
+    // (todos os resets passam a passar por limparEstadoOperador).
+    for (const proibido of [
+      "setArquivo(null);",
+      "setBase(null);",
+      "setAprovacao(null);",
+      "setCredencialUnica(null);",
+      "setOperadores([]);",
+    ]) {
+      expect(recorte).not.toContain(proibido);
+    }
+    // Retomada server-driven (me=null) zera campanha/modo/retomada — nenhuma
+    // request pendente do operador A restaura estado para o operador B.
+    const blocoRetomada = mid('if (!me) {');
+    expect(blocoRetomada).toContain('setModoRetomada("INDEFINIDO")');
+    expect(blocoRetomada).toContain("setCampanha(null)");
+  });
+
+  it("nenhuma persistência/localStorage para estado do operador", () => {
+    expect(fonteComponente).not.toContain("localStorage.");
+    expect(fonteComponente).not.toContain("localStorage[");
+    // sessionStorage permanece restrito à limpeza HISTÓRICA do hash legado.
+    expect(fonteComponente.split("sessionStorage.").length - 1).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-01 (F6) — CREDENTIAL_BLOB_URL_REVOKED: UM URL por
+// credencial, criado em useEffect (NUNCA no JSX/render) e revogado quando a
+// credencial muda, o modal fecha ou o componente desmonta.
+// ---------------------------------------------------------------------------
+describe("GF3 F6 — ciclo de vida do blob URL da credencial", () => {
+  it("URL.createObjectURL só existe dentro do useEffect (nunca no JSX)", () => {
+    expect(fonteComponente.split("URL.createObjectURL(").length - 1).toBe(1);
+    expect(fonteComponente.split("URL.revokeObjectURL(").length - 1).toBe(1);
+    const inicioEfeito = fonteComponente.indexOf("const [credencialBlobUrl, setCredencialBlobUrl]");
+    const efeito = fonteComponente.slice(inicioEfeito);
+    const blocoEfeito = efeito.slice(efeito.indexOf("useEffect(() => {"), efeito.indexOf("}, [credencialUnica]);"));
+    expect(blocoEfeito).toContain("URL.createObjectURL(");
+    expect(blocoEfeito).toContain("URL.revokeObjectURL(url);");
+  });
+
+  it("dependência [credencialUnica] revoga na troca/fechamento; cleanup cobre desmontagem; JSX usa credencialBlobUrl", () => {
+    expect(fonteComponente).toContain("}, [credencialUnica]);");
+    const inicioEfeito = fonteComponente.indexOf("const [credencialBlobUrl, setCredencialBlobUrl]");
+    const efeito = fonteComponente.slice(inicioEfeito, inicioEfeito + 1200);
+    expect(efeito).toContain("if (!credencialUnica) {");
+    expect(efeito).toContain("setCredencialBlobUrl(null);");
+    expect(fonteComponente).toContain('href={credencialBlobUrl ?? undefined}');
+    expect(fonteComponente).not.toContain("href={URL.createObjectURL");
   });
 });

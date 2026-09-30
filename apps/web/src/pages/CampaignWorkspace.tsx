@@ -450,6 +450,36 @@ export function CampaignWorkspace() {
   const [confirmacaoAprovacao, setConfirmacaoAprovacao] = useState("");
   const [previaIndice, setPreviaIndice] = useState(0);
   const [excluidos, setExcluidos] = useState<readonly number[]>([]);
+  // GF-3 CORRECTIVE-01 (F2) — limpeza canônica do logout: TODOS os estados
+  // ligados ao operador montado (arquivo, avaliacaoArquivo, mapeamento, base,
+  // aprovacao, confirmacaoAprovacao, excluidos, previaIndice, erroEtapa,
+  // painelAdmin, operadores, credencialUnica, credencialSalvaConfirmada,
+  // acaoMensagem, acaoErro, campanha, retomada, modoRetomada). O logout
+  // confirmado (SIGNED_OUT) aplica o reset completo; a retomada server-driven
+  // re-deriva tudo do servidor para o próximo login — ownership permanece
+  // autoridade SERVER-SIDE e nenhuma request pendente de A restaura estado
+  // para B (o efeito é cancelado pelo cleanup `ativo` ao trocar `me`).
+  // NENHUMA persistência/localStorage para estes dados.
+  const limparEstadoOperador = () => {
+    setArquivo(null);
+    setAvaliacaoArquivo(null);
+    setMapeamento({});
+    setBase(null);
+    setAprovacao(null);
+    setConfirmacaoAprovacao("");
+    setExcluidos([]);
+    setPreviaIndice(0);
+    setErroEtapa("");
+    setPainelAdmin(false);
+    setOperadores([]);
+    setCredencialUnica(null);
+    setCredencialSalvaConfirmada(false);
+    setAcaoMensagem("");
+    setAcaoErro("");
+    setCampanha(null);
+    setRetomada(LIMPEZA_RETOMADA.retomada);
+    setModoRetomada(LIMPEZA_RETOMADA.modo);
+  };
   const [painelAdmin, setPainelAdmin] = useState(false);
   const [operadores, setOperadores] = useState<readonly OperatorListEntry[]>([]);
   const [adminErro, setAdminErro] = useState("");
@@ -490,6 +520,25 @@ export function CampaignWorkspace() {
   // (read-only). Sem Session Storage; nenhuma autorização é decidida aqui.
   const [readiness, setReadiness] = useState<ReadinessOperacional | null>(null);
   const [readinessErro, setReadinessErro] = useState("");
+  // GF-3 CORRECTIVE-01 (F6) — ciclo de vida do blob URL da credencial: UM URL
+  // por credencial (nunca URL.createObjectURL dentro do JSX/render). O URL é
+  // revogado quando a credencial muda, o modal fecha (credencialUnica → null)
+  // ou o componente desmonta. A credencial bruta NUNCA é persistida.
+  const [credencialBlobUrl, setCredencialBlobUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!credencialUnica) {
+      setCredencialBlobUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(
+      new Blob([credencialUnica.credencial], { type: "text/plain" }),
+    );
+    setCredencialBlobUrl(url);
+    return () => {
+      URL.revokeObjectURL(url);
+      setCredencialBlobUrl(null);
+    };
+  }, [credencialUnica]);
   // SLICE-03C.1 — guarda de duplo clique e feedback das ações mutáveis.
   const [acaoPendente, setAcaoPendente] = useState<"PREPARAR" | "AUTORIZAR" | "ATIVAR" | null>(null);
   const [acaoMensagem, setAcaoMensagem] = useState("");
@@ -820,14 +869,16 @@ export function CampaignWorkspace() {
         cache: "no-store",
       });
       if (campaignLogoutDisposition(response.status) === "SIGNED_OUT") {
-        // Corretivo R1: NENHUM estado operacional do operador anterior
-        // sobrevive localmente (campanha, retomada e modo de descoberta).
-        // Limpeza HISTÓRICA (UX-FLOW-01B.1): remove ic_campanha_hash deixado
-        // por versões anteriores; não existe leitura nem gravação da chave.
+        // GF-3 CORRECTIVE-01 (F2): NENHUM estado ligado ao operador anterior
+        // sobrevive ao logout confirmado — workspace (arquivo, avaliação,
+        // mapeamento, base, aprovação, exclusões, prévia, erros), painel
+        // administrativo (operadores, credencial única e confirmação) e ações
+        // em curso. A retomada server-driven re-deriva tudo do servidor para o
+        // próximo login; ownership permanece autoridade SERVER-SIDE. Sem
+        // persistência/localStorage para estes dados. Limpeza HISTÓRICA
+        // (UX-FLOW-01B.1) de ic_campanha_hash permanece (sem leitor/gravador).
         sessionStorage.removeItem(LIMPEZA_RETOMADA.chaveHashSessao);
-        setCampanha(null);
-        setRetomada(LIMPEZA_RETOMADA.retomada);
-        setModoRetomada(LIMPEZA_RETOMADA.modo);
+        limparEstadoOperador();
         setMe(null);
         setToken("");
         return;
@@ -1521,7 +1572,7 @@ export function CampaignWorkspace() {
                   <a
                     className="admin-credential-download"
                     download={`credencial-${credencialUnica.operator}.txt`}
-                    href={URL.createObjectURL(new Blob([credencialUnica.credencial], { type: "text/plain" }))}
+                    href={credencialBlobUrl ?? undefined}
                   >
                     Baixar
                   </a>

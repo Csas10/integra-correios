@@ -695,7 +695,13 @@ export function snapshotCampanha(input: CampaignPersistInput): CampaignPersistSn
     total_registros: input.registros.length,
     total_aptos: registrosAptos.length,
     total_bloqueados: input.registros.length - registrosAptos.length,
-    total_aprovados: registrosAptos.length - input.decisoes.length,
+    // GF-3 CORRECTIVE-01 (F4) — o contrato cliente/servidor envia
+    // `registros` = finais APTO após as exclusões humanas e `decisoes` =
+    // trilha de auditoria dessas decisões. As decisões NÃO são subtraídas
+    // novamente: total_aprovados = número de registros efetivamente
+    // aprovados persistidos (snapshot.registros). Conjunto de destinatários,
+    // exclusões e semântica de decisão intocados.
+    total_aprovados: registrosAptos.length,
     registros: registrosAptos.map((registro) => ({
       profissional_id: registro.profissional_id,
       nome: registro.nome,

@@ -33,6 +33,47 @@ function firstCookie(header: string | undefined): string {
   return header?.split("\n")[0]?.split(";")[0] ?? "";
 }
 
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02.1 — TEST-ONLY: busca pagination-aware de um operador
+// sintético pelo código. A listagem administrativa é paginada POR CONTRATO
+// (ORDER BY o.criado_em, o.id + LIMIT/OFFSET): um operador recém-provisionado
+// NÃO tem garantia contratual de pertencer à página 1 — múltiplos arquivos de
+// teste criam operadores sintéticos no MESMO banco do quality-gate
+// (FRESH_POSTGRES_PER_RUN=true; o acúmulo é INTRA-run). Este helper percorre
+// a paginação EXISTENTE pela PRÓPRIA API administrativa (nenhuma consulta
+// direta ao PostgreSQL para contornar a API; nenhum endpoint novo de busca em
+// produção; nenhum mudança de ordenação). Teto de 20 páginas é SEGURANÇA DE
+// TESTE apenas — nenhum limite de produção é alterado.
+//
+// ADMIN_OPERATOR_UI_PAGINATION_DEBT....... DEFER_POST_CANARY
+// (limitação da UI com >100 operadores; fora do escopo deste fechamento —
+// nenhuma evidência de que o canário controlado dependa de >100 operadores.)
+// ---------------------------------------------------------------------------
+const PAGINA_TAMANHO = 100;
+const PAGINAS_TETO_SEGURANCA = 20; // 20 × 100 = 2000 entradas (só teste)
+
+async function buscarOperadorPorCodigo(
+  adminCookie: string,
+  code: string,
+): Promise<Record<string, unknown> | undefined> {
+  for (let pagina = 0; pagina < PAGINAS_TETO_SEGURANCA; pagina += 1) {
+    const offset = pagina * PAGINA_TAMANHO;
+    const resposta = await despachar(
+      "GET",
+      `/api/operator/admin/operators?limit=${PAGINA_TAMANHO}&offset=${offset}`,
+      { headers: { cookie: adminCookie } },
+    );
+    expect(resposta.status, `listagem paginada (offset=${offset}) deve responder 200`).toBe(200);
+    const paginados = JSON.parse(resposta.corpo) as { operadores: Record<string, unknown>[] };
+    const entry = paginados.operadores.find((o) => o["code"] === code);
+    if (entry !== undefined) return entry;
+    // Última página: nada mais a percorrer.
+    if (paginados.operadores.length < PAGINA_TAMANHO) return undefined;
+  }
+  // Teto de segurança atingido (paginação não terminou dentro do teto).
+  return undefined;
+}
+
 describe("OPERATOR_LIST — recusas fail-closed sem banco", () => {
   it("401 sem sessão e 503 com cookie de formato válido sem identidade disponível", async () => {
     const semSessao = await despachar("GET", "/api/operator/admin/operators");
@@ -49,10 +90,11 @@ describe("OPERATOR_LIST — recusas fail-closed sem banco", () => {
 const describeDb = DATABASE_URL_AMBIENTE ? describe : describe.skip;
 
 describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
-  async function bootstrapAdmin(): Promise<string> {
+  async function bootstrapAdmin(): Promise<{ readonly cookie: string; readonly codigo: string }> {
     const operatorId = randomUUID();
     const tokenId = randomUUID();
     const suffix = operatorId.replace(/-/g, "").slice(0, 12);
+    const codigo = `ADMIN-${suffix}`;
     const rawCredential = `AdminList_${"abcdefghijklmnopqrstuvwxyz0123456789"}${suffix}`;
     const now = new Date().toISOString();
     const { NodePostgresPool } = await import("@integra-correios/persistence");
@@ -61,7 +103,7 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
       await pool.query(
         `INSERT INTO operador (id, codigo, nome_exibicao, status, criado_em, atualizado_em)
          VALUES ($1, $2, $3, 'ATIVO', $4, $4)`,
-        [operatorId, `ADMIN-${suffix}`, "Administrador Listagem", now],
+        [operatorId, codigo, "Administrador Listagem", now],
       );
       await pool.query(
         `INSERT INTO operador_papel (operator_id, papel, ativo, concedido_em)
@@ -81,7 +123,7 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
       corpo: Buffer.from(JSON.stringify({ token: rawCredential })),
     });
     expect(login.status).toBe(200);
-    return firstCookie(login.headers["set-cookie"]);
+    return { cookie: firstCookie(login.headers["set-cookie"]), codigo };
   }
 
   async function provisionar(
@@ -117,18 +159,24 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
   });
 
   it("listagem autorizada: ADMIN_TECNICO vê operadores sem nenhum segredo", async () => {
-    const adminCookie = await bootstrapAdmin();
+    const admin = await bootstrapAdmin();
+    const adminCookie = admin.cookie;
     const preparador = await provisionar(adminCookie, "ui-preparador", ["PREPARADOR"]);
     const aprovador = await provisionar(adminCookie, "ui-aprovador", ["APROVADOR"]);
 
-    const resposta = await despachar("GET", "/api/operator/admin/operators?limit=100", {
+    const resposta = await despachar("GET", `/api/operator/admin/operators?limit=${PAGINA_TAMANHO}`, {
       headers: { cookie: adminCookie },
     });
     expect(resposta.status).toBe(200);
     const parsed = JSON.parse(resposta.corpo) as { operadores: Record<string, unknown>[] };
-    const codigos = parsed.operadores.map((o) => o["code"]);
-    expect(codigos).toContain("ui-preparador");
-    expect(codigos).toContain("ui-aprovador");
+
+    // GF-3 CORRECTIVE-02.1 — localização pagination-aware (o operador criado
+    // NÃO tem garantia contratual de estar na página 1). Os operadores
+    // PRECISAM ser encontrados até a página terminal — senão o teste FALHA:
+    const preparadorEntry = await buscarOperadorPorCodigo(adminCookie, "ui-preparador");
+    const aprovadorEntry = await buscarOperadorPorCodigo(adminCookie, "ui-aprovador");
+    expect(preparadorEntry, "ui-preparador deve existir na listagem paginada").toBeDefined();
+    expect(aprovadorEntry, "ui-aprovador deve existir na listagem paginada").toBeDefined();
 
     const chavesPermitidas = new Set([
       "operatorId", "code", "displayName", "status", "roles",
@@ -147,12 +195,13 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
     expect(resposta.corpo).not.toContain(preparador.credencial);
     expect(resposta.corpo).not.toContain(aprovador.credencial);
 
-    // administrador enxerga a si mesmo
-    expect(codigos.some((c) => String(c).startsWith("ADMIN-"))).toBe(true);
+    // administrador enxerga a si mesmo (pagination-aware também)
+    const adminEntry = await buscarOperadorPorCodigo(adminCookie, admin.codigo);
+    expect(adminEntry, "administrador deve enxergar a si mesmo na listagem").toBeDefined();
   });
 
   it("recusa usuário sem ADMIN_TECNICO (403 OPERATOR_ROLE_FORBIDDEN)", async () => {
-    const adminCookie = await bootstrapAdmin();
+    const { cookie: adminCookie } = await bootstrapAdmin();
     const preparador = await provisionar(adminCookie, "ui-preparador-2", ["PREPARADOR"]);
     const resposta = await despachar("GET", "/api/operator/admin/operators", {
       headers: { cookie: preparador.cookie },
@@ -162,7 +211,7 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
   });
 
   it("paginação inválida com admin → 422", async () => {
-    const adminCookie = await bootstrapAdmin();
+    const { cookie: adminCookie } = await bootstrapAdmin();
     for (const query of ["limit=0", "limit=101", "offset=-1", "limit=NaN"]) {
       const resposta = await despachar("GET", `/api/operator/admin/operators?${query}`, {
         headers: { cookie: adminCookie },
@@ -173,14 +222,14 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
   });
 
   it("ciclo provisionar → suspender → recuperar reflete estados agregados na listagem", async () => {
-    const adminCookie = await bootstrapAdmin();
+    const { cookie: adminCookie } = await bootstrapAdmin();
     const alvo = await provisionar(adminCookie, "ui-temporario", ["EXECUTOR"]);
 
-    let resposta = await despachar("GET", "/api/operator/admin/operators?limit=100", {
-      headers: { cookie: adminCookie },
-    });
-    let entry = (JSON.parse(resposta.corpo) as { operadores: Array<Record<string, unknown>> })
-      .operadores.find((o) => o["code"] === "ui-temporario");
+    // GF-3 CORRECTIVE-02.1 — localização pagination-aware; o operador criado
+    // PRECISA ser encontrado (senão o teste falha com diagnóstico claro) e
+    // TODAS as expectativas de ciclo permanecem INTEGROS (nada opcionalizado):
+    let entry = await buscarOperadorPorCodigo(adminCookie, "ui-temporario");
+    expect(entry, "ui-temporario (pós-provisionamento) deve existir na listagem paginada").toBeDefined();
     expect(entry?.["status"]).toBe("ATIVO");
     expect(entry?.["credentialState"]).toBe("ATIVA");
     expect(entry?.["activeSessions"]).toBe(1);
@@ -189,11 +238,8 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
       headers: { cookie: adminCookie, "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({ operatorId: alvo.operatorId })),
     });
-    resposta = await despachar("GET", "/api/operator/admin/operators?limit=100", {
-      headers: { cookie: adminCookie },
-    });
-    entry = (JSON.parse(resposta.corpo) as { operadores: Array<Record<string, unknown>> })
-      .operadores.find((o) => o["code"] === "ui-temporario");
+    entry = await buscarOperadorPorCodigo(adminCookie, "ui-temporario");
+    expect(entry, "ui-temporario (pós-suspensão) deve existir na listagem paginada").toBeDefined();
     expect(entry?.["status"]).toBe("SUSPENSO");
     expect(entry?.["credentialState"]).toBe("INDEFINIDA");
     expect(entry?.["activeSessions"]).toBe(0);
@@ -219,18 +265,15 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
         credentialHash: sha(`Rot_${randomUUID()}`),
       })),
     });
-    resposta = await despachar("GET", "/api/operator/admin/operators?limit=100", {
-      headers: { cookie: adminCookie },
-    });
-    entry = (JSON.parse(resposta.corpo) as { operadores: Array<Record<string, unknown>> })
-      .operadores.find((o) => o["code"] === "ui-temporario-2");
+    entry = await buscarOperadorPorCodigo(adminCookie, "ui-temporario-2");
+    expect(entry, "ui-temporario-2 (pós-rotação) deve existir na listagem paginada").toBeDefined();
     expect(entry?.["status"]).toBe("ATIVO");
     expect(entry?.["credentialState"]).toBe("ATIVA");
     expect(entry?.["activeSessions"]).toBe(0); // sessões revogadas na rotação
   });
 
   it("proteção do último administrador e da auto-suspensão → 409 OPERATOR_ADMIN_CONTINUITY_REQUIRED", async () => {
-    const adminCookie = await bootstrapAdmin();
+    const { cookie: adminCookie } = await bootstrapAdmin();
     const me = await despachar("GET", "/api/operator/me", { headers: { cookie: adminCookie } });
     expect(me.status).toBe(200);
     const { operatorId } = JSON.parse(me.corpo) as { operatorId: string };
@@ -247,7 +290,7 @@ describeDb("OPERATOR_LIST — contratos completos (PostgreSQL)", () => {
   });
 
   it("logout confirmado revoga a sessão (me 200 → DELETE → me 401)", async () => {
-    const adminCookie = await bootstrapAdmin();
+    const { cookie: adminCookie } = await bootstrapAdmin();
     expect((await despachar("GET", "/api/operator/me", { headers: { cookie: adminCookie } })).status).toBe(200);
     await despachar("DELETE", "/api/operator/identity/session", { headers: { cookie: adminCookie } });
     expect((await despachar("GET", "/api/operator/me", { headers: { cookie: adminCookie } })).status).toBe(401);

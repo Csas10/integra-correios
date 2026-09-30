@@ -4,3 +4,4 @@ export * from "./xlsx-reader.js";
 export * from "./csv-reader.js";
 export * from "./mapping.js";
 export * from "./address-parser.js";
+export * from "./pf-update-campaign.js";

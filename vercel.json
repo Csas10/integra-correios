@@ -12,6 +12,10 @@
     {
       "source": "/confirma/:token",
       "destination": "/index.html"
+    },
+    {
+      "source": "/operacao/email",
+      "destination": "/index.html"
     }
   ]
 }

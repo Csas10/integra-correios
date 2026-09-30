@@ -3,3 +3,4 @@ export * from "./crypto.js";
 export * from "./driver.js";
 export * from "./postgres.js";
 export type { RegistrarImportacaoPfCommand, ResultadoRegistrarImportacao } from "./postgres.js";
+export * from "./operator-identity.js";

@@ -1,3 +1,4 @@
+export * from "./campaigns.js";
 export { despachar } from "./server.js";
 
 import { ORIGENS } from "@integra-correios/domain";

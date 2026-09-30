@@ -23,6 +23,13 @@ if (vercel.buildCommand !== "npm run build:vercel") {
   fail("vercel.json must use the same backend+web build command exercised by CI");
 }
 
+const operacaoRewrite = vercel.rewrites?.find(
+  (r) => r.source === "/operacao/email" && r.destination === "/index.html",
+);
+if (!operacaoRewrite) {
+  fail("vercel.json must rewrite /operacao/email to /index.html so the direct deep link serves the SPA");
+}
+
 const entry = await readFile(path.join(root, "api/index.ts"), "utf8");
 if (!entry.includes('from "@integra-correios/api"')) {
   fail("api/index.ts must enter the backend through the declared @integra-correios/api workspace package");

@@ -18,6 +18,11 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // A CI compartilha um único PostgreSQL 16 entre todas as suítes DB-gated
+    // (deltas antes/depois em contadores globais). Execução de arquivos em
+    // paralelo torna esses deltas não determinísticos; serializar os arquivos
+    // garante a prova de zero-escrita e o isolamento por operador.
+    fileParallelism: false,
     include: [
       "apps/*/test/**/*.test.ts",
       "packages/*/test/**/*.test.ts",

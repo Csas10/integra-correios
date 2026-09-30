@@ -24,7 +24,9 @@
     "build:web": "npm run build --workspace=@integra-correios/web",
     "mail:homologation": "npm run build && node apps/worker/dist/mail-homologation.js",
     "build:vercel": "npm run build && npm run build:web",
-    "verify:vercel-runtime": "node scripts/verify-vercel-runtime.mjs"
+    "verify:vercel-runtime": "node scripts/verify-vercel-runtime.mjs",
+    "operator:credential": "node scripts/operator-credential.mjs",
+    "operator:bootstrap-admin": "npm run build --workspace=@integra-correios/persistence && node scripts/operator-bootstrap-admin.mjs"
   },
   "devDependencies": {
     "@types/node": "22.20.3",

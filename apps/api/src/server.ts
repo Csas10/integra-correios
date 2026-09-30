@@ -13,6 +13,11 @@ import {
   PostgresConfirmationOwnership,
   Aes256GcmSecretBox,
   HmacSha256Fingerprinter,
+  PostgresOperatorIdentityRepository,
+  OperatorAdminAuthorizationError,
+  OperatorAdminContinuityError,
+  type OperatorIdentity,
+  type OperatorRole,
 } from "@integra-correios/persistence";
 import {
   analisarXlsx,
@@ -62,12 +67,85 @@ import {
   ConfirmationInvalidaError,
   type ConfirmationDecisionInput,
 } from "./confirmation.js";
+import {
+  acoesCampanhaPorPapeis,
+  baseSinteticaCampanha,
+  carregarPoliticaCampanhaAtualizacao,
+  hashAprovacaoCampanha,
+} from "./campaigns.js";
+import {
+  AvaliacaoInvalidaError,
+  avaliarArquivoCampanha,
+  avaliarBaseCampanha,
+} from "./campaign-import.js";
+import {
+  CampaignControlError,
+  avaliarAcaoOperacaoCampanha,
+  ativarLoteCampanha,
+  lerEstoqueOperacionalCampanha,
+  prepararLoteCampanha,
+  autorizarExecucaoCampanha,
+} from "./campaign-control.js";
+// SLICE-03C.2A — fundação runtime do canário (preflight ZERO CLAIM,
+// provider Gmail, OAuth readiness read-only). STRICT NO SEND: o caminho só
+// arma com PF_CAMPAIGN_CANARY_SEND_ENABLED=true (política) e a UI não tem
+// handler de envio.
+import { criarCampanhaGmailRuntime } from "./campaign-gmail-runtime.js";
+import {
+  ProvedorGmailCampanha,
+  avaliarReadinessOauthCanario,
+  enviarCanarioCampanha,
+  statusOauthFromReadiness,
+} from "./campaign-canary.js";
+import type { ProvedorEnvioCampanha } from "./campaign-execution.js";
+//
+// SLICE-03C.2A.1 (Seção C) — INJEÇÃO DE PROVIDER EXCLUSIVA PARA TESTE:
+// dependency injection de fábrica, NUNCA selecionável por request (query/
+// body/header/cookie), NUNCA por variável operacional genérica, NUNCA por
+// NODE_ENV. O runtime normal SEMPRE constrói o provider Gmail real (com
+// transport/token não configurados nesta fatia ⇒ FALHA_PRE_PROVIDER).
+// TEST_PROVIDER_DEPENDENCY_INJECTION=true.
+let provedorCanarioParaTeste: ProvedorEnvioCampanha | null = null;
+export function injetarProvedorCanarioParaTeste(
+  provider: ProvedorEnvioCampanha | null,
+): void {
+  provedorCanarioParaTeste = provider;
+}
+
+function provedorCanarioRuntime(campanhaId: string): ProvedorEnvioCampanha {
+  // SLICE-03C.2B1A — provider fake permanece disponível SOMENTE por DI de teste.
+  if (provedorCanarioParaTeste) return provedorCanarioParaTeste;
+  // Runtime Gmail REAL: transport + token resolver (decrypt/refresh/
+  // persistência cifrada) compostos no GmailMailGateway. O envio continua
+  // fail-closed pelas políticas de produção (flags ausentes ou false).
+  const runtime = criarCampanhaGmailRuntime({ env: process.env, pool: requireDbPool() });
+  return new ProvedorGmailCampanha({
+    pool: requireDbPool(),
+    campanhaId,
+    gateway: new GmailMailGateway(runtime.transport, runtime.loadAccessToken, undefined, process.env),
+  });
+}
+
+import {
+  CampaignPersistenceError,
+  listarCampanhasRetomaveis,
+  recuperarCampanhaPorId,
+  recuperarEstadoCampanha,
+  persistirCampanhaAprovada,
+  persistirLoteCampanha,
+  type CampaignPersistDecisao,
+  type CampaignPersistRegistro,
+} from "./campaign-persistence.js";
 import { createWebTokenService } from "@integra-correios/pf-workflow";
-import { MapeamentoInvalidoError } from "@integra-correios/importers";
+import {
+  MapeamentoInvalidoError,
+  PfUpdateCampaignImportError,
+} from "@integra-correios/importers";
 import {
   loadGmailOauthConfig,
   oauthStatusFromEnvironment,
   OAUTH_BINDING_COOKIE,
+  GmailMailGateway,
 } from "@integra-correios/mail";
 import {
   avaliarReadiness,
@@ -134,9 +212,191 @@ const ROTAS_PUBLICAS = new Set([
   "POST /api/operator/session", // F12: valida token UMA vez e emite sessão (fail-closed sem env)
   "GET /api/operator/session", // F17: restore da sessão pela UI (200/401 sanitizado)
   "DELETE /api/operator/session", // logout operacional
+  "POST /api/operator/identity/session", // autenticação individual; handler próprio
+  "DELETE /api/operator/identity/session", // logout individual; handler próprio
 ]);
 
+// Rotas da nova interface com autenticação própria. Não passam pelo fallback
+// de OPERATOR_TOKEN/sessão compartilhada do piloto.
+const ROTAS_AUTH_PROPRIA = new Set([
+  "GET /api/operator/me",
+  "GET /api/campaigns/status",
+  "GET /api/campaigns/synthetic-base",
+  "POST /api/campaigns/analyze",
+  "POST /api/campaigns/evaluate",
+  "POST /api/campaigns/authorize",
+  "GET /api/operator/workspace/status",
+  "POST /api/operator/admin/provision",
+  "POST /api/operator/admin/credentials/rotate",
+  "POST /api/operator/admin/credentials/recover",
+  "POST /api/operator/admin/suspend",
+  "GET /api/operator/admin/operators",
+  "GET /api/campaigns/persisted",
+  "GET /api/campaigns/batch",
+  "GET /api/campaigns/resumable",
+  "GET /api/campaigns/detail",
+  "POST /api/campaigns/persist",
+  "POST /api/campaigns/batch",
+  "GET /api/campaigns/operational-readiness",
+  "POST /api/campaigns/prepare",
+  "POST /api/campaigns/authorize-execution",
+  "POST /api/campaigns/activate",
+  "POST /api/campaigns/canary-send",
+  "POST /api/campaigns/execute-attempt",
+]);
+
+
 const OPERATOR_SESSION_COOKIE = "ic_operator_session";
+const CAMPAIGN_OPERATOR_SESSION_COOKIE = "__Host-ic_campaign_operator_session";
+const CAMPAIGN_OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const CAMPAIGN_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43,128}$/;
+const CAMPAIGN_WORKSPACE_ROLES: readonly OperatorRole[] = [
+  "PREPARADOR",
+  "REVISOR",
+  "APROVADOR",
+  "EXECUTOR",
+  "SUPERVISOR",
+];
+
+/**
+ * SLICE-02 — Papéis que autorizam o fluxo persistente de campanha.
+ * ADMIN_TECNICO administra identidade, NÃO campanha (sem poder implícito).
+ */
+const CAMPAIGN_OPERATIONAL_ROLES: readonly OperatorRole[] = [
+  "PREPARADOR",
+  "REVISOR",
+  "APROVADOR",
+  "EXECUTOR",
+  "SUPERVISOR",
+];
+
+/** Pool do banco operacional (mesma fonte do requireDb, sem repository). */
+function requireDbPool(): NodePostgresPool {
+  return requireDb().pool;
+}
+
+/** Validação server-side da submissão de aprovação (mesma regra do authorize). */
+function validarSubmissaoAprovacao(corpo: unknown): {
+  registros: CampaignPersistRegistro[];
+  templateVersao: string;
+} | undefined {
+  const entrada = corpo as {
+    templateVersao?: unknown;
+    registros?: unknown;
+  };
+  const templateVersao =
+    typeof entrada.templateVersao === "string" && entrada.templateVersao.trim() !== ""
+      ? entrada.templateVersao.trim()
+      : "pf-atualizacao-cadastral-2026-v1";
+  const registros = Array.isArray(entrada.registros) ? entrada.registros : [];
+  if (
+    templateVersao.length > 80 ||
+    registros.length === 0 ||
+    registros.length > 20_000 ||
+    !registros.every((registroBruto) => {
+      const registro = registroBruto as {
+        profissional_id?: unknown;
+        nome?: unknown;
+        email_normalizado?: unknown;
+        status_validacao?: unknown;
+      };
+      return (
+        typeof registro === "object" &&
+        registro !== null &&
+        typeof registro.profissional_id === "string" &&
+        registro.profissional_id.trim() !== "" &&
+        typeof registro.nome === "string" &&
+        registro.nome.trim() !== "" &&
+        typeof registro.email_normalizado === "string" &&
+        registro.email_normalizado.trim() !== "" &&
+        registro.status_validacao === "APTO"
+      );
+    })
+  ) {
+    return undefined;
+  }
+  return { registros: registros as CampaignPersistRegistro[], templateVersao };
+}
+
+/** Decisões humanas estruturadas (coerentes com as linhas dos registros). */
+function validarDecisoesHumanas(corpo: unknown): CampaignPersistDecisao[] | undefined {
+  const entrada = corpo as { decisoes?: unknown };
+  if (entrada.decisoes === undefined) return [];
+  if (!Array.isArray(entrada.decisoes) || entrada.decisoes.length > 20_000) return undefined;
+  const decisoes: CampaignPersistDecisao[] = [];
+  for (const item of entrada.decisoes) {
+    const candidata = item as {
+      linha?: unknown;
+      profissional_id?: unknown;
+      tipo?: unknown;
+      motivo?: unknown;
+    };
+    if (
+      typeof item !== "object" ||
+      item === null ||
+      !Number.isSafeInteger(candidata.linha) ||
+      (candidata.linha as number) < 1 ||
+      typeof candidata.profissional_id !== "string" ||
+      candidata.profissional_id.trim() === "" ||
+      (candidata.tipo !== "EXCLUSAO_HUMANA" && candidata.tipo !== "INCONSISTENCIA_JULGADA") ||
+      typeof candidata.motivo !== "string" ||
+      candidata.motivo.trim() === ""
+    ) {
+      return undefined;
+    }
+    const decisao = item as {
+      linha: number;
+      profissional_id: string;
+      tipo: "EXCLUSAO_HUMANA" | "INCONSISTENCIA_JULGADA";
+      motivo: string;
+    };
+    decisoes.push({
+      linha: decisao.linha,
+      profissional_id: decisao.profissional_id.trim(),
+      tipo: decisao.tipo,
+      motivo: decisao.motivo.trim().slice(0, 80),
+    });
+  }
+  return decisoes;
+}
+
+function erroPersistenciaCampanha(
+  res: ServerResponse,
+  error: unknown,
+): void {
+  if (error instanceof CampaignPersistenceError) {
+    const status =
+      error.code === "CAMPAIGN_INPUT_INVALID" ||
+      error.code === "CAMPAIGN_NOT_APPROVED" ||
+      error.code === "CAMPAIGN_BATCH_INVALID"
+        ? 422
+        : error.code === "CAMPAIGN_APPROVAL_STALE"
+          ? 409
+          : error.code === "CAMPAIGN_PERSISTED_NOT_FOUND"
+            ? 404
+            : error.code === "CAMPAIGN_OPERATOR_FORBIDDEN"
+              ? 403
+              : 500;
+    json(res, status, { erro: error.message, codigo: error.code });
+    return;
+  }
+  const mensagem = error instanceof Error ? error.message : "Erro interno.";
+  json(res, 500, { erro: mensagem.slice(0, 200) });
+}
+
+/**
+ * SLICE-03B — mapeamento de erro do plano de controle: bloqueio de domínio
+ * → 409 sanitizado; infraestrutura → 503; entrada inválida → 422. Nenhum
+ * detalhe interno, HMAC ou PII na resposta.
+ */
+function erroControleCampanha(res: ServerResponse, error: unknown): void {
+  if (error instanceof CampaignControlError) {
+    const status = error.code === "CAMPAIGN_INPUT_INVALID" ? 422 : 409;
+    json(res, status, { erro: error.message, codigo: error.code });
+    return;
+  }
+  erroPersistenciaCampanha(res, error);
+}
 
 /** F12 — TTL da sessão operacional (cookie HttpOnly; token NUNCA vai ao browser). */
 const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
@@ -341,6 +601,44 @@ export function parseFileNameHeader(bruto: string | undefined): string {
   return decodificado;
 }
 
+/**
+ * Header x-mapping da campanha (opcional): JSON { campo: coluna }.
+ * Formato inválido, campo vazio/excessivo ou coluna fora de 0..1023 →
+ * erro 400 sanitizado (nunca 500).
+ */
+export function parseCampaignMappingHeader(
+  bruto: string | undefined,
+): Record<string, number> | undefined {
+  const cru = bruto?.trim();
+  if (!cru) return undefined;
+  if (cru.length > 4096) {
+    throw new ContratoInvalidoError("MAPPING_TOO_LARGE", "Header x-mapping excede o limite de tamanho.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cru);
+  } catch {
+    throw new ContratoInvalidoError("MAPPING_MALFORMED", "Header x-mapping não contém JSON válido.");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ContratoInvalidoError(
+      "MAPPING_INVALID_SCHEMA",
+      "Header x-mapping deve ser um objeto { campo: coluna }.",
+    );
+  }
+  const mapeamento: Record<string, number> = {};
+  for (const [campo, coluna] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!campo.trim() || campo.length > 64) {
+      throw new ContratoInvalidoError("MAPPING_INVALID_SCHEMA", "Campo do mapeamento inválido.");
+    }
+    if (typeof coluna !== "number" || !Number.isInteger(coluna) || coluna < 0 || coluna > 1023) {
+      throw new ContratoInvalidoError("MAPPING_INVALID_SCHEMA", "Coluna do mapeamento inválida.");
+    }
+    mapeamento[campo.trim()] = coluna;
+  }
+  return mapeamento;
+}
+
 async function lerCorpo(req: IncomingMessage, limite = MAX_UPLOAD_BYTES): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -409,6 +707,91 @@ function cookiesDo(req: IncomingMessage): Record<string, string> {
   return cookies;
 }
 
+function hashSegredoOpaco(valor: string): string {
+  return createHash("sha256").update(valor, "utf8").digest("hex");
+}
+
+function cookieSessaoCampanha(valor: string, maxAgeSeconds: number): string {
+  return `${CAMPAIGN_OPERATOR_SESSION_COOKIE}=${valor}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAgeSeconds}`;
+}
+
+function cookieSessaoCampanhaRemovido(): string {
+  return `${CAMPAIGN_OPERATOR_SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
+}
+
+function tokenIndividualValido(token: string): boolean {
+  return CAMPAIGN_TOKEN_PATTERN.test(token);
+}
+
+function credentialHashValido(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function operatorUuidValido(value: unknown): value is string {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function textoOperadorValido(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.trim().length <= maxLength;
+}
+
+function expiracaoTokenValida(value: unknown, now: Date): boolean {
+  if (value === undefined) return true;
+  if (typeof value !== "string" || value.trim() === "") return false;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && epoch > now.getTime();
+}
+
+function operatorIdentityRepository(): PostgresOperatorIdentityRepository {
+  return new PostgresOperatorIdentityRepository(requireDb().pool);
+}
+
+async function resolverOperadorCampanha(
+  req: IncomingMessage,
+): Promise<OperatorIdentity | undefined> {
+  const rawSession = cookiesDo(req)[CAMPAIGN_OPERATOR_SESSION_COOKIE];
+  if (!rawSession || !CAMPAIGN_TOKEN_PATTERN.test(rawSession)) return undefined;
+  return operatorIdentityRepository().resolveSession(
+    hashSegredoOpaco(rawSession),
+    new Date().toISOString(),
+  );
+}
+
+async function exigirOperadorCampanha(
+  req: IncomingMessage,
+  res: ServerResponse,
+  allowedRoles?: readonly OperatorRole[],
+): Promise<OperatorIdentity | undefined> {
+  let identity: OperatorIdentity | undefined;
+  try {
+    identity = await resolverOperadorCampanha(req);
+  } catch {
+    json(res, 503, {
+      erro: "Identidade operacional indisponível.",
+      codigo: "OPERATOR_IDENTITY_UNAVAILABLE",
+    });
+    return undefined;
+  }
+  if (!identity) {
+    json(res, 401, {
+      erro: "Sessão individual ausente, expirada ou revogada.",
+      codigo: "INDIVIDUAL_OPERATOR_AUTH_REQUIRED",
+    });
+    return undefined;
+  }
+  if (allowedRoles && !identity.roles.some((role) => allowedRoles.includes(role))) {
+    json(res, 403, {
+      erro: "Papel operacional insuficiente.",
+      codigo: "OPERATOR_ROLE_FORBIDDEN",
+    });
+    return undefined;
+  }
+  return identity;
+}
+
 function autenticacaoDeSessao(req: IncomingMessage): boolean {
   // F16: sessão stateless — nenhuma memória de processo; qualquer instância
   // valida o mesmo cookie assinado.
@@ -473,6 +856,1478 @@ const ROTAS: readonly Rota[] = [
         ppn: { enabled: false },
         gmail: { oauthStatus: oauth, realSendEnabled: policy.realSendEnabled },
       });
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // CAMPANHA PF — identidade INDIVIDUAL obrigatória. Nenhuma destas rotas
+  // aceita OPERATOR_TOKEN nem a sessão compartilhada do piloto como fallback.
+  // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/identity/session",
+    handler: async (_req, res, _url, corpo) => {
+      let token = "";
+      try {
+        const body = JSON.parse(corpo.toString("utf8") || "{}") as { token?: unknown };
+        token = typeof body.token === "string" ? body.token.trim() : "";
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      if (!tokenIndividualValido(token)) {
+        json(res, 401, {
+          erro: "Credencial individual inválida.",
+          codigo: "INDIVIDUAL_OPERATOR_AUTH_INVALID",
+        });
+        return;
+      }
+
+      const tokenHash = hashSegredoOpaco(token);
+      token = "";
+      const sessionSecret = randomBytes(32).toString("base64url");
+      const sessionHash = hashSegredoOpaco(sessionSecret);
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + CAMPAIGN_OPERATOR_SESSION_TTL_MS);
+      try {
+        const identity = await operatorIdentityRepository().createSessionFromToken({
+          tokenHash,
+          sessionHash,
+          now: now.toISOString(),
+          sessionExpiresAt: expiresAt.toISOString(),
+        });
+        if (!identity) {
+          json(res, 401, {
+            erro: "Credencial individual inválida, expirada ou revogada.",
+            codigo: "INDIVIDUAL_OPERATOR_AUTH_INVALID",
+          });
+          return;
+        }
+        json(
+          res,
+          200,
+          {
+            status: "INDIVIDUAL_OPERATOR_SESSION_ACTIVE",
+            expiraEm: identity.sessionExpiresAt,
+          },
+          {
+            "set-cookie": cookieSessaoCampanha(
+              sessionSecret,
+              Math.floor(CAMPAIGN_OPERATOR_SESSION_TTL_MS / 1000),
+            ),
+          },
+        );
+      } catch {
+        json(res, 503, {
+          erro: "Identidade operacional indisponível.",
+          codigo: "OPERATOR_IDENTITY_UNAVAILABLE",
+        });
+      }
+    },
+  },
+  {
+    metodo: "DELETE",
+    caminhoExato: "/api/operator/identity/session",
+    handler: async (req, res) => {
+      const sessionSecret = cookiesDo(req)[CAMPAIGN_OPERATOR_SESSION_COOKIE];
+      if (!sessionSecret || !CAMPAIGN_TOKEN_PATTERN.test(sessionSecret)) {
+        json(res, 401, {
+          erro: "Sessão individual ausente ou inválida.",
+          codigo: "INDIVIDUAL_OPERATOR_AUTH_REQUIRED",
+        });
+        return;
+      }
+
+      try {
+        // Idempotente: false significa que a sessão já não está ATIVA.
+        // O cookie local pode e deve ser removido; somente falha de persistência
+        // (exceção) impede confirmar o logout.
+        await operatorIdentityRepository().revokeSession(
+          hashSegredoOpaco(sessionSecret),
+          new Date().toISOString(),
+        );
+      } catch {
+        json(res, 503, {
+          erro: "Não foi possível confirmar a revogação da sessão.",
+          codigo: "OPERATOR_SESSION_REVOCATION_UNCONFIRMED",
+        });
+        return;
+      }
+
+      json(
+        res,
+        200,
+        { status: "INDIVIDUAL_OPERATOR_SESSION_CLOSED" },
+        { "set-cookie": cookieSessaoCampanhaRemovido() },
+      );
+    },
+  },
+  {
+    metodo: "GET",
+    caminhoExato: "/api/operator/me",
+    handler: async (req, res) => {
+      const identity = await exigirOperadorCampanha(req, res);
+      if (!identity) return;
+      json(res, 200, {
+        operatorId: identity.operatorId,
+        code: identity.code,
+        displayName: identity.displayName,
+        status: identity.status,
+        roles: identity.roles,
+        sessionExpiresAt: identity.sessionExpiresAt,
+      });
+    },
+  },
+  {
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/status",
+    handler: async (req, res) => {
+      const identity = await exigirOperadorCampanha(req, res);
+      if (!identity) return;
+      json(res, 200, carregarPoliticaCampanhaAtualizacao());
+    },
+  },
+  {
+    metodo: "GET",
+    caminhoExato: "/api/operator/workspace/status",
+    handler: async (req, res) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_WORKSPACE_ROLES);
+      if (!identity) return;
+      json(res, 200, {
+        campaign: carregarPoliticaCampanhaAtualizacao(),
+        operatorIdentity: "INDIVIDUAL_ACTIVE",
+        operatorId: identity.operatorId,
+        roles: identity.roles,
+        availableActions: acoesCampanhaPorPapeis(identity.roles),
+        queueAvailable: false,
+        nextAction: "WAIT_FOR_CAMPAIGN_PERSISTENCE_GATE",
+      });
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // CAMPANHA PF — jornada operacional (etapas 3–5) e validade de
+  // aprovação. Somente leitura/avaliação EM MEMÓRIA: nada persiste
+  // (canPersistImport=false), nada envia (canExecute=false). As ações
+  // futuras de escrita revalidarão papel + estado no servidor, sempre.
+  // ------------------------------------------------------------------
+  {
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/synthetic-base",
+    handler: async (req, res) => {
+      const identity = await exigirOperadorCampanha(req, res, ["PREPARADOR"]);
+      if (!identity) return;
+      json(res, 200, {
+        registros: baseSinteticaCampanha(),
+        aviso:
+          "Base sintética de desenvolvimento da interface — NÃO representa destinatários reais.",
+      });
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/analyze",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, ["PREPARADOR"]);
+      if (!identity) return;
+      try {
+        const nome = parseFileNameHeader(req.headers["x-file-name"]?.toString());
+        json(res, 200, avaliarArquivoCampanha(nome, new Uint8Array(corpo)));
+      } catch (error) {
+        if (error instanceof ContratoInvalidoError) {
+          json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 422, {
+          erro: "Arquivo não pôde ser analisado (formato/estrutura inválida).",
+          codigo: "CAMPAIGN_FILE_INVALID",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/evaluate",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, ["PREPARADOR"]);
+      if (!identity) return;
+      try {
+        const nome = parseFileNameHeader(req.headers["x-file-name"]?.toString());
+        const mapeamento = parseCampaignMappingHeader(req.headers["x-mapping"]?.toString());
+        json(res, 200, avaliarBaseCampanha(nome, new Uint8Array(corpo), mapeamento ? { mapeamento } : {}));
+      } catch (error) {
+        if (error instanceof ContratoInvalidoError || error instanceof AvaliacaoInvalidaError) {
+          json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        if (error instanceof PfUpdateCampaignImportError) {
+          json(res, 400, { erro: error.message, codigo: error.codigo });
+          return;
+        }
+        json(res, 422, {
+          erro: "Base não pôde ser avaliada (arquivo/mapeamento inválidos).",
+          codigo: "CAMPAIGN_EVALUATE_INVALID",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/authorize",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, ["APROVADOR"]);
+      if (!identity) return;
+      let body: {
+        templateVersao?: unknown;
+        registros?: unknown;
+        conteudoHash?: unknown;
+      };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_AUTH_JSON_INVALID" });
+        return;
+      }
+      const templateVersao = typeof body.templateVersao === "string" ? body.templateVersao.trim() : "";
+      const registros = Array.isArray(body.registros) ? body.registros : [];
+      if (
+        !templateVersao ||
+        templateVersao.length > 80 ||
+        registros.length === 0 ||
+        registros.length > 20_000 ||
+        !registros.every(
+          (registro) =>
+            typeof registro === "object" &&
+            registro !== null &&
+            typeof (registro as { profissional_id?: unknown }).profissional_id === "string" &&
+            typeof (registro as { nome?: unknown }).nome === "string" &&
+            typeof (registro as { email_normalizado?: unknown }).email_normalizado === "string" &&
+            typeof (registro as { status_validacao?: unknown }).status_validacao === "string",
+        )
+      ) {
+        json(res, 422, {
+          erro: "Dados de aprovação inválidos.",
+          codigo: "CAMPAIGN_AUTHORIZE_INVALID",
+        });
+        return;
+      }
+      const conteudoHash = hashAprovacaoCampanha({
+        templateVersao,
+        registros: registros as { profissional_id: string; nome: string; email_normalizado: string; status_validacao: string }[],
+      });
+      if (typeof body.conteudoHash === "string" && body.conteudoHash !== conteudoHash) {
+        json(res, 409, {
+          erro: "Conteúdo divergiu do hash submetido — reprovar e reaprovar.",
+          codigo: "CAMPAIGN_APPROVAL_STALE",
+        });
+        return;
+      }
+      json(res, 200, {
+        status: "CAMPAIGN_APPROVAL_FROZEN",
+        conteudoHash,
+        totalItens: registros.length,
+        aprovadaPor: identity.operatorId,
+        persistida: false,
+        aviso:
+          "Aprovação calculada e devolvida para manifestação — NADA foi persistido nesta fase (canPersistImport=false, canCreateBatch=false).",
+      });
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // SLICE-02 — PERSISTÊNCIA CONTROLADA (0007). Sessão individual +
+  // operador ATIVO + papel operacional + flags server-side + hash
+  // recalculado do conteúdo re-submetido. 409 CAMPAIGN_APPROVAL_STALE
+  // quando o conteúdo diverge da aprovação submetida. Idempotente.
+  // ------------------------------------------------------------------
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/persist",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const politica = carregarPoliticaCampanhaAtualizacao();
+      if (!politica.canPersistImport) {
+        json(res, 403, {
+          erro: "Persistência da campanha desabilitada por política.",
+          codigo: "CAMPAIGN_PERSIST_DISABLED",
+        });
+        return;
+      }
+      if (identity.status !== "ATIVO") {
+        json(res, 403, {
+          erro: "Operador suspenso não pode persistir campanha.",
+          codigo: "OPERATOR_SUSPENDED",
+        });
+        return;
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as Record<string, unknown>;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_PERSIST_JSON_INVALID" });
+        return;
+      }
+      const submissao = validarSubmissaoAprovacao(body);
+      if (!submissao) {
+        json(res, 422, {
+          erro: "Dados de persistência inválidos: registros aptos são obrigatórios.",
+          codigo: "CAMPAIGN_PERSIST_INVALID",
+        });
+        return;
+      }
+      const decisoes = validarDecisoesHumanas(body);
+      if (!decisoes) {
+        json(res, 422, {
+          erro: "Decisões humanas inválidas.",
+          codigo: "CAMPAIGN_PERSIST_DECISIONS_INVALID",
+        });
+        return;
+      }
+      const fingerprintHash = hashAprovacaoCampanha({
+        templateVersao: submissao.templateVersao,
+        registros: submissao.registros,
+      });
+      const hashSubmetido =
+        typeof body.conteudoHash === "string" ? body.conteudoHash.trim().toLowerCase() : "";
+      if (hashSubmetido && hashSubmetido !== fingerprintHash) {
+        json(res, 409, {
+          erro: "Conteúdo divergiu da aprovação congelada — reprovar e reaprovar.",
+          codigo: "CAMPAIGN_APPROVAL_STALE",
+        });
+        return;
+      }
+      const fingerprintArquivo =
+        typeof body.fingerprintArquivo === "string" ? body.fingerprintArquivo.trim().toLowerCase() : "";
+      if (!/^[0-9a-f]{64}$/.test(fingerprintArquivo)) {
+        json(res, 422, {
+          erro: "Fingerprint do arquivo de origem ausente ou inválido.",
+          codigo: "CAMPAIGN_PERSIST_INVALID",
+        });
+        return;
+      }
+      try {
+        const resultado = await persistirCampanhaAprovada(requireDbPool(), {
+          operatorId: identity.operatorId,
+          fingerprintArquivo,
+          registros: submissao.registros,
+          decisoes,
+          templateVersao: submissao.templateVersao,
+        });
+        json(res, resultado.resultado === "CRIADA" ? 201 : 200, {
+          status: resultado.resultado === "CRIADA" ? "CAMPAIGN_PERSISTED" : "CAMPAIGN_ALREADY_PERSISTED",
+          campanhaId: resultado.campanhaId,
+          conteudoHash: resultado.hashAprovacao,
+          totalItens: submissao.registros.length,
+          aprovadaPor: identity.operatorId,
+          persistida: true,
+          aviso:
+            "Campanha persistida com hash recalculado no servidor. Lote e outbox ainda não foram criados (use /api/campaigns/batch).",
+        });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/persisted",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      if (!carregarPoliticaCampanhaAtualizacao().canPersistImport) {
+        json(res, 403, {
+          erro: "Persistência da campanha desabilitada por política.",
+          codigo: "CAMPAIGN_PERSIST_DISABLED",
+        });
+        return;
+      }
+      // Recuperação por hash (jornada pós-reload da UI) OU por fingerprint.
+      const hashConsulta = url.searchParams.get("hash")?.trim().toLowerCase() ?? "";
+      const fingerprintArquivo = url.searchParams.get("fingerprint")?.trim().toLowerCase() ?? "";
+      const hashValido = /^[0-9a-f]{64}$/.test(hashConsulta);
+      const fingerprintValido = /^[0-9a-f]{64}$/.test(fingerprintArquivo);
+      if (!hashValido && !fingerprintValido) {
+        json(res, 422, {
+          erro: "Informe hash (SHA-256) e/ou fingerprint (SHA-256) para recuperação.",
+          codigo: "CAMPAIGN_PERSIST_INVALID",
+        });
+        return;
+      }
+      try {
+        const estado = await recuperarEstadoCampanha(requireDbPool(), {
+          ...(fingerprintValido ? { fingerprintArquivo } : {}),
+          ...(hashValido ? { hashAprovacao: hashConsulta } : {}),
+          operatorId: identity.operatorId,
+        });
+        if (!estado) {
+          // Isolamento por operador: campanha de terceiro é indistinguível de
+          // inexistente (404 sanitizado, sem revelar existência/proprietário).
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este fingerprint/hash.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, 200, { campanha: estado });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    // ------------------------------------------------------------------
+    // UX-FLOW-01B — Detalhe READ-ONLY de UMA campanha (seleção explícita da
+    // retomada MULTIPLE). campanhaId vem do cliente, porém o escopo é
+    // SEMPRE operator_id da sessão: campanha inexistente ou alheia → 404
+    // sanitizado (indistinguível). Sem mutação, sem evento de auditoria.
+    // ------------------------------------------------------------------
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/detail",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const campanhaId = url.searchParams.get("campanhaId")?.trim() ?? "";
+      if (!operatorUuidValido(campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_DETAIL_INVALID",
+        });
+        return;
+      }
+      try {
+        const estado = await recuperarCampanhaPorId(requireDbPool(), {
+          campanhaId,
+          operatorId: identity.operatorId,
+        });
+        if (!estado) {
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, 200, { campanha: estado });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    // ------------------------------------------------------------------
+    // UX-FLOW-01B — Retomada server-driven: lista READ-ONLY das campanhas
+    // persistidas do operador da sessão. Escopo exclusivo = operator_id
+    // validado no servidor (nenhum parâmetro do cliente seleciona dados;
+    // sem hash e sem fingerprint prévios). Zero mutação: nenhuma escrita,
+    // nenhum evento de auditoria. Operador suspenso/revogado não passa do
+    // exigirOperadorCampanha (sessão resolvida = ATIVO; 401 sanitizado).
+    // Campanha alheia nunca aparece: invisível e indistinguível de ausência
+    // (lista vazia ≠ informação sobre terceiros). Contrato de cardinalidade
+    // (corretivo UX-FLOW-01B): EMPTY/SINGLE/MULTIPLE dependem da contagem
+    // TOTAL de campanhas retomáveis do operador (filtro de estados
+    // server-side) — NUNCA de paginação/limite controlado pelo cliente; sem
+    // parâmetro limite nesta rota (?limite=N → 422 CAMPAIGN_RESUMABLE_INVALID).
+    // ------------------------------------------------------------------
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/resumable",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      // Corretivo UX-FLOW-01B: ?limite=N sai do contrato — a cardinalidade
+      // EMPTY/SINGLE/MULTIPLE nunca pode depender de parâmetro do cliente.
+      if (url.searchParams.get("limite") !== null) {
+        json(res, 422, {
+          erro: "Parâmetro limite não é aceito na retomada (cardinalidade é sempre total).",
+          codigo: "CAMPAIGN_RESUMABLE_INVALID",
+        });
+        return;
+      }
+      try {
+        const campanhas = await listarCampanhasRetomaveis(requireDbPool(), {
+          operatorId: identity.operatorId,
+        });
+        // Política obrigatória de retomada: 0 → EMPTY; 1 → SINGLE (sem
+        // seleção pelo cliente); 2+ → MULTIPLE (resumos autorizados; NENHUMA
+        // escolha implícita de mais recente/último/maior id/primeira linha).
+        if (campanhas.length === 1) {
+          const unica = campanhas[0]!;
+          json(res, 200, {
+            mode: "SINGLE",
+            campaign: {
+              campanhaId: unica.campanhaId,
+              estado: unica.estado,
+              totalAprovados: unica.totalAprovados,
+              loteId: unica.loteId,
+              loteCodigo: unica.loteCodigo,
+              loteEstado: unica.loteEstado,
+              outboxTotal: unica.outboxTotal,
+              outboxNaoExecutavel: unica.outboxNaoExecutavel,
+              criadaEm: unica.criadaEm,
+            },
+          });
+          return;
+        }
+        // Cardinalidade da lista COMPLETA (nenhum limite do cliente):
+        // 0 → EMPTY; 1 → SINGLE (bloco acima); 2+ → MULTIPLE (sem escolha
+        // implícita — o operador seleciona explicitamente via detail).
+        json(res, 200, {
+          mode: campanhas.length === 0 ? "EMPTY" : "MULTIPLE",
+          campaigns: campanhas,
+        });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/batch",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      if (!carregarPoliticaCampanhaAtualizacao().canCreateBatch) {
+        json(res, 403, {
+          erro: "Criação de lote desabilitada por política.",
+          codigo: "CAMPAIGN_BATCH_DISABLED",
+        });
+        return;
+      }
+      if (!identity.roles.includes("EXECUTOR")) {
+        json(res, 403, {
+          erro: "Criação de lote exige papel EXECUTOR.",
+          codigo: "OPERATOR_ROLE_FORBIDDEN",
+        });
+        return;
+      }
+      if (identity.status !== "ATIVO") {
+        json(res, 403, {
+          erro: "Operador suspenso não pode criar lote.",
+          codigo: "OPERATOR_SUSPENDED",
+        });
+        return;
+      }
+      let body: { campanhaId?: unknown; conteudoHash?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_BATCH_JSON_INVALID" });
+        return;
+      }
+      if (
+        !operatorUuidValido(body.campanhaId) ||
+        typeof body.conteudoHash !== "string" ||
+        !/^[0-9a-f]{64}$/.test(body.conteudoHash.trim().toLowerCase())
+      ) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) e conteudoHash (SHA-256) são obrigatórios.",
+          codigo: "CAMPAIGN_BATCH_INVALID",
+        });
+        return;
+      }
+      const campanhaId = body.campanhaId as string;
+      const hashSubmetido = body.conteudoHash.trim().toLowerCase();
+      try {
+        const lote = await persistirLoteCampanha(requireDbPool(), {
+          campanhaId,
+          operatorId: identity.operatorId,
+          hashSubmetido,
+        });
+        json(res, lote.resultado === "CRIADO" ? 201 : 200, {
+          status:
+            lote.resultado === "CRIADO"
+              ? "CAMPAIGN_BATCH_CREATED"
+              : "CAMPAIGN_BATCH_ALREADY_EXISTS",
+          campanhaId,
+          lote: {
+            id: lote.loteCampanhaId,
+            codigo: lote.loteCodigo,
+            estado: lote.estado,
+            totalItens: lote.totalItens,
+            outboxTotal: lote.outboxTotal,
+            outboxNaoExecutavel: lote.outboxNaoExecutavel,
+          },
+          executavel: false,
+          aviso:
+            lote.resultado === "CRIADO"
+              ? "Lote criado em HOLD e outbox NÃO capturável pelo worker (canExecute=false). Nenhuma chamada Gmail foi realizada."
+              : "Lote já existente — nenhuma duplicação (idempotência). Gmail não foi chamado.",
+        });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/batch",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      if (!carregarPoliticaCampanhaAtualizacao().canCreateBatch) {
+        json(res, 403, {
+          erro: "Criação de lote desabilitada por política.",
+          codigo: "CAMPAIGN_BATCH_DISABLED",
+        });
+        return;
+      }
+      const campanhaId = url.searchParams.get("campanhaId")?.trim() ?? "";
+      if (!operatorUuidValido(campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_BATCH_INVALID",
+        });
+        return;
+      }
+      try {
+        const estado = await requireDbPool().query<{
+          lote_id: string | null;
+          lote_codigo: string | null;
+          lote_estado: string | null;
+          total_itens: number | null;
+          outbox_total: string | null;
+          outbox_hold: string | null;
+        }>(
+          `SELECT lc.id AS lote_id, lc.codigo AS lote_codigo, lc.estado AS lote_estado,
+                  lc.total_itens,
+                  (SELECT count(*)::text FROM outbox_campanha o WHERE o.lote_campanha_id = lc.id) AS outbox_total,
+                  (SELECT count(*)::text FROM outbox_campanha o
+                    WHERE o.lote_campanha_id = lc.id AND o.estado IN ('HOLD','PREPARADO')) AS outbox_hold
+             FROM lote_campanha lc
+            WHERE lc.campanha_id = $1
+              AND EXISTS (
+                SELECT 1 FROM campanha_persistida c
+                 WHERE c.id = lc.campanha_id AND c.operator_id = $2
+              )
+            LIMIT 1`,
+          [campanhaId, identity.operatorId],
+        );
+        const lote = estado.rows[0];
+        if (!lote?.lote_id) {
+          // Isolamento por operador: lote inexistente ou de terceiro é
+          // indistinguível (404 sanitizado, sem revelar estado/contadores).
+          json(res, 404, {
+            erro: "Nenhum lote para esta campanha.",
+            codigo: "CAMPAIGN_BATCH_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, 200, {
+          lote: {
+            id: lote.lote_id,
+            codigo: lote.lote_codigo,
+            estado: lote.lote_estado,
+            totalItens: lote.total_itens,
+            outboxTotal: Number(lote.outbox_total ?? 0),
+            outboxNaoExecutavel: Number(lote.outbox_hold ?? 0),
+          },
+          executavel: false,
+        });
+      } catch (error) {
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // SLICE-03B — PLANO DE CONTROLE OPERACIONAL (NO SEND). Quatro rotas
+  // mínimas, todas com sessão individual + escopo exclusivo pelo
+  // operator_id da sessão. Nenhuma aceita operator_id, estado, prova,
+  // fingerprint ou chave idempotente do cliente: provas são emitidas e
+  // verificadas server-side; alheio/inexistente é 404 sanitizado; com as
+  // flags fechadas toda mutação é recusada ANTES de qualquer escrita e a
+  // tentativa de execução é bloqueada ANTES de claim/provider/Gmail.
+  // ------------------------------------------------------------------
+  {
+    // Readiness READ-ONLY: estado, contagens por estado da outbox da
+    // campanha, políticas e bloqueios objetivos + próxima ação. Nenhuma
+    // mutação, nenhum evento de auditoria.
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/operational-readiness",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const campanhaId = url.searchParams.get("campanhaId")?.trim() ?? "";
+      if (!operatorUuidValido(campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_READINESS_INVALID",
+        });
+        return;
+      }
+      try {
+        const estoque = await lerEstoqueOperacionalCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId,
+        });
+        if (!estoque) {
+          // Isolamento por operador: campanha alheia é indistinguível de
+          // inexistente (404 sanitizado).
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        const politica = carregarPoliticaCampanhaAtualizacao();
+        const preparacao = avaliarAcaoOperacaoCampanha({
+          acao: "PREPARAR_LOTE",
+          politica,
+          loteEstado: estoque.loteEstado,
+          totalItens: estoque.totalItens,
+          autorizacaoHumanaConcedida: estoque.autorizacaoHumana.concedida,
+        });
+        const autorizacao = avaliarAcaoOperacaoCampanha({
+          acao: "AUTORIZAR_EXECUCAO",
+          politica,
+          loteEstado: estoque.loteEstado,
+          totalItens: estoque.totalItens,
+          autorizacaoHumanaConcedida: estoque.autorizacaoHumana.concedida,
+        });
+        const execucao = avaliarAcaoOperacaoCampanha({
+          acao: "EXECUTAR_ITEM",
+          politica,
+          loteEstado: estoque.loteEstado,
+          totalItens: estoque.totalItens,
+          autorizacaoHumanaConcedida: estoque.autorizacaoHumana.concedida,
+        });
+        // SLICE-03C.1 — elegibilidade da ATIVAÇÃO (sem segredo na resposta):
+        // prova exige chave dedicada; canário exige configuração server-side;
+        // ativação exige realSendEnabled=false (o envio só se arma no 03C.2).
+        const ativacao = avaliarAcaoOperacaoCampanha({
+          acao: "ATIVAR_LOTE",
+          politica,
+          loteEstado: estoque.loteEstado,
+          totalItens: estoque.totalItens,
+          autorizacaoHumanaConcedida: estoque.autorizacaoHumana.concedida,
+          proofKeyReady: estoque.proofKeyReady,
+          canaryRecipientConfigured: estoque.canaryRecipientConfigured,
+          canarySelecionado: estoque.canarySelected,
+          realSendEnabled: politica.realSendEnabled,
+        });
+        // SLICE-03C.2A — OAuth readiness READ-ONLY (sem rede, sem token,
+        // sem refresh): estados sanitizados + semântica CONNECTED restrita a
+        // "persistido e conta esperada correspondente".
+        const oauth = await avaliarReadinessOauthCanario(requireDbPool(), fingerprinter());
+        // SLICE-03C.2A.1 (Seção E) — a rota consome a DERIVAÇÃO CANÔNICA
+        // statusOauthFromReadiness (mesma função do gate). Readiness ≠
+        // liveness: TOKEN_REFRESHES=0, GOOGLE_NETWORK_CALLS=0, nenhum token
+        // descriptografado; CONNECTED não prova token/refresh/reachability/
+        // send-as (03C.2B1).
+        const oauthEstado = statusOauthFromReadiness(oauth);
+        json(res, 200, {
+          campanha: { campanhaId, estado: "LOTE_CRIADO" },
+          lote: {
+            loteCampanhaId: estoque.loteCampanhaId,
+            codigo: estoque.loteCodigo,
+            estado: estoque.loteEstado,
+            totalItens: estoque.totalItens,
+            contagemPorEstado: estoque.contagemPorEstado,
+          },
+          politicas: {
+            canPrepareBatch: politica.canPrepareBatch,
+            canExecute: politica.canExecute,
+            realSendEnabled: politica.realSendEnabled,
+            canarySendEnabled: politica.canarySendEnabled,
+          },
+          autorizacaoHumana: {
+            concedida: estoque.autorizacaoHumana.concedida,
+            referenciaPresente: estoque.autorizacaoHumana.referencia !== null,
+          },
+          ativacao: {
+            proofKeyReady: estoque.proofKeyReady,
+            canaryRecipientConfigured: estoque.canaryRecipientConfigured,
+            canarySelected: estoque.canarySelected,
+            canaryReferencePresent: estoque.canaryReferencePresent,
+            providerReady: estoque.providerReady,
+          },
+          // SLICE-03C.2A — campos sanitizados (nenhum e-mail, fingerprint,
+          // token ou segredo). CONNECTED ⇒ somente "persistido + conta
+          // esperada correspondente"; NÃO significa token ao vivo testado.
+          oauth: {
+            configurationReady: oauth.oauthConfigurationReady,
+            connectionStored: oauth.oauthConnectionStored,
+            expectedAccountConfigured: oauth.oauthExpectedAccountConfigured,
+            storedAccountMatchesExpected: oauth.oauthStoredAccountMatchesExpected,
+            encryptionConfigurationReady: oauth.oauthEncryptionConfigurationReady,
+            executionReady: oauth.executionReady,
+            estado: oauthEstado,
+            // Readiness é liveness-free: nenhuma prova de token ao vivo.
+            tokenRefreshes: 0,
+            googleNetworkCalls: 0,
+          },
+          envioCanario: {
+            armado: politica.canarySendEnabled,
+            providerWiringReady: estoque.providerReady || oauth.executionReady,
+            gateOperacional: "PENDING_OWNER",
+          },
+          acoes: {
+            PREPARAR_LOTE: { permitida: preparacao.permitida, bloqueios: preparacao.bloqueios },
+            AUTORIZAR_EXECUCAO: { permitida: autorizacao.permitida, bloqueios: autorizacao.bloqueios },
+            ATIVAR_LOTE: { permitida: ativacao.permitida, bloqueios: ativacao.bloqueios },
+            EXECUTAR_ITEM: { permitida: execucao.permitida, bloqueios: execucao.bloqueios },
+          },
+          executavel: false,
+          envioRealDesabilitado: !politica.realSendEnabled,
+          proximaAcao: preparacao.permitida
+            ? "PREPARAR_LOTE"
+            : autorizacao.permitida
+              ? "AUTORIZAR_EXECUCAO"
+              : ativacao.permitida
+                ? "ATIVAR_LOTE"
+                : politica.canarySendEnabled
+                  ? "CANARY_SEND_BLOQUEADO"
+                  : "AGUARDAR_GATES_OPERACIONAIS",
+        });
+      } catch (error) {
+        erroControleCampanha(res, error);
+      }
+    },
+  },
+  {
+    // Preparação controlada (HOLD → PREPARADO). Exige canPrepareBatch e
+    // papel EXECUTOR. NÃO liga o Gmail e NÃO captura item: a outbox
+    // PREPARADO continua não capturável (claim exige lote ATIVO — 03A).
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/prepare",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      if (!carregarPoliticaCampanhaAtualizacao().canPrepareBatch) {
+        json(res, 403, {
+          erro: "Preparação do lote desabilitada por política.",
+          codigo: "CAMPAIGN_PREPARE_DISABLED",
+        });
+        return;
+      }
+      if (!identity.roles.includes("EXECUTOR")) {
+        json(res, 403, {
+          erro: "Preparação exige papel EXECUTOR.",
+          codigo: "OPERATOR_ROLE_FORBIDDEN",
+        });
+        return;
+      }
+      if (identity.status !== "ATIVO") {
+        json(res, 403, {
+          erro: "Operador suspenso não pode preparar lote.",
+          codigo: "OPERATOR_SUSPENDED",
+        });
+        return;
+      }
+      let body: { campanhaId?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_PREPARE_JSON_INVALID" });
+        return;
+      }
+      if (!operatorUuidValido(body.campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_PREPARE_INVALID",
+        });
+        return;
+      }
+      try {
+        const resultado = await prepararLoteCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId: body.campanhaId as string,
+          politica: carregarPoliticaCampanhaAtualizacao(),
+        });
+        if (!resultado) {
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, resultado.resultado === "PREPARADO" ? 200 : 200, {
+          status:
+            resultado.resultado === "PREPARADO"
+              ? "CAMPAIGN_BATCH_PREPARED"
+              : "CAMPAIGN_BATCH_ALREADY_PREPARED",
+          campanhaId: resultado.campanhaId,
+          lote: {
+            loteCampanhaId: resultado.loteCampanhaId,
+            codigo: resultado.loteCodigo,
+            totalItens: resultado.totalItens,
+          },
+          executavel: false,
+          aviso:
+            "Lote PREPARADO permanece não capturável: nenhum envio foi realizado e o Gmail não foi chamado.",
+        });
+      } catch (error) {
+        erroControleCampanha(res, error);
+      }
+    },
+  },
+  {
+    // AUTORIZAÇÃO HUMANA explícita (lote PREPARADO). Emite a prova auditada
+    // server-side (evento append-only); NÃO ativa o lote e NÃO executa nada.
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/authorize-execution",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const politica = carregarPoliticaCampanhaAtualizacao();
+      if (!politica.canExecute) {
+        json(res, 403, {
+          erro: "Execução desabilitada por política — autorização humana indisponível.",
+          codigo: "CAMPAIGN_EXECUTE_DISABLED",
+        });
+        return;
+      }
+      if (!identity.roles.includes("EXECUTOR")) {
+        json(res, 403, {
+          erro: "Autorização exige papel EXECUTOR.",
+          codigo: "OPERATOR_ROLE_FORBIDDEN",
+        });
+        return;
+      }
+      if (identity.status !== "ATIVO") {
+        json(res, 403, {
+          erro: "Operador suspenso não pode autorizar execução.",
+          codigo: "OPERATOR_SUSPENDED",
+        });
+        return;
+      }
+      let body: { campanhaId?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_AUTHORIZE_EXEC_JSON_INVALID" });
+        return;
+      }
+      if (!operatorUuidValido(body.campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_AUTHORIZE_EXEC_INVALID",
+        });
+        return;
+      }
+      try {
+        const resultado = await autorizarExecucaoCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId: body.campanhaId as string,
+          politica,
+        });
+        if (!resultado) {
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, 200, {
+          status:
+            resultado.resultado === "AUTORIZADO"
+              ? "CAMPAIGN_EXECUTION_AUTHORIZED"
+              : "CAMPAIGN_EXECUTION_ALREADY_AUTHORIZED",
+          campanhaId: resultado.campanhaId,
+          lote: {
+            loteCampanhaId: resultado.loteCampanhaId,
+            totalItens: resultado.totalItens,
+          },
+          referenciaPresente: true,
+          executavel: false,
+          aviso:
+            "Autorização registrada server-side. O lote permanece PREPARADO; nenhuma execução foi iniciada.",
+        });
+      } catch (error) {
+        erroControleCampanha(res, error);
+      }
+    },
+  },
+  {
+    // SLICE-03C.2A — CANARY SEND (STRICT NO SEND neste gate). Corpo aceita
+    // EXCLUSIVAMENTE campanhaId (UUID); itemId/lote/destinatário/fingerprint/
+    // provas/flags/provider são reconstruídos SERVER-SIDE (evento persistido
+    // + snapshot congelado + política única). Preflight read-only OBRIGATÓRIO
+    // antes do claim: qualquer bloqueio ⇒ ZERO claim, ZERO mutação, ZERO
+    // evento, ZERO token, ZERO provider, ZERO rede. Resposta sanitizada
+    // (sem e-mail, fingerprint, HMAC, token ou segredo).
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/canary-send",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      let body: { campanhaId?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_CANARY_JSON_INVALID" });
+        return;
+      }
+      if (!operatorUuidValido(body.campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_CANARY_INVALID",
+        });
+        return;
+      }
+      const recebidas = Object.keys((body as Record<string, unknown>)).filter((k) => k !== "campanhaId");
+      if (recebidas.length > 0) {
+        json(res, 422, {
+          erro: "Somente campanhaId é aceito — nenhuma autoridade adicional do cliente.",
+          codigo: "CAMPAIGN_CANARY_BODY_AUTHORITY",
+        });
+        return;
+      }
+      const politica = carregarPoliticaCampanhaAtualizacao();
+      // SLICE-03C.2A.1 (Matriz A) — armamento ausente: gate de POLÍTICA antes
+      // de qualquer leitura de banco, evento, token ou provider (409 estável;
+      // ZERO tudo).
+      if (!politica.canarySendEnabled) {
+        json(res, 409, {
+          erro: "Envio do canário não está armado — nenhuma execução foi iniciada.",
+          codigo: "CAMPAIGN_CANARY_SEND_DISABLED",
+          bloqueios: ["CANARY_SEND_DISABLED"],
+          claims: 0,
+        });
+        return;
+      }
+      // SLICE-03C.2A.1 (Seção C) — provider via DI exclusiva para teste;
+      // runtime normal constrói o provider Gmail da campanha.
+      const resultado = await enviarCanarioCampanha(requireDbPool(), {
+        operatorId: identity.operatorId,
+        campanhaId: body.campanhaId as string,
+        politica,
+        provider: provedorCanarioRuntime(body.campanhaId as string),
+        contexto: { fingerprinter: fingerprinter() },
+      });
+      if (resultado.tipo === "BLOQUEADO") {
+        // ZERO CLAIM OBRIGATÓRIO: bloqueios do preflight, sanitizados.
+        json(res, 409, {
+          erro: "Envio do canário bloqueado — nenhuma execução foi iniciada.",
+          codigo: "CAMPAIGN_CANARY_BLOCKED",
+          bloqueios: resultado.bloqueios,
+          claims: 0,
+        });
+        return;
+      }
+      const tentativa = resultado.resultado;
+      json(res, 200, {
+        resultado: tentativa.resultado,
+        itemId: tentativa.itemId,
+        ...(tentativa.resultado === "NAO_CLAIMADO" ? { claim: tentativa.claim } : {}),
+        ...(tentativa.resultado === "ENVIADO" ? { receipt: tentativa.receipt } : {}),
+        ...(tentativa.resultado === "FALHA_PRE_PROVIDER" ||
+          tentativa.resultado === "FALHA_DEFINITIVA" ||
+          tentativa.resultado === "AMBIGUO"
+          ? { motivo: tentativa.motivo }
+          : {}),
+      });
+    },
+  },
+  {
+    // SLICE-03C.1 — RUNTIME HARD-DISABLE. Nenhum provider de execução existe
+    // no runtime nesta fatia: o entrypoint de TENTATIVA falha ANTES de provas,
+    // claim, mutação, INSERT de execução, provider ou Gmail — mesmo que todas
+    // as políticas estejam abertas, o lote esteja ATIVO, o item PREPARADO, a
+    // autorização vigente e o canário selecionado. O provider Gmail só será
+    // conectado no 03C.2, com nova autorização do owner. A validação de
+    // sessão/identidade permanece (a rota segue autenticada); nenhum estado
+    // operacional é lido ou escrito aqui.
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/execute-attempt",
+    handler: async (req, res, _url, _corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      json(res, 409, {
+        erro:
+          "Execução desabilitada no runtime — nenhum provider está montado nesta fatia e nenhum item se torna executável.",
+        codigo: "CAMPAIGN_PROVIDER_DISABLED",
+        executavel: false,
+        providerReady: false,
+      });
+    },
+  },
+  {
+    // SLICE-03C.1 — ATIVAÇÃO EXPLÍCITA do lote (PREPARADO → ATIVO), com
+    // seleção durável de canário server-side na MESMA transação. O corpo
+    // aceita EXCLUSIVAMENTE campanhaId (UUID): operatorId, loteCampanhaId,
+    // itemId, e-mail, fingerprint, proofKey, estado, chave idempotente e
+    // provider são resolvidos server-side (sessão + banco + configuração) e
+    // NUNCA do cliente. A resposta não contém e-mail, fingerprint nem segredo.
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/activate",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      let body: { campanhaId?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_ACTIVATE_JSON_INVALID" });
+        return;
+      }
+      if (!operatorUuidValido(body.campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_ACTIVATE_INVALID",
+        });
+        return;
+      }
+      try {
+        const resultado = await ativarLoteCampanha(
+          requireDbPool(),
+          {
+            operatorId: identity.operatorId,
+            campanhaId: body.campanhaId as string,
+            politica: carregarPoliticaCampanhaAtualizacao(),
+            papeisOperador: identity.roles,
+          },
+        );
+        if (!resultado) {
+          // Alheio/inexistente indistinguíveis — 404 sanitizado, sem mutação.
+          json(res, 404, {
+            erro: "Nenhuma campanha persistida para este identificador.",
+            codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+          });
+          return;
+        }
+        json(res, 200, {
+          status:
+            resultado.resultado === "ATIVADO"
+              ? "CAMPAIGN_BATCH_ACTIVATED"
+              : "CAMPAIGN_BATCH_ALREADY_ACTIVATED",
+          campanhaId: resultado.campanhaId,
+          lote: {
+            loteCampanhaId: resultado.loteCampanhaId,
+            codigo: resultado.loteCodigo,
+            totalItens: resultado.totalItens,
+          },
+          canarioReferenciaPresente: true,
+          executavel: false,
+          providerReady: false,
+          aviso:
+            "Lote ATIVO permanece não executável: provider indisponível, nenhum item foi enfileirado e o Gmail não foi chamado.",
+        });
+      } catch (error) {
+        erroControleCampanha(res, error);
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/admin/provision",
+    handler: async (req, res, _url, corpo) => {
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
+      let body: {
+        code?: unknown;
+        displayName?: unknown;
+        roles?: unknown;
+        credentialHash?: unknown;
+        tokenExpiresAt?: unknown;
+      };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+
+      const roles = Array.isArray(body.roles) ? body.roles : [];
+      const rolesValid = roles.length > 0 && roles.every(
+        (role) => typeof role === "string" &&
+          ["PREPARADOR","REVISOR","APROVADOR","EXECUTOR","SUPERVISOR","ADMIN_TECNICO"].includes(role),
+      );
+      const now = new Date();
+      if (
+        !textoOperadorValido(body.code, 80) ||
+        !textoOperadorValido(body.displayName, 160) ||
+        !rolesValid ||
+        !credentialHashValido(body.credentialHash) ||
+        !expiracaoTokenValida(body.tokenExpiresAt, now)
+      ) {
+        json(res, 422, {
+          erro: "Dados de provisionamento inválidos.",
+          codigo: "OPERATOR_PROVISION_INVALID",
+        });
+        return;
+      }
+
+      const operatorId = randomUUID();
+      try {
+        await operatorIdentityRepository().provisionOperator({
+          actorOperatorId: admin.operatorId,
+          operatorId,
+          code: body.code,
+          displayName: body.displayName,
+          roles: roles as OperatorRole[],
+          tokenHash: body.credentialHash,
+          now: now.toISOString(),
+          ...(typeof body.tokenExpiresAt === "string"
+            ? { tokenExpiresAt: body.tokenExpiresAt }
+            : {}),
+        });
+        json(res, 201, {
+          operatorId,
+          status: "ATIVO",
+          roles: [...new Set(roles as string[])].sort(),
+          provisionedBy: admin.operatorId,
+        });
+      } catch (error) {
+        if (error instanceof OperatorAdminAuthorizationError) {
+          json(res, 403, {
+            erro: "Administrador técnico individual não está mais autorizado.",
+            codigo: "OPERATOR_ADMIN_AUTH_STALE",
+          });
+          return;
+        }
+        if ((error as { code?: unknown })?.code === "23505") {
+          json(res, 409, {
+            erro: "Operador ou credencial já provisionados.",
+            codigo: "OPERATOR_EXISTS",
+          });
+          return;
+        }
+        json(res, 503, {
+          erro: "Provisionamento operacional indisponível.",
+          codigo: "OPERATOR_PROVISION_UNAVAILABLE",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/admin/credentials/rotate",
+    handler: async (req, res, _url, corpo) => {
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
+      let body: {
+        operatorId?: unknown;
+        credentialHash?: unknown;
+        tokenExpiresAt?: unknown;
+      };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      const now = new Date();
+      if (
+        !operatorUuidValido(body.operatorId) ||
+        !credentialHashValido(body.credentialHash) ||
+        !expiracaoTokenValida(body.tokenExpiresAt, now)
+      ) {
+        json(res, 422, {
+          erro: "Dados de rotação inválidos.",
+          codigo: "OPERATOR_CREDENTIAL_ROTATION_INVALID",
+        });
+        return;
+      }
+
+      try {
+        const replaced = await operatorIdentityRepository().replaceCredential({
+          actorOperatorId: admin.operatorId,
+          operatorId: body.operatorId,
+          tokenHash: body.credentialHash,
+          reason: "ROTACAO",
+          now: now.toISOString(),
+          ...(typeof body.tokenExpiresAt === "string"
+            ? { tokenExpiresAt: body.tokenExpiresAt }
+            : {}),
+        });
+        if (!replaced) {
+          json(res, 404, {
+            erro: "Operador ativo não encontrado.",
+            codigo: "OPERATOR_NOT_ACTIVE",
+          });
+          return;
+        }
+        json(res, 200, {
+          operatorId: body.operatorId,
+          status: "CREDENTIAL_ROTATED",
+          sessionsRevoked: true,
+          performedBy: admin.operatorId,
+        });
+      } catch (error) {
+        if (error instanceof OperatorAdminAuthorizationError) {
+          json(res, 403, {
+            erro: "Administrador técnico individual não está mais autorizado.",
+            codigo: "OPERATOR_ADMIN_AUTH_STALE",
+          });
+          return;
+        }
+        json(res, 503, {
+          erro: "Rotação de credencial indisponível.",
+          codigo: "OPERATOR_CREDENTIAL_ROTATION_UNAVAILABLE",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/admin/credentials/recover",
+    handler: async (req, res, _url, corpo) => {
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
+      let body: {
+        operatorId?: unknown;
+        credentialHash?: unknown;
+        tokenExpiresAt?: unknown;
+      };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      const now = new Date();
+      if (
+        !operatorUuidValido(body.operatorId) ||
+        !credentialHashValido(body.credentialHash) ||
+        !expiracaoTokenValida(body.tokenExpiresAt, now)
+      ) {
+        json(res, 422, {
+          erro: "Dados de recuperação inválidos.",
+          codigo: "OPERATOR_CREDENTIAL_RECOVERY_INVALID",
+        });
+        return;
+      }
+
+      try {
+        const replaced = await operatorIdentityRepository().replaceCredential({
+          actorOperatorId: admin.operatorId,
+          operatorId: body.operatorId,
+          tokenHash: body.credentialHash,
+          reason: "RECUPERACAO",
+          now: now.toISOString(),
+          ...(typeof body.tokenExpiresAt === "string"
+            ? { tokenExpiresAt: body.tokenExpiresAt }
+            : {}),
+        });
+        if (!replaced) {
+          json(res, 404, {
+            erro: "Operador ativo não encontrado.",
+            codigo: "OPERATOR_NOT_ACTIVE",
+          });
+          return;
+        }
+        json(res, 200, {
+          operatorId: body.operatorId,
+          status: "CREDENTIAL_RECOVERED",
+          sessionsRevoked: true,
+          performedBy: admin.operatorId,
+        });
+      } catch (error) {
+        if (error instanceof OperatorAdminAuthorizationError) {
+          json(res, 403, {
+            erro: "Administrador técnico individual não está mais autorizado.",
+            codigo: "OPERATOR_ADMIN_AUTH_STALE",
+          });
+          return;
+        }
+        json(res, 503, {
+          erro: "Recuperação de credencial indisponível.",
+          codigo: "OPERATOR_CREDENTIAL_RECOVERY_UNAVAILABLE",
+        });
+      }
+    },
+  },
+  {
+    metodo: "POST",
+    caminhoExato: "/api/operator/admin/suspend",
+    handler: async (req, res, _url, corpo) => {
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
+      let operatorId = "";
+      try {
+        const body = JSON.parse(corpo.toString("utf8") || "{}") as { operatorId?: unknown };
+        operatorId = typeof body.operatorId === "string" ? body.operatorId : "";
+      } catch {
+        json(res, 400, { erro: "JSON inválido." });
+        return;
+      }
+      if (!operatorUuidValido(operatorId)) {
+        json(res, 422, {
+          erro: "Identificador do operador inválido.",
+          codigo: "OPERATOR_SUSPEND_INVALID",
+        });
+        return;
+      }
+      try {
+        const suspended = await operatorIdentityRepository().suspendOperator(
+          operatorId,
+          admin.operatorId,
+          new Date().toISOString(),
+        );
+        if (!suspended) {
+          json(res, 404, { erro: "Operador ativo não encontrado.", codigo: "OPERATOR_NOT_ACTIVE" });
+          return;
+        }
+        json(res, 200, {
+          operatorId,
+          status: "SUSPENSO",
+          sessionsRevoked: true,
+          performedBy: admin.operatorId,
+        });
+      } catch (error) {
+        if (error instanceof OperatorAdminAuthorizationError) {
+          json(res, 403, {
+            erro: "Administrador técnico individual não está mais autorizado.",
+            codigo: "OPERATOR_ADMIN_AUTH_STALE",
+          });
+          return;
+        }
+        if (error instanceof OperatorAdminContinuityError) {
+          json(res, 409, {
+            erro: "Suspensão recusada para preservar administração técnica ativa.",
+            codigo: "OPERATOR_ADMIN_CONTINUITY_REQUIRED",
+          });
+          return;
+        }
+        json(res, 503, {
+          erro: "Suspensão operacional indisponível.",
+          codigo: "OPERATOR_SUSPEND_UNAVAILABLE",
+        });
+      }
+    },
+  },
+
+  // ------------------------------------------------------------------
+  // ADMIN — listagem de operadores para a área administrativa da UI.
+  // Exige sessão individual ativa + ADMIN_TECNICO. Somente dados
+  // operacionais e estados agregados de credencial; nenhum segredo.
+  // ------------------------------------------------------------------
+  {
+    metodo: "GET",
+    caminhoExato: "/api/operator/admin/operators",
+    handler: async (req, res, url) => {
+      const admin = await exigirOperadorCampanha(req, res, ["ADMIN_TECNICO"]);
+      if (!admin) return;
+
+      const limitBruto = Number(url.searchParams.get("limit") ?? "50");
+      const offsetBruto = Number(url.searchParams.get("offset") ?? "0");
+      const limit = Number.isSafeInteger(limitBruto) ? limitBruto : 0;
+      const offset = Number.isSafeInteger(offsetBruto) ? offsetBruto : -1;
+      if (limit < 1 || limit > 100 || offset < 0) {
+        json(res, 422, {
+          erro: "Parâmetros de paginação inválidos (limit 1–100, offset ≥ 0).",
+          codigo: "OPERATOR_LIST_INVALID_PAGINATION",
+        });
+        return;
+      }
+
+      try {
+        const operadores = await operatorIdentityRepository().listOperators(
+          limit,
+          offset,
+          new Date().toISOString(),
+        );
+        json(res, 200, { operadores });
+      } catch {
+        json(res, 503, {
+          erro: "Listagem de operadores indisponível.",
+          codigo: "OPERATOR_LIST_UNAVAILABLE",
+        });
+      }
     },
   },
 
@@ -1542,8 +3397,10 @@ export function criarServidor() {
         return;
       }
       // F10: público explícito; todo o resto exige operador autenticado.
-      const publica = ROTAS_PUBLICAS.has(`${req.method} ${rota.caminhoExato ?? ""}`);
-      if (!publica && !exigirOperador(req, res)) return;
+      const routeKey = `${req.method} ${rota.caminhoExato ?? ""}`;
+      const publica = ROTAS_PUBLICAS.has(routeKey);
+      const authPropria = ROTAS_AUTH_PROPRIA.has(routeKey);
+      if (!publica && !authPropria && !exigirOperador(req, res)) return;
       const corpo = req.method === "POST" ? await lerCorpo(req) : Buffer.alloc(0);
       await rota.handler(req, res, url, corpo);
     } catch (error) {
@@ -1616,8 +3473,10 @@ export async function despachar(
       json(coletor.res as unknown as ServerResponse, 404, { erro: "Rota não encontrada." });
       return coletor.obter();
     }
-    const publica = ROTAS_PUBLICAS.has(`${metodo} ${rota.caminhoExato ?? ""}`);
-    if (!publica && !exigirOperador(req, coletor.res as unknown as ServerResponse)) {
+    const routeKey = `${metodo} ${rota.caminhoExato ?? ""}`;
+    const publica = ROTAS_PUBLICAS.has(routeKey);
+    const authPropria = ROTAS_AUTH_PROPRIA.has(routeKey);
+    if (!publica && !authPropria && !exigirOperador(req, coletor.res as unknown as ServerResponse)) {
       return coletor.obter();
     }
     const corpo = metodo === "POST" ? await lerCorpo(req) : Buffer.alloc(0);

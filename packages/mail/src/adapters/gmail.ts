@@ -408,23 +408,70 @@ export interface GmailTokenRefreshResponse {
  * Headers sanitizados: CRLF proibido em from/replyTo/to/subject (header
  * injection); subject em RFC 2047 quando contém não-ASCII.
  */
+function encodeRfc2047Utf8Base64(value: string): string {
+  if (/^[\x20-\x7E]*$/.test(value)) return value;
+
+  // RFC 2047 limita cada encoded-word a 75 caracteres e a linha física
+  // contendo encoded-word deve permanecer <= 76 caracteres.
+  // "Subject: " (9) + overhead RFC 2047 (12) + Base64 de 39 bytes (52) = 73.
+  // Linhas de continuação usam um único espaço de folding + encoded-word.
+  const maxPayloadBytes = 39;
+  const segments: string[] = [];
+  let current = "";
+  let currentBytes = 0;
+
+  for (const codePoint of value) {
+    const bytes = Buffer.byteLength(codePoint, "utf8");
+    if (bytes > maxPayloadBytes) {
+      throw new Error("Caractere UTF-8 excede limite RFC 2047");
+    }
+    if (current && currentBytes + bytes > maxPayloadBytes) {
+      const encoded = Buffer.from(current, "utf8").toString("base64");
+      segments.push(`=?UTF-8?B?${encoded}?=`);
+      current = "";
+      currentBytes = 0;
+    }
+    current += codePoint;
+    currentBytes += bytes;
+  }
+
+  if (current) {
+    const encoded = Buffer.from(current, "utf8").toString("base64");
+    segments.push(`=?UTF-8?B?${encoded}?=`);
+  }
+
+  return segments.join("\r\n ");
+}
+
 export function composeMimeMessage(message: OutboundMail): string {
   const headerSanitize = (valor: string): string => {
     if (/[\r\n]/.test(valor)) throw new Error("Cabeçalho MIME inválido (CRLF detectado)");
     return valor;
   };
-  const from = headerSanitize(`${PILOT_SENDER.name} <${PILOT_SENDER.address}>`);
+  // SLICE-03C.2A — From: remetente injetado da campanha quando presente;
+  // ausente ⇒ comportamento LEGADO do piloto preservado (PILOT_SENDER).
+  const remetente = message.from ?? PILOT_SENDER;
+  const from = headerSanitize(`${remetente.name} <${remetente.address}>`);
   const replyTo = headerSanitize(message.replyTo);
   const to = headerSanitize(message.to);
   const subject = headerSanitize(message.subject);
-  const subjectEncoded = /^[-\w .,:;()!\u00C0-\u024F]*$/.test(subject)
-    ? subject
-    : `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
+  const subjectEncoded = encodeRfc2047Utf8Base64(subject);
   const boundary = `ic-${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}-${randomBytes(8).toString("hex")}`;
   // Seção 6 — Message-ID determinístico por communication_id (RFC 5322
   // msg-id sem aspas angulares, reservado ao provedor): permite detecção de
   // duplicidade e reconstrução do MIME em casos ambíguos.
-  const messageIdentifier = `${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}.pf-confirmation@pilot.crtba.org.br`;
+  // SLICE-03C.2A — caminho da CAMPANHA (message.from presente): o domínio do
+  // Message-ID é derivado do REMETENTE injetado server-side (nunca domínio
+  // hardcoded do piloto). Comportamento LEGADO do piloto (sem from) é
+  // preservado byte-a-byte (pf-confirmation@pilot.crtba.org.br).
+  const caminhoCampanha = message.from !== undefined;
+  const dominioMensagem = caminhoCampanha
+    ? message.from!.address.split("@")[1]!.trim().toLowerCase()
+    : "pilot.crtba.org.br";
+  const tagMensagem = caminhoCampanha
+    ? (message.messageTag ?? "pf-campanha").replace(/[^a-zA-Z0-9-]/g, "")
+    : "pf-confirmation";
+  const messageIdentifier = `${message.confirmationId.replace(/[^a-zA-Z0-9]/g, "")}.${tagMensagem}@${dominioMensagem}`;
 
   return [
     `From: ${from}`,
@@ -458,64 +505,15 @@ export function composeMimeMessage(message: OutboundMail): string {
  * erros ou receipts — apenas códigos curtos determinísticos.
  */
 export class GmailHttpTransport {
-  async send(message: OutboundMail, accessToken: string): Promise<MailReceipt> {
-    const mime = composeMimeMessage(message);
-    const body = JSON.stringify({ raw: Buffer.from(mime, "utf8").toString("base64url") });
-    let response: Response;
-    try {
-      response = await fetch(GMAIL_SEND_ENDPOINT, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${accessToken}`,
-          "content-type": "application/json",
-        },
-        body,
-        // Seção 7 — timeout: rede lenta não pode segurar o lease indefinidamente.
-        signal: AbortSignal.timeout(GMAIL_SEND_TIMEOUT_MS),
-      });
-    } catch (error) {
-      // Timeout/abort é ambíguo: a requisição pode ter chegado ao Gmail.
-      // Classe dedicada para o worker classificar como DELIVERY_UNKNOWN.
-      if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
-        throw new GmailAmbiguousError("messages.send");
-      }
-      throw new MailProviderRequestError("GMAIL", "messages.send (rede)");
-    }
-    if (!response.ok) {
-      // Erro sanitizado: classe por status + código curto; corpo da resposta
-      // NUNCA é propagado (pode conter PII do payload ou detalhes internos).
-      // FINAL CLOSURE GATE item 3 — nem todo 403 é permanente: o `reason`
-      // sanitizado do Google decide entre rate-limit (retryable) e política.
-      if (response.status === 401) throw new GmailAuthError("messages.send");
-      if (response.status === 429) throw new GmailRateLimitError("messages.send");
-      if (response.status >= 500) {
-        // Piloto: resultado incerto — a requisição pode ter chegado ao Gmail.
-        throw new GmailAmbiguousError("messages.send");
-      }
-      if (response.status === 403) {
-        const reason = (await extrairReasonGoogle(response)).toLowerCase();
-        if (reason === "ratelimitexceeded" || reason === "userratelimitexceeded") {
-          throw new GmailRateLimitError("messages.send");
-        }
-        // domainPolicy, escopo insuficiente, política administrativa etc.
-        throw new GmailPermanentPolicyError("messages.send");
-      }
-      throw new MailProviderRequestError("GMAIL", `messages.send (HTTP ${response.status})`);
-    }
-    const data = (await response.json()) as GmailSendResponse;
-    if (!data?.id) {
-      throw new MailProviderRequestError("GMAIL", "messages.send (resposta sem id)");
-    }
-    return {
-      provider: "GMAIL" as const,
-      messageId: data.id,
-      ...(data.threadId ? { threadId: data.threadId } : {}),
-      acceptedAt: new Date().toISOString(),
-    };
-  }
+  constructor(
+    /** Porta de refresh injetável (testes usam fake; default = endpoint real). */
+    private readonly refreshPort: (
+      config: GmailOauthConfig,
+      refreshToken: string,
+    ) => Promise<GmailTokenRefreshResponse> = GmailHttpTransport.#refreshAccessTokenPadrao,
+  ) {}
 
-  /** Refresh do access token via refresh_token (server-side, sem logs). */
-  async refreshAccessToken(
+  static async #refreshAccessTokenPadrao(
     config: GmailOauthConfig,
     refreshToken: string,
   ): Promise<GmailTokenRefreshResponse> {
@@ -543,5 +541,79 @@ export class GmailHttpTransport {
       throw new MailProviderRequestError("GMAIL", "token.refresh (resposta sem access_token)");
     }
     return data;
+  }
+
+  async send(message: OutboundMail, accessToken: string): Promise<MailReceipt> {
+    const mime = composeMimeMessage(message);
+    const body = JSON.stringify({ raw: Buffer.from(mime, "utf8").toString("base64url") });
+    let response: Response;
+    try {
+      response = await fetch(GMAIL_SEND_ENDPOINT, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "content-type": "application/json",
+        },
+        body,
+        // Seção 7 — timeout: rede lenta não pode segurar o lease indefinidamente.
+        signal: AbortSignal.timeout(GMAIL_SEND_TIMEOUT_MS),
+      });
+    } catch {
+      // SLICE-03C.2A.1 (A.3) — QUALQUER exceção de transporte de
+      // messages.send que NÃO produziu um Response é AMBÍGUA: timeout, abort,
+      // ECONNRESET, DNS, conexão encerrada ou erro genérico de fetch. Não é
+      // possível provar que a requisição não alcançou o Google — nenhuma
+      // distinção entre timeout e demais falhas de rede. A operação descreve
+      // a fronteira ("rede sem Response") mantendo a mensagem sanitizada.
+      throw new GmailAmbiguousError("messages.send (rede sem Response)");
+    }
+    if (!response.ok) {
+      // Erro sanitizado: classe por status + código curto; corpo da resposta
+      // NUNCA é propagado (pode conter PII do payload ou detalhes internos).
+      // FINAL CLOSURE GATE item 3 — nem todo 403 é permanente: o `reason`
+      // sanitizado do Google decide entre rate-limit (retryable) e política.
+      if (response.status === 401) throw new GmailAuthError("messages.send");
+      if (response.status === 429) throw new GmailRateLimitError("messages.send");
+      if (response.status >= 500) {
+        // Piloto: resultado incerto — a requisição pode ter chegado ao Gmail.
+        throw new GmailAmbiguousError("messages.send");
+      }
+      if (response.status === 403) {
+        const reason = (await extrairReasonGoogle(response)).toLowerCase();
+        if (reason === "ratelimitexceeded" || reason === "userratelimitexceeded") {
+          throw new GmailRateLimitError("messages.send");
+        }
+        // domainPolicy, escopo insuficiente, política administrativa etc.
+        throw new GmailPermanentPolicyError("messages.send");
+      }
+      throw new MailProviderRequestError("GMAIL", `messages.send (HTTP ${response.status})`);
+    }
+    // SLICE-03C.2A.1 (A.4) — 2xx sem messageId NÃO é rejeição conclusiva: o
+    // Gmail pode ter aceitado a mensagem sem receipt suficiente para
+    // settlement seguro ⇒ resultado INCERTO (AMBIGUO), nunca FALHA_DEFINITIVA.
+    let data: GmailSendResponse;
+    try {
+      data = (await response.json()) as GmailSendResponse;
+    } catch {
+      throw new GmailAmbiguousError("messages.send (2xx sem corpo válido)");
+    }
+    if (!data?.id) {
+      throw new GmailAmbiguousError("messages.send (2xx sem id)");
+    }
+    return {
+      provider: "GMAIL" as const,
+      messageId: data.id,
+      ...(data.threadId ? { threadId: data.threadId } : {}),
+      acceptedAt: new Date().toISOString(),
+    };
+  }
+
+  /** Refresh do access token via refresh_token (server-side, sem logs). */
+  async refreshAccessToken(
+    config: GmailOauthConfig,
+    refreshToken: string,
+  ): Promise<GmailTokenRefreshResponse> {
+    // Porta injetável: testes substituem por fake (zero rede real).
+    return this.refreshPort(config, refreshToken);
   }
 }

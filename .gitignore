@@ -24,3 +24,6 @@ fixtures/
 
 assets/correios/templates/*.xlsx
 assets/correios/templates/*.xls
+
+# Credenciais operacionais geradas localmente — nunca versionar
+*.operator-credential.json

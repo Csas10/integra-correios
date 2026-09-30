@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   CampaignPersistenceError,
@@ -48,7 +49,8 @@ describe("CAMPAIGN_PERSISTENCE — snapshot, hash e validação de entrada (unit
   it("snapshot contém apenas aptos e reflete decisões humanas", () => {
     const snapshot = snapshotCampanha({
       fingerprintArquivo: "a".repeat(64),
-      templateVersao: "pf-atualizacao-cadastral-2026-v1",
+      templateVersao: "pf-expedicao-carteira-2026-v2",
+      templateContentHash: "c".repeat(64),
       registros: [...REGISTROS, { profissional_id: "PF-3", nome: "Bloqueado", email_normalizado: "x@exemplo.test", status_validacao: "BLOQUEADO" }],
       decisoes: [{ linha: 1, profissional_id: "PF-1", tipo: "EXCLUSAO_HUMANA", motivo: "REVISAO" }],
     });
@@ -60,14 +62,22 @@ describe("CAMPAIGN_PERSISTENCE — snapshot, hash e validação de entrada (unit
     expect(snapshot.decisoes_humanas).toHaveLength(1);
   });
 
-  it("hash do snapshot coincide com hashAprovacaoCampanha do conteúdo apto", () => {
+  it("hash do snapshot segue o contrato V2 persistido no marcador (approval_hash_version)", () => {
+    const templateContentHash = "c".repeat(64);
     const snapshot = snapshotCampanha({
       fingerprintArquivo: "a".repeat(64),
-      templateVersao: "v1",
+      templateVersao: "pf-expedicao-carteira-2026-v2",
+      templateContentHash,
       registros: REGISTROS,
       decisoes: [],
     });
-    const hash = hashAprovacaoCampanha({ templateVersao: "v1", registros: REGISTROS });
+    expect(snapshot.approval_hash_version).toBe("CAMPANHA_APROVACAO_V2");
+    const hash = hashAprovacaoCampanha({
+      contrato: "CAMPANHA_APROVACAO_V2",
+      templateVersao: "pf-expedicao-carteira-2026-v2",
+      templateContentHash,
+      registros: REGISTROS,
+    });
     expect(hashDoSnapshotLocal(snapshot)).toBe(hash);
   });
 
@@ -112,9 +122,12 @@ describe("CAMPAIGN_PERSISTENCE — snapshot, hash e validação de entrada (unit
   it("transação única: BEGIN/COMMIT e INSERTs envolvidos; falha → ROLLBACK", async () => {
     const { pool, sqls, falhaProxima } = poolMemoria();
 
+    // GF-2 FINAL — seleção EXPLÍCITA de template (sem default): a versão
+    // registrada/APPROVED é parte do comando de persistência.
     await persistirCampanhaAprovada(pool, {
       operatorId: "00000000-0000-4000-8000-000000000001",
       fingerprintArquivo: "a".repeat(64),
+      templateVersao: "pf-expedicao-carteira-2026-v2",
       registros: REGISTROS,
       decisoes: [],
     });
@@ -129,6 +142,7 @@ describe("CAMPAIGN_PERSISTENCE — snapshot, hash e validação de entrada (unit
       persistirCampanhaAprovada(pool, {
         operatorId: "00000000-0000-4000-8000-000000000001",
         fingerprintArquivo: "b".repeat(64),
+        templateVersao: "pf-expedicao-carteira-2026-v2",
         registros: REGISTROS,
         decisoes: [],
       }),
@@ -191,6 +205,7 @@ describe("CAMPAIGN_PERSISTENCE — snapshot, hash e validação de entrada (unit
       persistirCampanhaAprovada(poolScript, {
         operatorId: "op-outro",
         fingerprintArquivo: "a".repeat(64),
+        templateVersao: "pf-expedicao-carteira-2026-v2",
         registros: REGISTROS,
         decisoes: [],
       }),
@@ -201,13 +216,44 @@ describe("CAMPAIGN_PERSISTENCE — snapshot, hash e validação de entrada (unit
   });
 });
 
-/** Espelha hashDoSnapshotCampanha sem depender do ciclo de import. */
+/**
+ * Espelha o contrato canônico V2 (implementação independente da de produção,
+ * sem depender do ciclo de import): namespace/versão + ordem fixa de campos,
+ * null canônico para campos de exibição ausentes.
+ */
 function hashDoSnapshotLocal(snapshot: {
   template_versao: string;
-  registros: readonly { profissional_id: string; nome: string; email_normalizado: string; status_validacao: string }[];
+  template_content_hash: string;
+  registros: readonly {
+    profissional_id: string;
+    nome: string;
+    email_normalizado: string;
+    status_validacao: string;
+  }[];
 }): string {
-  return hashAprovacaoCampanha({
-    templateVersao: snapshot.template_versao,
-    registros: snapshot.registros,
-  });
+  const sha256 = createHash("sha256");
+  sha256.update("integra-correios:approval-hash:CAMPANHA_APROVACAO_V2\n");
+  sha256.update(`templateVersion=${snapshot.template_versao}\n`);
+  sha256.update(`templateContentHash=${snapshot.template_content_hash}\n`);
+  sha256.update(`totalRegistros=${snapshot.registros.length}\n`);
+  for (const registro of snapshot.registros) {
+    sha256.update(
+      [
+        registro.profissional_id,
+        registro.nome,
+        registro.email_normalizado,
+        registro.status_validacao,
+        "null", // source_record_key (ausente neste fluxo)
+        "null", // telefone
+        "null", // cep
+        "null", // logradouro
+        "null", // numero
+        "null", // complemento
+        "null", // bairro
+        "null", // cidade
+        "null", // uf
+      ].join("\u001f") + "\n",
+    );
+  }
+  return sha256.digest("hex");
 }

@@ -54,6 +54,18 @@ export type PoliticaExecucaoCampanha = PfUpdateCampaignPolicy;
 // Elegibilidade (pura — bloqueios sanitizados)
 // ---------------------------------------------------------------------------
 
+/**
+ * SLICE-03C.2B1D — registry de templates (pacote mail, módulo puro): o claim
+ * resolve a versão CONGELADA no lote e bloqueia (fail-closed, sem evento e
+ * sem mutação) versão não registrada, DRAFT, RETIRED ou de escopo diverso —
+ * ANTES do CAS. O provider NUNCA aceita conteúdo ou versão do request.
+ */
+import {
+  contentHashDoTemplate,
+  resolverRendererTemplate,
+  type TemplateErrorCode,
+} from "@integra-correios/mail";
+
 export type BloqueioExecucao =
   | "EXECUTE_DISABLED"
   | "REAL_SEND_DISABLED"
@@ -62,7 +74,9 @@ export type BloqueioExecucao =
   | "ITEM_CONCLUIDO"
   | "DOMINIO_PILOTO_REJEITADO"
   | "PROVA_DESTINATARIO_AUSENTE"
-  | "AUTORIZACAO_HUMANA_AUSENTE";
+  | "AUTORIZACAO_HUMANA_AUSENTE"
+  | TemplateErrorCode
+  | "SNAPSHOT_CORROMPIDO";
 
 export interface EntradaElegibilidadeExecucao {
   readonly politica: PoliticaExecucaoCampanha;
@@ -348,6 +362,51 @@ interface LinhaItemExecucao {
   readonly lote_codigo: string;
   readonly hash_aprovacao: string;
   readonly operator_id: string;
+  /** Versão congelada do template (autoridade da resolução do provider). */
+  readonly template_versao?: string;
+  /** Snapshot congelado da campanha (preflight estrutural — GF-2 FINAL). */
+  readonly snapshot_registros?: unknown;
+  /** Ordem do item no lote (1-based; posição do registro no snapshot). */
+  readonly ordem?: unknown;
+}
+
+/**
+ * GF-2 FINAL — preflight estrutural do item (exigido ANTES do claim, sem
+ * mutação/evento em nenhuma falha): versão registrada/APPROVED no escopo,
+ * contentHash do registry presente e snapshot íntegro para a ORDEM do item.
+ * O provider repete verificações apenas como defesa em profundidade.
+ * Retorno: undefined = OK; string = código de bloqueio sanitizado.
+ */
+function preflightEstruturalItemExecucao(linha: {
+  readonly template_versao?: unknown;
+  readonly hash_aprovacao?: unknown;
+  readonly snapshot_registros?: unknown;
+  readonly ordem?: unknown;
+}): TemplateErrorCode | "SNAPSHOT_CORROMPIDO" | undefined {
+  const resolucaoTemplate = resolverRendererTemplate(
+    typeof linha.template_versao === "string" ? linha.template_versao : "",
+  );
+  if (!resolucaoTemplate.ok) return resolucaoTemplate.code;
+  if (contentHashDoTemplate(linha.template_versao as string) === undefined) {
+    return "SNAPSHOT_CORROMPIDO";
+  }
+  if (typeof linha.hash_aprovacao !== "string" || linha.hash_aprovacao.length !== 64) {
+    return "SNAPSHOT_CORROMPIDO";
+  }
+  const snapshot = linha.snapshot_registros;
+  if (
+    typeof snapshot !== "object" ||
+    snapshot === null ||
+    !Array.isArray((snapshot as { registros?: unknown }).registros)
+  ) {
+    return "SNAPSHOT_CORROMPIDO";
+  }
+  const registros = (snapshot as { registros: readonly unknown[] }).registros;
+  const ordem = typeof linha.ordem === "number" ? Math.trunc(linha.ordem) : Number.NaN;
+  if (!Number.isInteger(ordem) || ordem < 1 || ordem > registros.length) {
+    return "SNAPSHOT_CORROMPIDO";
+  }
+  return undefined;
 }
 
 function operatorUuidValidoExecucao(value: unknown): value is string {
@@ -412,7 +471,7 @@ async function claimItemInterno(
   try {
     await transaction.query("BEGIN");
     const linhas = await transaction.query(
-      "SELECT i.estado AS item_estado, i.destinatario_fingerprint, l.estado AS lote_estado, l.codigo AS lote_codigo, c.hash_aprovacao, c.operator_id FROM lote_campanha l JOIN campanha_persistida c ON c.id = l.campanha_id JOIN outbox_campanha i ON i.lote_campanha_id = l.id WHERE i.id = $1 AND l.id = $2 AND c.id = $3 FOR UPDATE OF l, i",
+      "SELECT i.estado AS item_estado, i.destinatario_fingerprint, l.estado AS lote_estado, l.codigo AS lote_codigo, c.hash_aprovacao, c.operator_id, l.template_versao, c.snapshot_registros, i.ordem FROM lote_campanha l JOIN campanha_persistida c ON c.id = l.campanha_id JOIN outbox_campanha i ON i.lote_campanha_id = l.id WHERE i.id = $1 AND l.id = $2 AND c.id = $3 FOR UPDATE OF l, i",
       [comando.itemId, comando.loteCampanhaId, comando.campanhaId],
     );
     const linha = linhas.rows[0] as
@@ -422,6 +481,21 @@ async function claimItemInterno(
       // Alheio/inexistente indistinguíveis — sem mutação, sem evento.
       await transaction.query("ROLLBACK");
       return { resultado: "NAO_ENCONTRADO", itemId: comando.itemId };
+    }
+
+    // SLICE-03C.2B1D / GF-2 FINAL — preflight estrutural ANTES do claim
+    // (ROLLBACK sem mutação e sem evento): versão registrada/APPROVED no
+    // escopo, contentHash do registry presente e snapshot íntegro para a
+    // ORDEM do item. O provider repete verificações como defesa em
+    // profundidade (nunca como autoridade primária).
+    const bloqueioPreflight = preflightEstruturalItemExecucao(linha);
+    if (bloqueioPreflight !== undefined) {
+      await transaction.query("ROLLBACK");
+      return {
+        resultado: "BLOQUEADO",
+        itemId: comando.itemId,
+        bloqueios: [bloqueioPreflight],
+      };
     }
 
     const agora = new Date().toISOString();
@@ -672,6 +746,8 @@ export interface ComandoTentativaExecucao {
 /**
  * ÚNICO entrypoint público. Ordem EXATA dos gates antes do primeiro SQL
  * mutável e antes do provider:
+ *   0. versão do template CONGELADA no lote (registry, 03C.2B1D):
+ *      DRAFT/RETIRED/desconhecida/incompatível ⇒ BLOQUEADO antes do claim;
  *   1. política de CONFIGURAÇÃO (PF_CAMPAIGN_EXECUTE_ENABLED ∧
  *      REAL_SEND_ENABLED) — NECESSÁRIA, NUNCA suficiente;
  *   2. PROVAS de autorização operacional (destinatário controlado

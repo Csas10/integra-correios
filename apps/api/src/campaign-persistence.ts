@@ -23,14 +23,24 @@
 
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { fingerprintDestinatarioCampanha } from "./campaign-control.js";
+import { normalizarCampoExibicaoCampanha } from "./campaign-import.js";
 import {
-  CAMPAIGN_TEMPLATE_VERSAO_PADRAO,
   codigoLoteCampanha,
+  contentHashDoTemplateSelecionado,
+  metadadosTemplateCampanha,
+  normalizarExibicaoRegistroCampanha,
+  selecionarTemplateCampanhaNova,
   hashDoSnapshotCampanha,
   snapshotCampanha,
   type CampaignPersistDecisao,
   type CampaignPersistRegistro,
 } from "./campaigns.js";
+import {
+  campoExibicao,
+  metadadosTemplate as metadadosTemplateNoRegistry,
+  renderizarTemplatePersistido,
+  type RenderInputCampanha,
+} from "@integra-correios/mail";
 
 export type { CampaignPersistDecisao, CampaignPersistRegistro } from "./campaigns.js";
 
@@ -194,12 +204,31 @@ export async function persistirCampanhaAprovada(
   assertFingerprint(fingerprint);
   assertRegistros(command.registros);
   assertDecisoes(command.decisoes);
+  // GF-2 FINAL — normalização/validação dos campos de exibição ANTES de
+  // qualquer SQL: caractere de controle/estrutura inválida ⇒ erro sanitizado
+  // (o snapshot NUNCA grava valor não conformante). O registry executa a
+  // mesma normalização no render (defesa em profundidade).
+  const registrosNormalizados = command.registros.map((registro) => {
+    const exibicao = normalizarExibicaoRegistroCampanha(registro.exibicao);
+    return exibicao === undefined
+      ? registro
+      : { ...registro, exibicao };
+  });
 
-  const templateVersao = command.templateVersao?.trim() || CAMPAIGN_TEMPLATE_VERSAO_PADRAO;
+  // SLICE-03C.2B1D / GF-2 F5 — seleção server-side OBRIGATÓRIA (sem default):
+  // versão ausente, não registrada, DRAFT, RETIRED ou de escopo diverso falha
+  // ANTES de qualquer SQL, com código sanitizado (nada do request é gravado).
+  const templateVersao = selecionarTemplateCampanhaNova({
+    templateVersao: command.templateVersao ?? "",
+  });
+  // GF-2 F4 — binding durável: o contentHash canônico entra no snapshot e no
+  // hash de aprovação (mesma versão + mesmo conteúdo em authorize/persist).
+  const templateContentHash = contentHashDoTemplateSelecionado(templateVersao);
   const snapshot = snapshotCampanha({
     fingerprintArquivo: fingerprint,
     templateVersao,
-    registros: command.registros,
+    templateContentHash,
+    registros: registrosNormalizados,
     decisoes: command.decisoes,
   });
   const hashAprovacao = hashDoSnapshotCampanha(snapshot);
@@ -686,6 +715,20 @@ export async function persistirLoteCampanha(
           fingerprintDestinatario,
           JSON.stringify({
             template_versao: campanhaLinha.template_versao,
+            // GF-2 F4 — outbox também congela o contentHash (quando presente
+            // no snapshot; registros históricos seguem PRESERVE_UNCHANGED).
+            ...(typeof (campanhaLinha.snapshot_registros as { template_content_hash?: unknown })
+              .template_content_hash === "string"
+              ? {
+                  template_content_hash: (campanhaLinha.snapshot_registros as {
+                    template_content_hash?: string;
+                  }).template_content_hash,
+                }
+              : {}),
+            // GF-2 FINAL — transporte do snapshot por item (o provider lê o
+            // registro PELA ORDEM do snapshot; nenhum PII além do já
+            // autorizado; nenhum CPF).
+            exibicao: registro.exibicao,
             hash_aprovacao: campanhaLinha.hash_aprovacao,
             ordem,
           }),
@@ -738,4 +781,173 @@ export async function persistirLoteCampanha(
   } finally {
     transaction.release();
   }
+}
+
+/**
+ * GF-2 FINAL — preview server-side de um registro PERSISTIDO (somente
+ * leitura). Autoridade: valores e assunto vêm SEMPRE do snapshot congelado
+ * e do registry (PREVIEW_RENDERER_EQUALS_SEND_RENDERER=true,
+ * PREVIEW_USES_SERVER_SNAPSHOT=true — o request fornece APENAS
+ * identificadores). Correlation code derivado deterministicamente da linha
+ * (NUNCA PII). ZERO mutação, ZERO token, ZERO rede, ZERO Gmail.
+ */
+export async function lerRegistroCampanhaParaPreview(
+  pool: CampanhaPool,
+  comando: { readonly operatorId: string; readonly campanhaId: string; readonly linha: number },
+): Promise<
+  | {
+      readonly ok: true;
+      readonly corpo: {
+        readonly templateVersao: string;
+        readonly templateContentHash: string;
+        readonly dataMode: string;
+        readonly assunto: string;
+        readonly mensagem: { readonly subject: string; readonly textBody: string; readonly htmlBody: string };
+      };
+    }
+  | { readonly ok: false; readonly httpStatus: number; readonly erro: string; readonly codigo: string }
+> {
+  const resultado = await pool.query(
+    "SELECT template_versao, hash_aprovacao, snapshot_registros FROM campanha_persistida WHERE id = $1 AND operator_id = $2",
+    [comando.campanhaId, comando.operatorId],
+  );
+  const linhaBanco = resultado.rows[0] as
+    | {
+        template_versao?: unknown;
+        hash_aprovacao?: unknown;
+        snapshot_registros?: unknown;
+      }
+    | undefined;
+  if (!linhaBanco) {
+    return {
+      ok: false,
+      httpStatus: 404,
+      erro: "Campanha não encontrada para o operador.",
+      codigo: "CAMPAIGN_PERSISTED_NOT_FOUND",
+    };
+  }
+  const templateVersao =
+    typeof linhaBanco.template_versao === "string" ? linhaBanco.template_versao : "";
+  const registros = (linhaBanco.snapshot_registros as { registros?: unknown } | undefined)
+    ?.registros;
+  if (!Array.isArray(registros)) {
+    return {
+      ok: false,
+      httpStatus: 409,
+      erro: "Snapshot da campanha está estruturalmente inválido.",
+      codigo: "CAMPAIGN_PREVIEW_SNAPSHOT_INVALIDO",
+    };
+  }
+  const indice = comando.linha - 1;
+  if (indice >= registros.length) {
+    return {
+      ok: false,
+      httpStatus: 404,
+      erro: "Linha inexistente no snapshot da campanha.",
+      codigo: "CAMPAIGN_PREVIEW_LINHA_INEXISTENTE",
+    };
+  }
+  const registro = registros[indice] as {
+    nome?: unknown;
+    email_normalizado?: unknown;
+    exibicao?: unknown;
+  } | undefined;
+  if (typeof registro?.nome !== "string" || typeof registro.email_normalizado !== "string") {
+    return {
+      ok: false,
+      httpStatus: 409,
+      erro: "Registro do snapshot está estruturalmente inválido.",
+      codigo: "CAMPAIGN_PREVIEW_SNAPSHOT_INVALIDO",
+    };
+  }
+  const metadados = metadadosTemplateNoRegistry(templateVersao);
+  if (!metadados.ok || metadados.contentHash === undefined) {
+    return {
+      ok: false,
+      httpStatus: 409,
+      erro: "Versão do template não registrada.",
+      codigo: "CAMPAIGN_PREVIEW_TEMPLATE_INVALIDO",
+    };
+  }
+  const hashPersistido =
+    typeof linhaBanco.hash_aprovacao === "string" ? linhaBanco.hash_aprovacao : "";
+  if (hashPersistido.length !== 64) {
+    return {
+      ok: false,
+      httpStatus: 409,
+      erro: "Snapshot da campanha está estruturalmente inválido.",
+      codigo: "CAMPAIGN_PREVIEW_SNAPSHOT_INVALIDO",
+    };
+  }
+  const bruto =
+    typeof registro.exibicao === "object" && registro.exibicao !== null && !Array.isArray(registro.exibicao)
+      ? (registro.exibicao as Record<string, unknown>)
+      : undefined;
+  const campo = (chave: string): string | undefined =>
+    bruto !== undefined && typeof bruto[chave] === "string"
+      ? campoExibicao(bruto[chave] as string)
+      : undefined;
+  const exibicaoAcumulada: Record<string, string> = {};
+  for (const chave of ["logradouro", "numero", "complemento", "bairro", "cidade", "uf", "cep", "telefone"] as const) {
+    const valor = campo(chave);
+    if (valor !== undefined) exibicaoAcumulada[chave] = valor;
+  }
+  const temExibicao = Object.keys(exibicaoAcumulada).length > 0;
+  const remetente = remetentePreviewCampanha();
+  const renderizado = renderizarTemplatePersistido({
+    persistedTemplateVersion: templateVersao,
+    professionalName: registro.nome,
+    correlationCode: correlationPreviewCampanha(comando.campanhaId, comando.linha),
+    ...(temExibicao
+      ? { exibicao: exibicaoAcumulada as RenderInputCampanha["exibicao"] }
+      : {}),
+    remetente: { name: remetente.name, address: remetente.address },
+    campaignId: comando.campanhaId,
+    itemId: `preview:${comando.campanhaId}:${comando.linha}`,
+    professionalId: "preview",
+    recipient: registro.email_normalizado,
+    messageTag: "pf-campanha",
+  });
+  if (!renderizado.ok) {
+    return {
+      ok: false,
+      httpStatus: 409,
+      erro: "Versão do template não pôde ser renderizada para preview.",
+      codigo: "CAMPAIGN_PREVIEW_TEMPLATE_INVALIDO",
+    };
+  }
+  return {
+    ok: true,
+    corpo: {
+      templateVersao,
+      templateContentHash: metadados.contentHash,
+      dataMode: metadados.dataMode ?? "",
+      assunto: metadados.subject ?? "",
+      mensagem: {
+        subject: renderizado.mensagem.subject,
+        textBody: renderizado.mensagem.textBody,
+        htmlBody: renderizado.mensagem.htmlBody,
+      },
+    },
+  };
+}
+
+/** Remetente institucional do preview (mesma política de envio do canário). */
+function remetentePreviewCampanha(): { readonly name: string; readonly address: string } {
+  const nome = normalizarCampoExibicaoCampanha(process.env.CAMPAIGN_SENDER_NAME);
+  const endereco = normalizarCampoExibicaoCampanha(process.env.CAMPAIGN_SENDER_ADDRESS);
+  return {
+    name: nome ?? "CRT-BA | Carteiras Profissionais",
+    address: endereco ?? "carteiras@crtba.org.br",
+  };
+}
+
+/** Correlation code do preview: SHA-256 determinístico (NUNCA PII). */
+function correlationPreviewCampanha(campanhaId: string, linha: number): string {
+  const digest = createHash("sha256")
+    .update("PF-CAMP-PREVIEW-V1\n")
+    .update(`${campanhaId}\n${linha}\n`)
+    .digest("hex")
+    .toUpperCase();
+  return `PF26${digest.slice(0, 28)}`;
 }

@@ -270,6 +270,44 @@ describe("SLICE_03A.1 — matriz de estados 9 pares lote×item (BEHAVIORAL)", ()
 // e humanAuthorization (emissores server-side chegam no 03B).
 // ---------------------------------------------------------------------------
 
+/**
+ * SLICE_03C.2B1D — pool que registra tentativas de MUTAÇÃO e responde ao
+ * SELECT de claim com uma versão de template NÃO registrada: prova o
+ * fail-closed ANTES do CAS (nenhum UPDATE/INSERT/COMMIT).
+ */
+function poolSentinela(): CampanhaPool {
+  return {
+    query: async () => {
+      throw new Error("SQL_PROIBIDO_NO_GATE_DE_VERSAO");
+    },
+    connect: async () => ({
+      query: async (text: string) => {
+        if (text.includes("BEGIN") || text.includes("ROLLBACK")) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.includes("SELECT i.estado") && text.includes("template_versao") && text.includes("snapshot_registros")) {
+          return {
+            rows: [
+              {
+                item_estado: "PREPARADO",
+                destinatario_fingerprint: "aa".repeat(32),
+                lote_estado: "ATIVO",
+                lote_codigo: "CAMPANHA_PF_SINTETICA",
+                hash_aprovacao: "bb".repeat(32),
+                operator_id: "3c3d3e3f-4a5b-4c6d-8e7f-0a1b2c3d4e5f",
+                template_versao: "v-sentinel-nao-registrada-2B1D",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        throw new Error("SQL_MUTANTE_PROIBIDO_SEM_PROVAS: " + text.slice(0, 60));
+      },
+      release: () => undefined,
+    }),
+  };
+}
+
 /** Pool que transformaria QUALQUER query em erro — prova de zero SQL. */
 function poolQueFalha(): CampanhaPool {
   return {
@@ -340,6 +378,22 @@ describe("SLICE_03A.2 — provas de autorização antes do claim (BEHAVIORAL)", 
       "PROVA_DESTINATARIO_AUSENTE",
       "AUTORIZACAO_HUMANA_AUSENTE",
     ]);
+    expect(provider.chamadas).toBe(0);
+  });
+
+  it("SLICE_03C.2B1D — versão DRAFT/desconhecida bloqueia ANTES do claim (zero mutação, zero provider)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executeAttemptCampanha(poolSentinela(), {
+      ...ids,
+      politica: politicaAberta,
+      provas: provasSinteticas,
+      provider,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["CAMPAIGN_TEMPLATE_UNSUPPORTED"]);
     expect(provider.chamadas).toBe(0);
   });
 
@@ -672,6 +726,14 @@ function criarExecutorDeAuditoriaSpy(opcoes: { readonly rowCountCas: number }): 
               lote_codigo: "CAMPANHA_PF_SINTETICA",
               hash_aprovacao: "bb".repeat(32),
               operator_id: operadorDoFluxo,
+              // SLICE_03C.2B1D / GF-2 FINAL — versão registrada/APPROVED no
+              // fake (v2 do registry): as provas D/E validam aridade e fluxo
+              // do claim; snapshot estrutural + ordem válida para o preflight.
+              template_versao: "pf-expedicao-carteira-2026-v2",
+              snapshot_registros: {
+                registros: [{ nome: "S", email_normalizado: "s@exemplo.test" }],
+              },
+              ordem: 1,
             },
           ],
           rowCount: 1,
@@ -898,7 +960,7 @@ async function criarCenaLote(
   const hashAprovacao = createHash("sha256").update("exec-fixture-" + campanhaId).digest("hex");
   const fingerprint = createHash("sha256").update("dest-exec-" + campanhaId).digest("hex");
   await pool.query(
-    "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'EXEC_TESTE_V1', $4, $5::jsonb, $6, 0, 0, 0, 'LOTE_CRIADO', $7, $7)",
+    "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'pf-expedicao-carteira-2026-v2', $4, $5::jsonb, $6, 0, 0, 0, 'LOTE_CRIADO', $7, $7)",
     [
       campanhaId,
       params.operatorId,
@@ -910,7 +972,7 @@ async function criarCenaLote(
     ],
   );
   await pool.query(
-    "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'EXEC_TESTE_V1', $4, $5, $6)",
+    "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'pf-expedicao-carteira-2026-v2', $4, $5, $6)",
     [loteCampanhaId, campanhaId, params.codigoLote ?? "EXEC_LOTE_SINTETICO", params.estadoLote, params.itens.length, agora],
   );
   let ordem = 0;
@@ -918,7 +980,7 @@ async function criarCenaLote(
     ordem += 1;
     await pool.query(
       "INSERT INTO outbox_campanha (id, lote_campanha_id, ordem, destinatario_fingerprint, payload_snapshot, estado, criada_em) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)",
-      [item.id, loteCampanhaId, ordem, fingerprint, JSON.stringify({ template_versao: "EXEC_TESTE_V1", ordem }), item.estado, agora],
+      [item.id, loteCampanhaId, ordem, fingerprint, JSON.stringify({ template_versao: "pf-expedicao-carteira-2026-v2", ordem }), item.estado, agora],
     );
   }
   return { campanhaId, loteCampanhaId, hashAprovacao };

@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { despachar as despacharSemBanco } from "../src/server.js";
-import { carregarPoliticaCampanhaAtualizacao } from "../src/campaigns.js";
+import {
+  carregarPoliticaCampanhaAtualizacao,
+  contentHashDoTemplateSelecionado,
+} from "../src/campaigns.js";
 
 type Despachar = typeof despacharSemBanco;
 let despacharAtivo: Despachar = despacharSemBanco;
@@ -157,11 +160,51 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
     return { operatorId, cookie: firstCookie(login.headers["set-cookie"]) };
   }
 
+  // GF-2 FINAL — versão EXPLÍCITA selecionável (sem default); o hash de
+  // aprovação congela versão + contentHash canônico do registry.
+  const TEMPLATE_V2 = "pf-expedicao-carteira-2026-v2";
+  // GF-2 CORRETIVO — campos PREFILLED fazem parte do conteúdo aprovado
+  // (hash V2) e do snapshot persistido.
   const REGISTROS = [
-    { profissional_id: "PF-P-0001", nome: "Ana Sintetica", email_normalizado: "ana@exemplo.test", status_validacao: "APTO" },
-    { profissional_id: "PF-P-0002", nome: "Bruno Sintetico", email_normalizado: "bruno@exemplo.test", status_validacao: "APTO" },
-    { profissional_id: "PF-P-0003", nome: "Carla Sintetica", email_normalizado: "carla@exemplo.test", status_validacao: "APTO" },
+    {
+      profissional_id: "PF-P-0001", nome: "Ana Sintetica", email_normalizado: "ana@exemplo.test", status_validacao: "APTO",
+      exibicao: { telefone: "(00) 00000-0001", cep: "00000-001", logradouro: "Rua Teste", numero: "101", bairro: "Bairro Teste", cidade: "Salvador", uf: "BA" },
+    },
+    {
+      profissional_id: "PF-P-0002", nome: "Bruno Sintetico", email_normalizado: "bruno@exemplo.test", status_validacao: "APTO",
+      exibicao: { telefone: "(00) 00000-0002", cep: "00000-002", logradouro: "Avenida Teste", numero: "202", complemento: "S/N", bairro: "Bairro Teste", cidade: "Salvador", uf: "BA" },
+    },
+    {
+      profissional_id: "PF-P-0003", nome: "Carla Sintetica", email_normalizado: "carla@exemplo.test", status_validacao: "APTO",
+      exibicao: { telefone: "(00) 00000-0003", cep: "00000-003", logradouro: "Travessa Teste", numero: "303", bairro: "Bairro Teste", cidade: "Salvador", uf: "BA" },
+    },
   ];
+  /** Espelho independente do hash de aprovação V2 (contrato versionado). */
+  function hashAprovacaoV2Local(
+    templateVersao: string,
+    templateContentHash: string,
+    registros: readonly { profissional_id: string; nome: string; email_normalizado: string; status_validacao: string; source_record_key?: string; exibicao?: Record<string, string | undefined> }[],
+  ): string {
+    const CHAVES = ["telefone", "cep", "logradouro", "numero", "complemento", "bairro", "cidade", "uf"] as const;
+    const sha256 = createHash("sha256");
+    sha256.update("integra-correios:approval-hash:CAMPANHA_APROVACAO_V2\n");
+    sha256.update(`templateVersion=${templateVersao}\n`);
+    sha256.update(`templateContentHash=${templateContentHash}\n`);
+    sha256.update(`totalRegistros=${registros.length}\n`);
+    for (const registro of registros) {
+      sha256.update(
+        [
+          registro.profissional_id,
+          registro.nome,
+          registro.email_normalizado,
+          registro.status_validacao,
+          registro.source_record_key === undefined ? "null" : (registro.source_record_key as string),
+          ...CHAVES.map((chave) => (registro.exibicao?.[chave] === undefined ? "null" : (registro.exibicao[chave] as string))),
+        ].join("\u001f") + "\n",
+      );
+    }
+    return sha256.digest("hex");
+  }
 
   it("jornada: gate 403 → persist → stale 409 → idempotência → batch EXECUTOR → outbox HOLD → zero-claim", async () => {
     const { NodePostgresPool, PostgresOperationalRepository } = await import("@integra-correios/persistence");
@@ -204,6 +247,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
           registros: REGISTROS,
           decisoes: decisoesTeste,
         })),
@@ -215,14 +259,11 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         status: string;
       };
       expect(corpoPersist.status).toBe("CAMPAIGN_PERSISTED");
-      const hashEsperado = createHash("sha256")
-        .update("template:pf-atualizacao-cadastral-2026-v1\n")
-        .update(
-          REGISTROS.map(
-            (r) => `${r.profissional_id}\u001f${r.nome}\u001f${r.email_normalizado}\u001f${r.status_validacao}\n`,
-          ).join(""),
-        )
-        .digest("hex");
+      const hashEsperado = hashAprovacaoV2Local(
+        TEMPLATE_V2,
+        contentHashDoTemplateSelecionado(TEMPLATE_V2),
+        REGISTROS,
+      );
       expect(corpoPersist.conteudoHash).toBe(hashEsperado);
 
       // 2. stale: conteúdo divergente com hash antigo → 409
@@ -230,6 +271,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: randomUUID().replace(/-/g, "").padEnd(64, "0"),
+          templateVersao: TEMPLATE_V2,
           registros: [{ ...REGISTROS[0]!, nome: "CONTEUDO DIVERGENTE" }],
           decisoes: [],
           conteudoHash: corpoPersist.conteudoHash,
@@ -243,6 +285,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
           registros: REGISTROS,
           decisoes: decisoesTeste,
         })),
@@ -348,6 +391,96 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
     }
   });
 
+    // GF-2 CORRETIVO — aprovação cadastral VINCULA o conteúdo completo
+    // (todos os campos PREFILLED + templateVersion + templateContentHash):
+    // qualquer alteração entre authorize e persist ⇒ 409 STALE.
+    it("stale por campo: mudar QUALQUER campo renderizado entre authorize e persist ⇒ 409 CAMPAIGN_APPROVAL_STALE", async () => {
+      const adminCookie = await bootstrapAdmin();
+      const aprovador = await provisionOperator(adminCookie, ["APROVADOR"]);
+      const operador = await provisionOperator(adminCookie, ["PREPARADOR", "EXECUTOR"]);
+      const fingerprint = sha(`stale-por-campo-${randomUUID()}`);
+
+      // 1. authorize congela o hash V2 do conteúdo completo
+      const autorizacao = await despachar("POST", "/api/campaigns/authorize", {
+        headers: { cookie: aprovador.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({ templateVersao: TEMPLATE_V2, registros: REGISTROS })),
+      });
+      expect(autorizacao.status).toBe(200);
+      const aprovado = JSON.parse(autorizacao.corpo) as {
+        status: string;
+        approvalHashVersion: string;
+        conteudoHash: string;
+      };
+      expect(aprovado.status).toBe("CAMPAIGN_APPROVAL_FROZEN");
+      expect(aprovado.approvalHashVersion).toBe("CAMPANHA_APROVACAO_V2");
+
+      // AUTHORIZE_PERSIST_SNAPSHOT_MATCH: o mesmo conteúdo persiste com o
+      // hash EXATAMENTE devolvido pelo authorize.
+      const persistida = await despachar("POST", "/api/campaigns/persist", {
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
+          conteudoHash: aprovado.conteudoHash,
+          registros: REGISTROS,
+          decisoes: [],
+        })),
+      });
+      expect(persistida.status).toBe(201);
+
+      // 2. MUTAÇÃO de um campo ⇒ hash recalculado diverge do congelado ⇒ 409.
+      //    templateVersion e templateContentHash: o registry é imutável e
+      //    versão desconhecida falha ANTES (422 fail-closed na seleção) —
+      //    provado no caso final.
+      const mutacoes: readonly (readonly [string, Record<string, string>, string])[] = [
+        ["telefone", { telefone: "(00) 00000-9999" }, "exibicao"],
+        ["cep", { cep: "00000-999" }, "exibicao"],
+        ["logradouro", { logradouro: "Rua Alterada" }, "exibicao"],
+        ["numero", { numero: "999" }, "exibicao"],
+        ["complemento", { complemento: "AP 99" }, "exibicao"],
+        ["bairro", { bairro: "Bairro Alterado" }, "exibicao"],
+        ["cidade", { cidade: "Feira de Santana" }, "exibicao"],
+        ["uf", { uf: "PE" }, "exibicao"],
+        ["nome", {}, "Ana Sintetica ALTERADA"],
+        ["email_normalizado", {}, "ana.alterada@exemplo.test"],
+      ];
+      for (const [campo, deltaExibicao, modo] of mutacoes) {
+        const mutados = REGISTROS.map((registro, indice) => {
+          if (indice !== 0) return registro;
+          if (modo === "exibicao") {
+            return { ...registro, exibicao: { ...(registro.exibicao ?? {}), ...deltaExibicao } };
+          }
+          return { ...registro, [modo]: deltaExibicao };
+        });
+        const stale = await despachar("POST", "/api/campaigns/persist", {
+          headers: { cookie: operador.cookie, "content-type": "application/json" },
+          corpo: Buffer.from(JSON.stringify({
+            fingerprintArquivo: sha(`outro-arquivo-${randomUUID()}`),
+            templateVersao: TEMPLATE_V2,
+            conteudoHash: aprovado.conteudoHash,
+            registros: mutados,
+            decisoes: [],
+          })),
+        });
+        expect(stale.status, `campo ${campo} deveria invalidar a aprovação`).toBe(409);
+        expect(stale.corpo).toContain("CAMPAIGN_APPROVAL_STALE");
+      }
+
+      // RENDERED_DATA_CHANGE_INVALIDATES_APPROVAL / TEMPLATE_CHANGE: versão
+      // diferente da autorizada nunca persiste (fail-closed na seleção).
+      const versaoDivergente = await despachar("POST", "/api/campaigns/persist", {
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          fingerprintArquivo: sha(`versao-divergente-${randomUUID()}`),
+          templateVersao: "pf-expedicao-carteira-2026-v3",
+          conteudoHash: aprovado.conteudoHash,
+          registros: REGISTROS,
+          decisoes: [],
+        })),
+      });
+      expect([409, 422]).toContain(versaoDivergente.status);
+    });
+
     it("isolamento por operador: terceiro EXECUTOR não lê nem materializa campanha/lote alheios (403/404, delta zero)", async () => {
     const { NodePostgresPool } = await import("@integra-correios/persistence");
     const pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE! });
@@ -362,6 +495,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: dono.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
           registros: REGISTROS,
           decisoes: [],
         })),
@@ -434,6 +568,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: outro.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
           registros: REGISTROS,
           decisoes: [],
         })),

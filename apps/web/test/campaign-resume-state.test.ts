@@ -184,11 +184,13 @@ describe("GATE: SERVER-DRIVEN RECOVERY AUTHORITY — efeito legado removido (fon
     expect(recorte).not.toContain("/api/campaigns/persisted");
   });
 
-  it("B·D: efeitos de retomada são EXATAMENTE 4 — sem efeito de hash (request por hash não pode iniciar nem concorrer)", () => {
-    // UX-FLOW-01B.1: loadMe, workspace/status, descoberta + readiness 03B
-    // (slice-03B: efeito read-only de /api/campaigns/operational-readiness).
+  it("B·D: efeitos são EXATAMENTE 6 (GF-2 FINAL: +catálogo server-driven +prévia server-side) — sem efeito de hash (request por hash não pode iniciar nem concorrer)", () => {
+    // UX-FLOW-01B.1: loadMe, workspace/status, descoberta + readiness 03B.
+    // GF-2 FINAL: efeitos read-only de /api/campaigns/template-selecionaveis
+    // (catálogo do registry) e de /api/campaigns/preview-registro (prévia
+    // pelo MESMO renderer do envio). Nenhum efeito de hash legado.
     const usos = fonteComponente.split("useEffect(").length - 1;
-    expect(usos).toBe(4);
+    expect(usos).toBe(6);
   });
 
   it("C·F: ciclo de hash EXTINTO — zero leitura e zero gravação de ic_campanha_hash (UX-FLOW-01B.1)", () => {
@@ -232,9 +234,9 @@ describe("GATE: SERVER-DRIVEN RECOVERY AUTHORITY — efeito legado removido (fon
     expect(recorte.split("let ativo = true;").length - 1).toBe(1);
     expect(recorte.split("ativo = false;").length - 1).toBe(1);
     expect(recorte).toContain("if (!ativo) return;");
-    // File-wide: cleanup `ativo` nos 3 efeitos async restantes (status +
-    // descoberta + readiness 03B).
-    expect(fonteComponente.split("let ativo = true;").length - 1).toBe(3);
+    // File-wide: cleanup `ativo` nos 5 efeitos async (status + descoberta +
+    // readiness 03B + catálogo GF-2 FINAL + prévia server-side GF-2 FINAL).
+    expect(fonteComponente.split("let ativo = true;").length - 1).toBe(5);
   });
 
   it("J: retomada é ZERO-MUTAÇÃO — nenhum POST na janela server-driven", () => {

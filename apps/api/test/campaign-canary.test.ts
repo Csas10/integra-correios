@@ -518,6 +518,8 @@ describe("SLICE_03C.2A.1 — mapeamento do provider (erros → resultado, AUTO_R
         {
           ordem: 1,
           estado: "ENFILEIRADO",
+          template_versao: "pf-expedicao-carteira-2026-v2",
+          hash_aprovacao: "b".repeat(64),
           destinatario_fingerprint: fingerprintDestinatarioCampanha("canario.classe@exemplo.test"),
           snapshot_registros: {
             registros: [
@@ -634,6 +636,53 @@ describe("SLICE_03C.2A.1 — mapeamento do provider (erros → resultado, AUTO_R
     } as never);
     const resultado = await provider.enviar(comando);
     expect(resultado.tipo).toBe("ENVIADO");
+  });
+
+  it("2B1D-H. provider resolve pela versão CONGELADA no lote: versão não registrada ⇒ FALHA_PRE_PROVIDER sanitizada, zero gateway", async () => {
+    let chamadasGateway = 0;
+    const gatewayEspiao = {
+      send: async () => {
+        chamadasGateway += 1;
+        throw new Error("gateway não deveria ser invocado com versão inválida");
+      },
+      getStatus: async () => {
+        throw new Error("n/a");
+      },
+    } as never;
+    // Linha com versão DESCONHECIDA: falha sanitizada ANTES do gateway.
+    const providerComVersao = new ProvedorGmailCampanha({
+      pool: {
+        query: async () => ({
+          rows: [
+            {
+              ordem: 1,
+              estado: "ENFILEIRADO",
+              template_versao: "versao-sintetica-nao-registrada-2B1D",
+              hash_aprovacao: "",
+              destinatario_fingerprint: fingerprintDestinatarioCampanha("canario.classe@exemplo.test"),
+              snapshot_registros: {
+                registros: [
+                  {
+                    profissional_id: "PF-CLS-0001",
+                    nome: "Sintetico Classe",
+                    email_normalizado: "canario.classe@exemplo.test",
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      } as never,
+      campanhaId: randomUUID(),
+      gateway: gatewayEspiao,
+      env: { CAMPAIGN_SENDER_ADDRESS: "carteiras@crtba.org.br" },
+    });
+    const resultado = await providerComVersao.enviar(comando);
+    expect(resultado).toEqual({
+      tipo: "FALHA_PRE_PROVIDER",
+      motivo: "TEMPLATE_VERSAO_NAO_REGISTRADA",
+    });
+    expect(chamadasGateway).toBe(0);
   });
 });
 
@@ -956,11 +1005,11 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
       status_validacao: "APTO",
     }));
     await p.query(
-      "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'CNR_TESTE_V1', $4, $5::jsonb, $6, $6, 0, $6, 'LOTE_CRIADO', $7, $7)",
+      "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'pf-expedicao-carteira-2026-v2', $4, $5::jsonb, $6, $6, 0, $6, 'LOTE_CRIADO', $7, $7)",
       [campanhaId, params.operatorId, fingerprintArquivo, hashAprovacao, JSON.stringify({ registros, total: registros.length }), registros.length, agora],
     );
     await p.query(
-      "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'CNR_TESTE_V1', $4, $5, $6)",
+      "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'pf-expedicao-carteira-2026-v2', $4, $5, $6)",
       [loteCampanhaId, campanhaId, "CNR_LOTE_" + loteCampanhaId.slice(0, 8), params.estadoLote ?? "ATIVO", registros.length, agora],
     );
     const fingerprints: string[] = [];

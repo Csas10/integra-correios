@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   analisarCampanhaAtualizacaoPf,
   emailCampanhaValido,
@@ -32,6 +33,18 @@ export const CAMPOS_MAPEAMENTO_CAMPANHA = [
   "email_normalizado",
   "status_validacao",
   "motivo_bloqueio",
+  // GF-2 FINAL (PREFILLED_CONFIRMATION) — campos de exibição OPCIONAIS
+  // (coluna ausente ⇒ -1 ⇒ campo ausente ⇒ renderer usa "Não informado").
+  // NUNCA entram no CPF; NUNCA geram bloqueio de contato (somente e-mail
+  // determina entregabilidade); são apenas projetados no snapshot.
+  "telefone",
+  "cep",
+  "logradouro",
+  "numero",
+  "complemento",
+  "bairro",
+  "cidade",
+  "uf",
 ] as const;
 
 export type CampoMapeamentoCampanha = (typeof CAMPOS_MAPEAMENTO_CAMPANHA)[number];
@@ -49,6 +62,11 @@ export type CodigoInconsistenciaCampanha =
 
 export interface RegistroAvaliado {
   readonly linha: number;
+  /**
+   * GF-2 CORRETIVO — chave opaca server-side da fonte (linha), sem PII;
+   * vinculada à aprovação e ao snapshot congelado.
+   */
+  readonly source_record_key?: string | undefined;
   readonly profissional_id: string;
   readonly nome: string;
   readonly nome_exibicao: string;
@@ -58,6 +76,87 @@ export interface RegistroAvaliado {
   readonly motivo_bloqueio: readonly PfUpdateBlockReason[];
   readonly normalizacoes_aplicadas: readonly ("NOME_ESPACOS" | "EMAIL_ESPACOS" | "EMAIL_CASE")[];
   readonly inconsistencias: readonly CodigoInconsistenciaCampanha[];
+  /**
+   * GF-2 FINAL — campos de exibição (PREFILLED_CONFIRMATION): normalizados
+   * para apresentação na ingestion (whitespace sequencial → espaço único;
+   * trim; vazio ⇒ ausente). A USENTE coluna origem mantém o campo ausente
+   * (renderer renderiza "Não informado"). NUNCA incluem CPF.
+   */
+  readonly exibicao?: {
+    readonly telefone?: string;
+    readonly cep?: string;
+    readonly logradouro?: string;
+    readonly numero?: string;
+    readonly complemento?: string;
+    readonly bairro?: string;
+    readonly cidade?: string;
+    readonly uf?: string;
+  };
+}
+
+/**
+ * GF-2 FINAL — normalização de APRESENTAÇÃO compartilhada pelo pipeline
+ * (importação, snapshot e provider). Semântica idêntica à do registry de
+ * templates (@integra-correios/mail `campoExibicao`): CR/LF/TAB e whitespace
+ * sequencial → espaço único; trim; vazio ⇒ undefined. Preserva o valor
+ * SEMÂNTICO (sem completar endereço, sem heurística de CEP, sem conversão
+ * numérica, sem remover S/N ou zeros significativos).
+ */
+export function normalizarCampoExibicaoCampanha(valor: string | undefined): string | undefined {
+  if (valor === undefined) return undefined;
+  const compactado = valor.replace(/\s+/g, " ").trim();
+  return compactado === "" ? undefined : compactado;
+}
+
+/**
+ * GF-2 CORRETIVO — SOURCE RECORD KEY (identidade opaca, pré-persistência):
+ * identifica estavelmente UM registro dentro da fonte avaliada. Derivada
+ * SERVER-SIDE, opaca, SEM PII e determinística para a MESMA fonte+linha:
+ * SHA-256("pf-campaign-source-record:v1" + fingerprintArquivo + numeroLinha).
+ * CPF, nome, e-mail, telefone e endereço NUNCA entram na derivação. Mudança
+ * de arquivo/ordem produz chave nova (esperado); a deduplicação de
+ * profissional pertence ao contrato document-fingerprint já existente.
+ */
+export function sourceRecordKeyCampanha(
+  fingerprintArquivo: string,
+  numeroLinha: number,
+): string {
+  return createHash("sha256")
+    .update("pf-campaign-source-record:v1")
+    .update(fingerprintArquivo.trim().toLowerCase())
+    .update(String(numeroLinha))
+    .digest("hex");
+}
+
+/** Extrai e normaliza os campos de exibição de uma linha mapeada. */
+function exibicaoDaLinha(
+  celulas: readonly { readonly texto: string }[],
+  mapeamento: Readonly<Record<string, number>>,
+): RegistroAvaliado["exibicao"] | undefined {
+  const campo = (key: CampoMapeamentoCampanha): string | undefined => {
+    const coluna = mapeamento[key];
+    if (typeof coluna !== "number" || coluna < 0) return undefined;
+    return normalizarCampoExibicaoCampanha(celulas[coluna]?.texto);
+  };
+  const telefone = campo("telefone");
+  const cep = campo("cep");
+  const logradouro = campo("logradouro");
+  const numero = campo("numero");
+  const complemento = campo("complemento");
+  const bairro = campo("bairro");
+  const cidade = campo("cidade");
+  const uf = campo("uf");
+  const exibicao: RegistroAvaliado["exibicao"] = {
+    ...(telefone === undefined ? {} : { telefone }),
+    ...(cep === undefined ? {} : { cep }),
+    ...(logradouro === undefined ? {} : { logradouro }),
+    ...(numero === undefined ? {} : { numero }),
+    ...(complemento === undefined ? {} : { complemento }),
+    ...(bairro === undefined ? {} : { bairro }),
+    ...(cidade === undefined ? {} : { cidade }),
+    ...(uf === undefined ? {} : { uf }),
+  };
+  return Object.keys(exibicao).length === 0 ? undefined : exibicao;
 }
 
 export interface AvaliacaoBase {
@@ -97,6 +196,16 @@ const CAMPOS_OBRIGATORIOS: readonly CampoMapeamentoCampanha[] = [
   "email_original",
 ];
 
+/**
+ * GF-2 CORRETIVO — identidade opaca (SOURCE RECORD KEY ≠ PII): colunas de
+ * documento/PII NUNCA podem alimentar o identificador institucional da
+ * campanha. O `profissional_id` avaliado é apenas o IDENTIFICADOR
+ * INSTITUCIONAL da fonte (MATRICULA/IDENTIFICACAO/ID); a identidade opaca
+ * persistida (UUID interno) é atribuída UMA vez na persistência operacional
+ * (intake.ts) — nunca derivada de CPF, e-mail, telefone ou linha.
+ */
+const CAMPOS_PROIBIDOS_COMO_IDENTIFICADOR = ["cpf", "cpf_cnpj", "cnpj"] as const;
+
 export function camposObrigatoriosMapeamento(): readonly CampoMapeamentoCampanha[] {
   return CAMPOS_OBRIGATORIOS;
 }
@@ -128,6 +237,15 @@ export function sugerirMapeamento(folha: FolhaExtraida): Record<CampoMapeamentoC
     email_normalizado: -1,
     status_validacao: -1,
     motivo_bloqueio: -1,
+    // GF-2 FINAL — sugestões de exibição (opcionais; coluna ausente ⇒ -1).
+    telefone: primeiro(["TELEFONE", "TELEFONEPRINCIPAL", "CELULAR"]),
+    cep: primeiro(["CEP"]),
+    logradouro: primeiro(["LOGRADOURO", "ENDERECO"]),
+    numero: primeiro(["NUMERO", "NUM"]),
+    complemento: primeiro(["COMPLEMENTO"]),
+    bairro: primeiro(["BAIRRO"]),
+    cidade: primeiro(["CIDADE"]),
+    uf: primeiro(["UF"]),
   };
 }
 
@@ -146,6 +264,23 @@ export function validarMapeamentoCampanha(
     const coluna = mapeamento[campo] as unknown;
     if (typeof coluna !== "number" || !Number.isInteger(coluna) || coluna < 0) {
       throw new AvaliacaoInvalidaError("COLUNA_INVALIDA", `Coluna inválida para ${campo}.`);
+    }
+  }
+  // GF-2 CORRETIVO — guarda de identidade: CPF/CNPJ NUNCA mapeia
+  // profissional_id (422 CAMPO_DESCONHECIDO sanitizado pela rota). O
+  // identificador institucional nunca é documento de identidade (fail-closed).
+  const colunasDocumento = new Set<number>();
+  for (const campo of campos) {
+    if ((CAMPOS_PROIBIDOS_COMO_IDENTIFICADOR as readonly string[]).includes(campo)) {
+      colunasDocumento.add(mapeamento[campo] as number);
+    }
+  }
+  if (colunasDocumento.size > 0 && typeof mapeamento.profissional_id === "number") {
+    if (colunasDocumento.has(mapeamento.profissional_id as number)) {
+      throw new AvaliacaoInvalidaError(
+        "CAMPO_DESCONHECIDO",
+        "Documento de identidade (CPF/CNPJ) não pode alimentar o identificador institucional.",
+      );
     }
   }
   const ausentes = CAMPOS_OBRIGATORIOS.filter(
@@ -255,6 +390,7 @@ export function reaplicarClassificacao(
         motivos,
         normalizacoes,
         divergenteInformado: false as boolean,
+        exibicaoDaLinhaAtual: exibicaoDaLinha(linha.celulas, mapeamento),
       };
     })
     .filter((row): row is NonNullable<typeof row> => row !== undefined);
@@ -307,6 +443,9 @@ export function reaplicarClassificacao(
       motivo_bloqueio: [...new Set(row.motivos)],
       normalizacoes_aplicadas: row.normalizacoes,
       inconsistencias,
+      ...(row.exibicaoDaLinhaAtual === undefined
+        ? {}
+        : { exibicao: row.exibicaoDaLinhaAtual }),
     };
   });
 
@@ -387,13 +526,27 @@ export function avaliarBaseCampanha(
   opcoes: { mapeamento?: Readonly<Record<string, number>> } = {},
 ): AvaliacaoBase {
   const leitura = lerXlsx({ nome: nomeArquivo, bytes });
+  // GF-2 CORRETIVO — cada registro avaliado carrega sua SOURCE RECORD KEY
+  // opaca (fingerprint do arquivo + linha), derivada server-side, sem PII.
+  const comChaveFonte = (
+    base: Omit<AvaliacaoBase, "sha256">,
+  ): Omit<AvaliacaoBase, "sha256"> => ({
+    ...base,
+    registros: base.registros.map((registro) => ({
+      ...registro,
+      source_record_key: sourceRecordKeyCampanha(leitura.sha256, registro.linha),
+    })),
+  });
   if (opcoes.mapeamento) {
-    return { sha256: leitura.sha256, ...reaplicarClassificacao(leitura.folha, opcoes.mapeamento) };
+    return {
+      sha256: leitura.sha256,
+      ...comChaveFonte(reaplicarClassificacao(leitura.folha, opcoes.mapeamento)),
+    };
   }
   const analise = analisarCampanhaAtualizacaoPf(leitura, {
     colunaIdentificadorInstitucional: "MATRICULA",
   });
-  return { sha256: leitura.sha256, ...converterRelatorioImportador(analise) };
+  return { sha256: leitura.sha256, ...comChaveFonte(converterRelatorioImportador(analise)) };
 }
 
 export { LeituraSeguraError, PfUpdateCampaignImportError };

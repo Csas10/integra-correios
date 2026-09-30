@@ -97,6 +97,17 @@ type RegistroAprovacao = {
   nome: string;
   email_normalizado: string;
   status_validacao: string;
+  source_record_key?: string;
+  exibicao?: {
+    telefone?: string;
+    cep?: string;
+    logradouro?: string;
+    numero?: string;
+    complemento?: string;
+    bairro?: string;
+    cidade?: string;
+    uf?: string;
+  };
 };
 
 type DecisaoHumana = {
@@ -146,6 +157,7 @@ type AvaliacaoArquivo = {
 
 type RegistroAvaliado = {
   readonly linha: number;
+  readonly source_record_key?: string;
   readonly profissional_id: string;
   readonly nome: string;
   readonly nome_exibicao: string;
@@ -155,6 +167,35 @@ type RegistroAvaliado = {
   readonly motivo_bloqueio: readonly string[];
   readonly normalizacoes_aplicadas: readonly string[];
   readonly inconsistencias: readonly string[];
+  readonly exibicao?: {
+    readonly telefone?: string;
+    readonly cep?: string;
+    readonly logradouro?: string;
+    readonly numero?: string;
+    readonly complemento?: string;
+    readonly bairro?: string;
+    readonly cidade?: string;
+    readonly uf?: string;
+  };
+};
+
+/** Catálogo server-driven de templates selecionáveis (GF-2 FINAL). */
+type TemplateSelecionavel = {
+  templateVersao: string;
+  templateId: string;
+  status: string;
+  scope: string;
+  subject: string;
+  dataMode: string;
+};
+
+/** Prévia server-side do registro persistido (mesmo renderer do provider). */
+type PreviaRegistro = {
+  templateVersao: string;
+  templateContentHash: string;
+  dataMode: string;
+  assunto: string;
+  mensagem: { subject: string; textBody: string; htmlBody: string };
 };
 
 type AvaliacaoBase = {
@@ -264,13 +305,12 @@ const ROTULOS_CAMPO: Readonly<Record<string, string>> = {
   motivo_bloqueio: "Motivo de bloqueio (derivado)",
 };
 
-const TEMPLATE_VERSAO_PADRAO = "pf-atualizacao-cadastral-2026-v1";
-
-/** Prévia textual determinística da mensagem (etapa 7) — destinatário mascarado. */
-function previaMensagem(registro: RegistroAvaliado): string {
-  const primeiroNome = registro.nome.split(/\s+/)[0] ?? registro.nome;
-  return `Assunto: Atualização cadastral — Confira seus dados\nPara: ${mascararEmail(registro.email_normalizado)}\n\nOlá, ${primeiroNome}.\n\nIdentificamos que seus dados cadastrais precisam de revisão. Confira as informações no link seguro enviado pela equipe.\n\nTemplate ${TEMPLATE_VERSAO_PADRAO} · mensagem sujeita a aprovação formal.`;
-}
+// GF-2 FINAL — SERVER_REGISTRY_AUTHORITY: NÃO existe constante de template
+// client-side. O catálogo vem de GET /api/campaigns/template-selecionaveis
+// (status APPROVED, escopo PF_CAMPAIGN) e o operador seleciona explicitamente
+// uma templateVersion registrada; o servidor revalida em authorize/persist/
+// claim. A prévia textual client-side foi REMOVIDA como autoridade: o preview
+// usa o MESMO registry/renderer do provider via /api/campaigns/preview-registro.
 
 function mascararEmail(email: string): string {
   const [local, dominio] = email.split("@");
@@ -428,6 +468,13 @@ export function CampaignWorkspace() {
   // legado não existe leitor, e estado write-only não é conveniência
   // operacional. A retomada é 100% server-driven (resumable + detail).
   // UX-FLOW-01A — detalhamento das dez etapas: consulta (painel), não wizard.
+  // GF-2 FINAL — catálogo server-driven de templates selecionáveis + seleção
+  // EXPLÍCITA do operador (sem default implícito no cliente).
+  const [templatesSelecionaveis, setTemplatesSelecionaveis] = useState<readonly TemplateSelecionavel[]>([]);
+  const [templateSelecionada, setTemplateSelecionada] = useState("");
+  // Prévia server-side (mesmo renderer do provider) para o registro selecionado.
+  const [previaMensagemServidor, setPreviaMensagemServidor] = useState<PreviaRegistro | null>(null);
+  const [previaCarregando, setPreviaCarregando] = useState(false);
   const [painelAtividade, setPainelAtividade] = useState(false);
   const [etapaConsulta, setEtapaConsulta] = useState<Etapa>(1);
   // UX-FLOW-01B — retomada server-driven (descoberta por operator_id).
@@ -471,6 +518,24 @@ export function CampaignWorkspace() {
 
   useEffect(() => {
     void loadMe();
+  }, []);
+
+  // GF-2 FINAL — catálogo de templates selecionáveis vem SEMPRE do servidor
+  // (registry: APPROVED no escopo PF_CAMPAIGN). Nenhum default implícito.
+  useEffect(() => {
+    let ativo = true;
+    void fetchJson<{ templates: readonly TemplateSelecionavel[] }>(
+      "/api/campaigns/template-selecionaveis",
+    )
+      .then((corpo) => {
+        if (ativo) setTemplatesSelecionaveis(corpo.templates);
+      })
+      .catch(() => {
+        if (ativo) setTemplatesSelecionaveis([]);
+      });
+    return () => {
+      ativo = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -865,6 +930,10 @@ export function CampaignWorkspace() {
       setErroEtapa("Nenhum profissional apto para aprovar.");
       return;
     }
+    if (templateSelecionada === "") {
+      setErroEtapa("Selecione explicitamente um template registrado (APPROVED) antes de aprovar.");
+      return;
+    }
     setErroEtapa("");
     setAvaliando(true);
     try {
@@ -872,12 +941,16 @@ export function CampaignWorkspace() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          templateVersao: TEMPLATE_VERSAO_PADRAO,
+          templateVersao: templateSelecionada,
           registros: aptos.map((registro) => ({
             profissional_id: registro.profissional_id,
             nome: registro.nome,
             email_normalizado: registro.email_normalizado,
             status_validacao: registro.status_validacao,
+            ...(registro.source_record_key === undefined
+              ? {}
+              : { source_record_key: registro.source_record_key }),
+            ...(registro.exibicao === undefined ? {} : { exibicao: registro.exibicao }),
           })),
         }),
       });
@@ -911,13 +984,17 @@ export function CampaignWorkspace() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           fingerprintArquivo: fingerprint,
-          templateVersao: TEMPLATE_VERSAO_PADRAO,
+          templateVersao: templateSelecionada,
           conteudoHash: aprovacao.conteudoHash,
           registros: aptosParaAprovacao.map((registro) => ({
             profissional_id: registro.profissional_id,
             nome: registro.nome,
             email_normalizado: registro.email_normalizado,
             status_validacao: registro.status_validacao,
+            ...(registro.source_record_key === undefined
+              ? {}
+              : { source_record_key: registro.source_record_key }),
+            ...(registro.exibicao === undefined ? {} : { exibicao: registro.exibicao }),
           })),
           decisoes: excluidos.map((linha) => {
             const registro = base.registros.find((item) => item.linha === linha);
@@ -1018,6 +1095,34 @@ export function CampaignWorkspace() {
       ) ?? [],
     [base, excluidos],
   );
+
+  // GF-2 FINAL — prévia server-side (PREVIEW_RENDERER_EQUALS_SEND_RENDERER):
+  // o browser envia APENAS identificadores autorizados (campanhaId + linha);
+  // valores/assunto vêm do snapshot congelado via o mesmo renderer do envio.
+  // Antes da persistência não há snapshot — a prévia completa é apresentada
+  // após o congelamento (o cliente NUNCA é autoridade de conteúdo).
+  useEffect(() => {
+    setPreviaMensagemServidor(null);
+    const campanhaId = campanha?.campanhaId;
+    if (templateSelecionada === "" || !campanhaId) return;
+    let ativo = true;
+    setPreviaCarregando(true);
+    void fetchJson<PreviaRegistro>(
+      `/api/campaigns/preview-registro?campanhaId=${encodeURIComponent(campanhaId)}&linha=1`,
+    )
+      .then((corpo) => {
+        if (ativo) setPreviaMensagemServidor(corpo);
+      })
+      .catch(() => {
+        if (ativo) setPreviaMensagemServidor(null);
+      })
+      .finally(() => {
+        if (ativo) setPreviaCarregando(false);
+      });
+    return () => {
+      ativo = false;
+    };
+  }, [templateSelecionada, campanha]);
 
   const acoesAtivas = new Set(status?.availableActions ?? []);
   const podeImportar = acoesAtivas.has("IMPORTAR_E_MAPEAR");
@@ -1817,8 +1922,9 @@ export function CampaignWorkspace() {
           <section className="campaign-panel" aria-labelledby="etapa-previa">
             <h2 id="etapa-previa">Prévia da comunicação</h2>
             <p>
-              Prévia textual determinística do template {TEMPLATE_VERSAO_PADRAO}. Destinatários
-              permanecem mascarados na interface; nada é enviado nesta fase.
+              Prévia gerada pelo SERVIDOR com o mesmo registry/renderer do envio
+              (PREFILLED_CONFIRMATION). Nada é enviado nesta fase; destinatários permanecem
+              mascarados na interface.
             </p>
             <div className="campaign-preview-nav">
               <button
@@ -1842,10 +1948,14 @@ export function CampaignWorkspace() {
                 Próxima →
               </button>
             </div>
-            {aptosParaAprovacao[previaIndice] ? (
+            {previaMensagemServidor ? (
               <pre className="campaign-preview">
-                {previaMensagem(aptosParaAprovacao[previaIndice])}
+                {`Assunto: ${previaMensagemServidor.assunto}\n\n${previaMensagemServidor.mensagem.textBody}`}
               </pre>
+            ) : previaCarregando ? (
+              <p role="status">Carregando prévia do servidor…</p>
+            ) : templateSelecionada === "" ? (
+              <p>Selecione um template registrado (APPROVED) para visualizar a prévia.</p>
             ) : (
               <p>Nenhuma mensagem elegível para prévia.</p>
             )}
@@ -1873,8 +1983,31 @@ export function CampaignWorkspace() {
               template + registros aptos. Qualquer alteração posterior de destinatário, template ou
               conteúdo invalida a aprovação — o hash deixa de corresponder.
             </p>
+            <div className="campaign-field" style={{ margin: "0.75rem 0" }}>
+              <label htmlFor="template-selecionada">
+                Template (registrada · APPROVED · escopo PF_CAMPAIGN):
+              </label>{" "}
+              <select
+                id="template-selecionada"
+                value={templateSelecionada}
+                onChange={(event) => {
+                  setTemplateSelecionada(event.target.value);
+                  setAprovacao(null);
+                  setPreviaMensagemServidor(null);
+                }}
+              >
+                <option value="">— selecione explicitamente —</option>
+                {templatesSelecionaveis.map((t) => (
+                  <option key={t.templateVersao} value={t.templateVersao}>
+                    {t.templateVersao} · {t.dataMode}
+                  </option>
+                ))}
+              </select>
+              {templatesSelecionaveis.length === 0 ? (
+                <small role="status"> Catálogo indisponível — aprovação bloqueada.</small>
+              ) : null}
+            </div>
             <ul className="campaign-flow-stats">
-              <li>Template: <code>{TEMPLATE_VERSAO_PADRAO}</code></li>
               <li>Itens elegíveis: {aptosParaAprovacao.length}</li>
               <li>Excluídos por decisão humana: {excluidos.length}</li>
               <li>Aprovadas: {aprovacao ? aprovacao.totalItens : 0}</li>

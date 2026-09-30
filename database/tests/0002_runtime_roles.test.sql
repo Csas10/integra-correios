@@ -229,6 +229,23 @@ SELECT count(*) AS registros_operacionais_visiveis FROM outbox_email;
 -- GF-3 CORRECTIVE-01 (F3) — prova operacional das grants de campanha sob o
 -- login herdado: INSERT + SELECT + UPDATE em campanha_persistida (DELETE
 -- permanece bloqueado — provado abaixo).
+-- GF-3 CORRECTIVE-01.1 — fixture de ownership: a FK
+-- campanha_persistida_operator_id_fkey exige a linha de operador referenciada.
+-- Operador SINTÉTICO criado NESTA transação (sob a role de runtime, que já
+-- possui INSERT em operador): dados 100% sintéticos, sem ON CONFLICT, sem
+-- desativação/adiamento de FK, sem privilégio adicional. O ROLLBACK final
+-- remove a fixture deterministicamente (nenhuma mutação externa).
+INSERT INTO operador (
+  id, codigo, nome_exibicao, status, criado_em, atualizado_em
+) VALUES (
+  '72000000-0000-4000-8000-0000000000f1',
+  'RUNTIME-CAMPAIGN-TEST',
+  'Operador Sintético Runtime',
+  'ATIVO',
+  now(),
+  now()
+);
+
 INSERT INTO campanha_persistida (
   id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao,
   snapshot_registros, total_registros, total_aptos, total_bloqueados,

@@ -16,4 +16,5 @@ export * from "./domain/message.js";
 export * from "./templates/pf-confirmation.js";
 export * from "./templates/pf-pilot.js";
 export * from "./templates/pf-update-campaign.js";
+export * from "./templates/pf-campaign-template-registry.js";
 export * from "./webhooks/resend.js";

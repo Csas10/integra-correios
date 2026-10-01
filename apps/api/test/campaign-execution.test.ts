@@ -25,7 +25,17 @@ import {
   type CampanhaPool,
   type PoliticaExecucaoCampanha,
 } from "../src/campaign-execution.js";
-import { carregarPoliticaCampanhaAtualizacao } from "../src/campaigns.js";
+import {
+  carregarPoliticaCampanhaAtualizacao,
+  hashAprovacaoCampanha,
+  hashDoSnapshotCampanha,
+} from "../src/campaigns.js";
+import { fingerprintDestinatarioCampanha } from "../src/campaign-control.js";
+import {
+  contentHashDoTemplate,
+  metadadosTemplate,
+  TEMPLATE_V2_VERSION,
+} from "@integra-correios/mail";
 
 const DB_URL_AMBIENTE = process.env.DATABASE_URL;
 
@@ -270,6 +280,45 @@ describe("SLICE_03A.1 — matriz de estados 9 pares lote×item (BEHAVIORAL)", ()
 // e humanAuthorization (emissores server-side chegam no 03B).
 // ---------------------------------------------------------------------------
 
+/**
+ * SLICE_03C.2B1D — pool que registra tentativas de MUTAÇÃO e responde ao
+ * SELECT de claim com uma versão de template NÃO registrada: prova o
+ * fail-closed ANTES do CAS (nenhum UPDATE/INSERT/COMMIT).
+ */
+function poolSentinela(): CampanhaPool {
+  return {
+    query: async () => {
+      throw new Error("SQL_PROIBIDO_NO_GATE_DE_VERSAO");
+    },
+    connect: async () => ({
+      query: async (text: string) => {
+        if (text.includes("BEGIN") || text.includes("ROLLBACK")) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.includes("SELECT i.estado") && text.includes("template_versao") && text.includes("snapshot_registros")) {
+          return {
+            rows: [
+              {
+                item_estado: "PREPARADO",
+                destinatario_fingerprint: "aa".repeat(32),
+                lote_estado: "ATIVO",
+                lote_codigo: "CAMPANHA_PF_SINTETICA",
+                hash_aprovacao: "bb".repeat(32),
+                operator_id: "3c3d3e3f-4a5b-4c6d-8e7f-0a1b2c3d4e5f",
+                template_versao: "v-sentinel-nao-registrada-2B1D",
+                campanha_template_versao: "v-sentinel-nao-registrada-2B1D",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        throw new Error("SQL_MUTANTE_PROIBIDO_SEM_PROVAS: " + text.slice(0, 60));
+      },
+      release: () => undefined,
+    }),
+  };
+}
+
 /** Pool que transformaria QUALQUER query em erro — prova de zero SQL. */
 function poolQueFalha(): CampanhaPool {
   return {
@@ -340,6 +389,22 @@ describe("SLICE_03A.2 — provas de autorização antes do claim (BEHAVIORAL)", 
       "PROVA_DESTINATARIO_AUSENTE",
       "AUTORIZACAO_HUMANA_AUSENTE",
     ]);
+    expect(provider.chamadas).toBe(0);
+  });
+
+  it("SLICE_03C.2B1D — versão DRAFT/desconhecida bloqueia ANTES do claim (zero mutação, zero provider)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executeAttemptCampanha(poolSentinela(), {
+      ...ids,
+      politica: politicaAberta,
+      provas: provasSinteticas,
+      provider,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["CAMPAIGN_TEMPLATE_UNSUPPORTED"]);
     expect(provider.chamadas).toBe(0);
   });
 
@@ -670,8 +735,49 @@ function criarExecutorDeAuditoriaSpy(opcoes: { readonly rowCountCas: number }): 
               destinatario_fingerprint: "aa".repeat(32),
               lote_estado: "ATIVO",
               lote_codigo: "CAMPANHA_PF_SINTETICA",
-              hash_aprovacao: "bb".repeat(32),
+              hash_aprovacao: hashDoSnapshotCampanha({
+                template_versao: "pf-expedicao-carteira-2026-v2",
+                template_content_hash: contentHashDoTemplate("pf-expedicao-carteira-2026-v2") ?? "",
+                approval_hash_version: "CAMPANHA_APROVACAO_V2",
+                total_registros: 1,
+                total_aptos: 1,
+                total_bloqueados: 0,
+                total_aprovados: 1,
+                registros: [
+                  {
+                    profissional_id: "00000000-0000-4000-8000-000000000001",
+                    nome: "Profissional Sintetico Fluxo",
+                    email_normalizado: "s@exemplo.test",
+                    status_validacao: "APTO",
+                  },
+                ],
+                decisoes_humanas: [],
+              }),
               operator_id: operadorDoFluxo,
+              // SLICE_03C.2B1D / GF-2 FINAL — versão registrada/APPROVED no
+              // fake (v2 do registry): as provas D/E validam aridade e fluxo
+              // do claim; snapshot estrutural + ordem válida para o preflight.
+              // GF-3 CORRECTIVE-02 (F8) — fixture V2 CONSISTENTE: o snapshot
+              // contém os inputs canônicos completos, contentHash do registry
+              // e hash_aprovacao recalculado pelo dispatcher de produção
+              // (hashDoSnapshotCampanha) — o preflight F8 passa e o fluxo
+              // D/E prossegue inalterado.
+              template_versao: "pf-expedicao-carteira-2026-v2",
+              campanha_template_versao: "pf-expedicao-carteira-2026-v2",
+              snapshot_registros: {
+                template_versao: "pf-expedicao-carteira-2026-v2",
+                template_content_hash: contentHashDoTemplate("pf-expedicao-carteira-2026-v2"),
+                approval_hash_version: "CAMPANHA_APROVACAO_V2",
+                registros: [
+                  {
+                    profissional_id: "00000000-0000-4000-8000-000000000001",
+                    nome: "Profissional Sintetico Fluxo",
+                    email_normalizado: "s@exemplo.test",
+                    status_validacao: "APTO",
+                  },
+                ],
+              },
+              ordem: 1,
             },
           ],
           rowCount: 1,
@@ -809,6 +915,115 @@ describe("SLICE_03A.3 — aridade e mapeamento SQL (regressão local do binding)
     ).toBe(false);
   });
 
+  // GF-3 CORRECTIVE-01 (F5) — SETTLEMENT_ERROR_ROLLBACK: falha no COMMIT da
+  // via de settlement (registrarEventoExecucao/COMMIT — aqui exercitada na
+  // transação do RECEIPT, mesmo padrão BEGIN → evento → COMMIT do bloco de
+  // settlement de executeAttemptCampanha) ⇒ ROLLBACK emitido, conexão liberada
+  // SEM transação aberta e causa original preservada. Prova BEHAVIORAL (sem
+  // banco) sobre pool falso que percorre o fluxo REAL.
+  it("F: falha no COMMIT da via de settlement (receipt) ⇒ ROLLBACK + release + causa original (conexão não volta com transação aberta)", async () => {
+    const chamadas: ChamadaSql[] = [];
+    const liberada: boolean[] = [];
+    const falhaCommit = new Error("commit settlement falhou (sintético)");
+    const transacao = {
+      query: async (text: string): Promise<{ rows: readonly unknown[]; rowCount: number | null }> => {
+        chamadas.push({ text, values: [] });
+        if (text.includes("SELECT i.estado") && text.includes("template_versao") && text.includes("snapshot_registros")) {
+          return {
+            rows: [
+              {
+                item_estado: "PREPARADO",
+                destinatario_fingerprint: "aa".repeat(32),
+                lote_estado: "ATIVO",
+                lote_codigo: "EXEC_LOTE_SINTETICO",
+                hash_aprovacao: hashDoSnapshotCampanha({
+                  template_versao: "pf-expedicao-carteira-2026-v2",
+                  template_content_hash: contentHashDoTemplate("pf-expedicao-carteira-2026-v2") ?? "",
+                  approval_hash_version: "CAMPANHA_APROVACAO_V2",
+                  total_registros: 1,
+                  total_aptos: 1,
+                  total_bloqueados: 0,
+                  total_aprovados: 1,
+                  registros: [
+                    {
+                      profissional_id: "00000000-0000-4000-8000-000000000001",
+                      nome: "Profissional Sintetico",
+                      email_normalizado: "prof.settlement@exemplo.test",
+                      status_validacao: "APTO",
+                    },
+                  ],
+                  decisoes_humanas: [],
+                }),
+                operator_id: operadorDoFluxo,
+                template_versao: "pf-expedicao-carteira-2026-v2",
+                campanha_template_versao: "pf-expedicao-carteira-2026-v2",
+                snapshot_registros: {
+                  template_versao: "pf-expedicao-carteira-2026-v2",
+                  template_content_hash: contentHashDoTemplate("pf-expedicao-carteira-2026-v2"),
+                  approval_hash_version: "CAMPANHA_APROVACAO_V2",
+                  registros: [
+                    {
+                      profissional_id: "00000000-0000-4000-8000-000000000001",
+                      nome: "Profissional Sintetico",
+                      email_normalizado: "prof.settlement@exemplo.test",
+                      status_validacao: "APTO",
+                    },
+                  ],
+                },
+                ordem: 1,
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (text.includes("SELECT destinatario_fingerprint FROM outbox_campanha WHERE id")) {
+          return { rows: [{ destinatario_fingerprint: "aa".repeat(32) }], rowCount: 1 };
+        }
+        if (text.includes("SELECT estado FROM outbox_campanha")) {
+          // registrarReceiptInterno: item ENFILEIRADO segue para receipt+CAS.
+          return { rows: [{ estado: "ENFILEIRADO" }], rowCount: 1 };
+        }
+        if (text === "COMMIT" && chamadas.filter((c) => c.text === "COMMIT").length > 2) {
+          // Terceiro COMMIT = transação de settlement (1º = claim, 2º =
+          // EXEC_TENTATIVA_INICIADA) ⇒ falha sintética exatamente lá.
+          throw falhaCommit;
+        }
+        return { rows: [], rowCount: 1 };
+      },
+      release: (): void => {
+        liberada.push(true);
+      },
+    };
+    const pool: CampanhaPool = {
+      query: async () => ({ rows: [], rowCount: 0 }),
+      connect: async () => transacao,
+    };
+    await expect(
+      executeAttemptCampanha(pool, {
+        ...comando,
+        provas: provasSinteticas,
+        provider: new ProvedorFakeCampanha(),
+      }),
+    ).rejects.toBe(falhaCommit); // causa original preservada (sem mascarar)
+    // BEGIN → ... → COMMIT (claim, ok) → BEGIN (settlement) → evento →
+    // COMMIT falha → ROLLBACK (settlement) — a conexão foi liberada exatamente
+    // uma vez por transação (claim + tentativa + settlement) e o último
+    // statement da transação com falha é ROLLBACK, nunca COMMIT pendente.
+    // A transação que falhou no COMMIT é a do RECEIPT (registrarReceiptInterno
+    // — mesmo padrão BEGIN → evento → COMMIT): ROLLBACK foi emitido, a conexão
+    // foi liberada e a settlement NUNCA iniciou (a causa propagou antes).
+    const indiceBeginRecebimento = chamadas.map((c) => c.text).lastIndexOf("BEGIN");
+    const aposBegin = chamadas.slice(indiceBeginRecebimento).map((c) => c.text);
+    expect(aposBegin.some((t) => t.includes("INSERT INTO evento_auditoria"))).toBe(true);
+    expect(aposBegin[aposBegin.length - 1]).toBe("ROLLBACK");
+    // 3 conexões usadas (claim, tentativa, receipt-falho); 3 COMMITs emitidos
+    // (claim + tentativa OK; o 3º, do receipt, FALHOU) e 1 ROLLBACK da
+    // transação quebrada — a conexão não volta ao pool com transação aberta.
+    expect(liberada.length).toBe(3);
+    expect(chamadas.filter((c) => c.text === "COMMIT").length).toBe(3);
+    expect(chamadas.filter((c) => c.text === "ROLLBACK").length).toBe(1);
+  });
+
   it("fonte do módulo: array de valores do INSERT de auditoria tem exatamente 7 elementos", () => {
     const inicio = FONTE_EXECUCAO.indexOf("INSERT INTO evento_auditoria");
     const trecho = FONTE_EXECUCAO.slice(inicio, FONTE_EXECUCAO.indexOf("],", inicio));
@@ -880,6 +1095,63 @@ interface CenaLote {
   readonly campanhaId: string;
   readonly loteCampanhaId: string;
   readonly hashAprovacao: string;
+  readonly templateContentHash: string;
+  readonly registros: readonly RegistroFixtureCampanha[];
+}
+
+interface RegistroFixtureCampanha {
+  readonly profissional_id: string;
+  readonly nome: string;
+  readonly email_normalizado: string;
+  readonly status_validacao: string;
+}
+
+const TEMPLATE_V2_FIXTURE = TEMPLATE_V2_VERSION;
+
+/**
+ * GF-2 CI CORRECTIVE-01 — snapshot V2 GOVERNADO da fixture (fonte única,
+ * usada pelo builder de cena e pela prova independente): contentHash obtido
+ * da entrada APPROVED do registry (nunca literal duplicado), marcador
+ * approval_hash_version, um registro sintético POR ORDEM (registro do item =
+ * registros[ordem - 1]) e hash de aprovação V2 recalculado pelo helper
+ * canônico sobre EXATAMENTE o snapshot persistido. 100% sintético (.test,
+ * UUIDs sintéticos, sem PII).
+ */
+function cenarioV2Sintetico(quantidade: number): {
+  readonly registros: readonly RegistroFixtureCampanha[];
+  readonly templateContentHash: string;
+  readonly snapshot: {
+    readonly template_versao: string;
+    readonly template_content_hash: string;
+    readonly approval_hash_version: "CAMPANHA_APROVACAO_V2";
+    readonly registros: readonly RegistroFixtureCampanha[];
+  };
+  readonly hashAprovacao: string;
+} {
+  const templateContentHash = contentHashDoTemplate(TEMPLATE_V2_FIXTURE);
+  if (!templateContentHash) {
+    throw new Error("Fixture: registry v2 sem contentHash canônico.");
+  }
+  const registros: RegistroFixtureCampanha[] = Array.from({ length: quantidade }, (_, indice) => ({
+    profissional_id: `00000000-0000-4000-8000-${String(indice + 1).padStart(12, "0")}`,
+    nome: `Profissional Sintetico Exec ${indice + 1}`,
+    email_normalizado: `prof.exec.fixture.${indice + 1}@exemplo.test`,
+    status_validacao: "APTO",
+  }));
+  const snapshot = {
+    template_versao: TEMPLATE_V2_FIXTURE,
+    template_content_hash: templateContentHash,
+    approval_hash_version: "CAMPANHA_APROVACAO_V2" as const,
+    registros,
+  };
+  // Helper público/canônico (contrato V2) sobre o snapshot EXATO persistido.
+  const hashAprovacao = hashAprovacaoCampanha({
+    contrato: "CAMPANHA_APROVACAO_V2",
+    templateVersao: TEMPLATE_V2_FIXTURE,
+    templateContentHash,
+    registros,
+  });
+  return { registros, templateContentHash, snapshot, hashAprovacao };
 }
 
 /** Campanha + lote + itens sintéticos (UNIQUE por execução; NUNCA dados reais). */
@@ -895,34 +1167,102 @@ async function criarCenaLote(
   const campanhaId = randomUUID();
   const loteCampanhaId = randomUUID();
   const agora = new Date().toISOString();
-  const hashAprovacao = createHash("sha256").update("exec-fixture-" + campanhaId).digest("hex");
-  const fingerprint = createHash("sha256").update("dest-exec-" + campanhaId).digest("hex");
+  const cenario = cenarioV2Sintetico(params.itens.length);
+  const fingerprintArquivo = createHash("sha256").update("exec-fixture-" + campanhaId).digest("hex");
   await pool.query(
-    "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'EXEC_TESTE_V1', $4, $5::jsonb, $6, 0, 0, 0, 'LOTE_CRIADO', $7, $7)",
+    "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, 0, $8, 'LOTE_CRIADO', $9, $9)",
     [
       campanhaId,
       params.operatorId,
-      hashAprovacao,
-      hashAprovacao,
-      JSON.stringify({ registros: [], total: params.itens.length }),
-      params.itens.length,
+      fingerprintArquivo,
+      cenario.snapshot.template_versao,
+      cenario.hashAprovacao,
+      JSON.stringify(cenario.snapshot),
+      cenario.registros.length,
+      cenario.registros.length,
       agora,
     ],
   );
   await pool.query(
-    "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'EXEC_TESTE_V1', $4, $5, $6)",
-    [loteCampanhaId, campanhaId, params.codigoLote ?? "EXEC_LOTE_SINTETICO", params.estadoLote, params.itens.length, agora],
+    "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, $4, $5, $6, $7)",
+    [loteCampanhaId, campanhaId, params.codigoLote ?? "EXEC_LOTE_SINTETICO", TEMPLATE_V2_FIXTURE, params.estadoLote, params.itens.length, agora],
   );
   let ordem = 0;
   for (const item of params.itens) {
     ordem += 1;
+    // Resolução EXATA do contrato: registro do item = registros[ordem - 1];
+    // destinatario_fingerprint canônico do e-mail normalizado do registro.
+    const registro = cenario.registros[ordem - 1]!;
     await pool.query(
       "INSERT INTO outbox_campanha (id, lote_campanha_id, ordem, destinatario_fingerprint, payload_snapshot, estado, criada_em) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)",
-      [item.id, loteCampanhaId, ordem, fingerprint, JSON.stringify({ template_versao: "EXEC_TESTE_V1", ordem }), item.estado, agora],
+      [
+        item.id,
+        loteCampanhaId,
+        ordem,
+        fingerprintDestinatarioCampanha(registro.email_normalizado),
+        JSON.stringify({ template_versao: TEMPLATE_V2_FIXTURE, template_content_hash: cenario.templateContentHash, ordem }),
+        item.estado,
+        agora,
+      ],
     );
   }
-  return { campanhaId, loteCampanhaId, hashAprovacao };
+  return { campanhaId, loteCampanhaId, hashAprovacao: cenario.hashAprovacao, templateContentHash: cenario.templateContentHash, registros: cenario.registros };
 }
+
+/**
+ * GF-2 CI CORRECTIVE-01 — prova INDEPENDENTE do preflight de execução
+ * (FIXTURE_VALIDATION_INDEPENDENT): as asserções abaixo usam APENAS o
+ * registry público (metadados/contentHash) e o helper canônico do hash para
+ * CONSTRUIR a fixture — nunca o verificador de snapshot da execução.
+ */
+describe("SLICE_03A.1 — fixture V2 governada (prova independente do preflight)", () => {
+  const cenario = cenarioV2Sintetico(5);
+
+  it("EXEC_FIXTURE_TEMPLATE_APPROVED: v2 registrada e APPROVED no registry público", () => {
+    const meta = metadadosTemplate(TEMPLATE_V2_FIXTURE);
+    expect(meta.ok).toBe(true);
+    if (!meta.ok) return expect.unreachable();
+    expect(meta.status).toBe("APPROVED");
+    expect(meta.scope).toBe("PF_CAMPAIGN");
+    expect(meta.dataMode).toBe("PREFILLED_CONFIRMATION");
+  });
+
+  it("EXEC_FIXTURE_CONTENT_HASH_MATCH: contentHash da fixture = contentHash canônico do registry", () => {
+    expect(cenario.templateContentHash).toBe(contentHashDoTemplate(TEMPLATE_V2_FIXTURE));
+    expect(cenario.snapshot.template_content_hash).toBe(cenario.templateContentHash);
+  });
+
+  it("EXEC_FIXTURE_VALID_V2_SNAPSHOT: versão/marcador/tamanho/ordem coerentes e sintéticos", () => {
+    expect(cenario.snapshot.template_versao).toBe(TEMPLATE_V2_FIXTURE);
+    expect(cenario.snapshot.approval_hash_version).toBe("CAMPANHA_APROVACAO_V2");
+    expect(cenario.snapshot.registros.length).toBe(5);
+    for (const registro of cenario.snapshot.registros) {
+      expect(registro.status_validacao).toBe("APTO");
+      expect(registro.email_normalizado.endsWith(".test")).toBe(true);
+      expect(registro.profissional_id).toMatch(/^[0-9a-f-]{36}$/);
+    }
+  });
+
+  it("EXEC_FIXTURE_APPROVAL_HASH_MATCH: hash V2 recalculado sobre o snapshot = hash persistido", () => {
+    expect(cenario.hashAprovacao).toMatch(/^[0-9a-f]{64}$/);
+    expect(cenario.hashAprovacao).toBe(
+      hashAprovacaoCampanha({
+        contrato: "CAMPANHA_APROVACAO_V2",
+        templateVersao: cenario.snapshot.template_versao,
+        templateContentHash: cenario.snapshot.template_content_hash,
+        registros: cenario.snapshot.registros,
+      }),
+    );
+  });
+
+  it("EXEC_FIXTURE_ORDER_RESOLVES_RECORD + EXEC_FIXTURE_RECIPIENT_FP_MATCH: item da ordem N resolve registros[N-1] com fingerprint canônico", () => {
+    for (let ordem = 1; ordem <= 5; ordem += 1) {
+      const registro = cenario.snapshot.registros[ordem - 1]!;
+      expect(registro.email_normalizado).toBe(`prof.exec.fixture.${ordem}@exemplo.test`);
+      expect(fingerprintDestinatarioCampanha(registro.email_normalizado)).toMatch(/^[0-9a-f]{64}$/);
+    }
+  });
+})
 
 describeDb("SLICE_03A.1 — jornada e gates (POSTGRESQL_INTEGRATION)", () => {
   let pool: PoolTipado | undefined;
@@ -1425,5 +1765,175 @@ describeDb("SLICE_03A.1 — corridas, falhas e restart (POSTGRESQL_INTEGRATION)"
     } finally {
       await poolNovaInstancia.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02 (F8) — APPROVAL_REVALIDATED_BEFORE_CLAIM (PostgreSQL 16):
+// antes de claim/evento/token/provider, o preflight revalida a aprovação
+// congelada. Tampering de QUALQUER input canônico ⇒ BLOQUEADO estável com
+// CLAIMS=0, EXEC_EVENTS=0, TOKEN_LOADS=0, PROVIDER_CALLS=0 (GMAIL_CALLS=0 —
+// provider é fake injetado e a rede é fisicamente ausente neste módulo).
+// Snapshot válido ⇒ execução EXISTENTE inalterada (cenas acima).
+// ---------------------------------------------------------------------------
+describeDb("GF3 C2 F8 — revalidação da aprovação antes do claim (PostgreSQL 16)", () => {
+  let pool: PoolTipado | undefined;
+  const operadorId = randomUUID();
+  const itemSaoId = randomUUID();
+  const itemPrefilledId = randomUUID();
+  const itemTamperHashId = randomUUID();
+  const itemTamperHashVersionId = randomUUID();
+  const itemTamperFpId = randomUUID();
+  const itemValidoId = randomUUID();
+  let cenaOk: CenaLote;
+  let cenaTamper: CenaLote;
+  let cenaTamperFp: CenaLote;
+
+  beforeAll(async () => {
+    const { NodePostgresPool } = await import("@integra-correios/persistence");
+    pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE!, max: 4 });
+    await criarOperadorSintetico(pool, operadorId, "EXEC-F8");
+    // Cena ÍNTEGRA: claim e execução existentes INALTERADOS (prova negativa).
+    cenaOk = await criarCenaLote(pool, {
+      operatorId: operadorId,
+      estadoLote: "ATIVO",
+      itens: [
+        { id: itemSaoId, estado: "PREPARADO" },
+        { id: itemValidoId, estado: "PREPARADO" },
+      ],
+    });
+    // Cena ADULTERADA no snapshot (campo prefilled + template_content_hash)
+    // e no hash persistido (campanha e approval_hash_version):
+    cenaTamper = await criarCenaLote(pool, {
+      operatorId: operadorId,
+      estadoLote: "ATIVO",
+      itens: [
+        { id: itemPrefilledId, estado: "PREPARADO" },
+        { id: itemTamperHashId, estado: "PREPARADO" },
+        { id: itemTamperHashVersionId, estado: "PREPARADO" },
+      ],
+    });
+    // Tampering 1: campo PREFILLED do snapshot (nome do registro ordem 1).
+    await pool.query(
+      "UPDATE campanha_persistida SET snapshot_registros = jsonb_set(snapshot_registros, '{registros,0,nome}', to_jsonb('Nome Adulterado F8'::text)) WHERE id = $1",
+      [cenaTamper.campanhaId],
+    );
+    // Tampering 2: hash_aprovacao persistido diverge do snapshot congelado.
+    await pool.query(
+      "UPDATE campanha_persistida SET hash_aprovacao = $2 WHERE id = $1",
+      [cenaTamper.campanhaId, createHash("sha256").update("f8-tamper-hash").digest("hex")],
+    );
+    // Tampering 3: approval_hash_version inválido (contrato desconhecido).
+    await pool.query(
+      "UPDATE campanha_persistida SET snapshot_registros = jsonb_set(snapshot_registros, '{approval_hash_version}', to_jsonb('CAMPANHA_APROVACAO_V9'::text)) WHERE id = $1",
+      [cenaTamper.campanhaId],
+    );
+    // Cena ADULTERADA no template_content_hash (versão de outra fixture):
+    cenaTamperFp = await criarCenaLote(pool, {
+      operatorId: operadorId,
+      estadoLote: "ATIVO",
+      itens: [{ id: itemTamperFpId, estado: "PREPARADO" }],
+    });
+    await pool.query(
+      "UPDATE campanha_persistida SET snapshot_registros = jsonb_set(snapshot_registros, '{template_content_hash}', to_jsonb($2::text)) WHERE id = $1",
+      [cenaTamperFp.campanhaId, createHash("sha256").update("f8-tamper-contenthash").digest("hex")],
+    );
+  });
+
+  afterAll(async () => {
+    await pool?.close();
+  });
+
+  it("snapshot válido: execução existente INALTERADA (claim → provider → receipt → settlement)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaOk.campanhaId,
+      loteCampanhaId: cenaOk.loteCampanhaId,
+      itemId: itemValidoId,
+    });
+    expect(resultado.resultado).toBe("ENVIADO");
+    expect(provider.chamadas).toBe(1);
+    expect(await contarEventos(pool!, itemValidoId, "EXEC_CLAIM")).toBe(1);
+    expect(await estadoDoItem(pool!, itemValidoId)).toBe("ENVIADO");
+  });
+
+  it("tampering de campo PREFILLED do snapshot ⇒ BLOQUEADO, CLAIMS=0/EXEC_EVENTS=0/PROVIDER=0", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const eventosAntes = await pool!.query(
+      "SELECT count(*)::int AS total FROM evento_auditoria WHERE agregado_id = $1",
+      [itemPrefilledId],
+    );
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaTamper.campanhaId,
+      loteCampanhaId: cenaTamper.loteCampanhaId,
+      itemId: itemPrefilledId,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["APPROVAL_REVALIDACAO_FALHOU"]);
+    expect(provider.chamadas).toBe(0); // PROVIDER_CALLS=0
+    expect(await estadoDoItem(pool!, itemPrefilledId)).toBe("PREPARADO"); // CLAIMS=0
+    const eventosDepois = await pool!.query(
+      "SELECT count(*)::int AS total FROM evento_auditoria WHERE agregado_id = $1",
+      [itemPrefilledId],
+    );
+    expect(
+      (eventosDepois.rows[0] as { total: number }).total,
+    ).toBe((eventosAntes.rows[0] as { total: number }).total); // EXEC_EVENTS=0
+  });
+
+  it("tampering de campanha.hash_aprovacao ⇒ BLOQUEADO (hash revalidado ≠ persistido)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaTamper.campanhaId,
+      loteCampanhaId: cenaTamper.loteCampanhaId,
+      itemId: itemTamperHashId,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["APPROVAL_REVALIDACAO_FALHOU"]);
+    expect(provider.chamadas).toBe(0);
+    expect(await estadoDoItem(pool!, itemTamperHashId)).toBe("PREPARADO");
+  });
+
+  it("approval_hash_version inválido ⇒ BLOQUEADO (fail-closed, sem downgrade)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaTamper.campanhaId,
+      loteCampanhaId: cenaTamper.loteCampanhaId,
+      itemId: itemTamperHashVersionId,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["APPROVAL_REVALIDACAO_FALHOU"]);
+    expect(provider.chamadas).toBe(0);
+    expect(await estadoDoItem(pool!, itemTamperHashVersionId)).toBe("PREPARADO");
+  });
+
+  it("tampering de template_content_hash do snapshot ⇒ BLOQUEADO (registry ≠ congelado)", async () => {
+    const provider = new ProvedorFakeCampanha();
+    const resultado = await executar(pool!, provider, {
+      operatorId: operadorId,
+      campanhaId: cenaTamperFp.campanhaId,
+      loteCampanhaId: cenaTamperFp.loteCampanhaId,
+      itemId: itemTamperFpId,
+    });
+    expect(resultado.resultado).toBe("NAO_CLAIMADO");
+    if (resultado.resultado !== "NAO_CLAIMADO") return;
+    expect(resultado.claim.resultado).toBe("BLOQUEADO");
+    if (resultado.claim.resultado !== "BLOQUEADO") return;
+    expect(resultado.claim.bloqueios).toEqual(["APPROVAL_REVALIDACAO_FALHOU"]);
+    expect(provider.chamadas).toBe(0);
+    expect(await estadoDoItem(pool!, itemTamperFpId)).toBe("PREPARADO");
   });
 });

@@ -140,6 +140,50 @@ describe("retomada cross-browser — destinos derivados (UX-FLOW-01B)", () => {
     expect(visao.foco).toContain("Acompanhamento");
   });
 
+  it("GF4.3D: SINGLE LOTE_CRIADO/PREPARADO ou ATIVO → Operação/acompanhamento (macroetapa 4, NUNCA import)", () => {
+    for (const loteEstado of ["PREPARADO", "ATIVO"] as const) {
+      const resumo: CampanhaRetomavelResumo = {
+        ...base,
+        estado: "LOTE_CRIADO",
+        loteId: "lote-gf43d",
+        loteCodigo: "CAMPANHA_PF_AF75C4B48D7C",
+        loteEstado,
+        outboxTotal: 1,
+        outboxNaoExecutavel: loteEstado === "PREPARADO" ? 1 : 0,
+      };
+      const disposicao = disposicaoRetomada([resumo]);
+      expect(disposicao.tipo).toBe("ACOMPANHAMENTO");
+      if (disposicao.tipo !== "ACOMPANHAMENTO") continue;
+      const visao = macroEtapaAtual({
+        sessaoAtiva: true,
+        baseAvaliada: false,
+        decisoesPendentes: false,
+        aprovacaoPresente: false,
+        campanha: {
+          estado: disposicao.campanha.estado,
+          loteId: disposicao.campanha.loteId,
+          loteEstado: disposicao.campanha.loteEstado,
+        },
+      });
+      expect(visao.macro).toBe(4);
+      expect(visao.macroId).toBe("OPERACAO");
+      expect(visao.foco).toContain("Acompanhamento");
+      expect(visao.macro).not.toBe(2);
+    }
+  });
+
+  it("GF4.3D: derivação da macroetapa não filtra por HOLD — qualquer lote não-nulo é acompanhamento (fonte real)", () => {
+    const caminhoMacro = resolve(diretorioAtual, "../src/pages/campaign-macro-stage.ts");
+    const fonteMacro = existsSync(caminhoMacro) ? readFileSync(caminhoMacro, "utf-8") : "";
+    expect(fonteMacro.length).toBeGreaterThan(0);
+    expect(fonteMacro).toContain("if (campanha.loteId !== null && campanha.loteEstado !== null)");
+    const inicio = fonteMacro.indexOf("export function macroEtapaAtual");
+    const fim = fonteMacro.indexOf("function visao(");
+    expect(inicio).toBeGreaterThanOrEqual(0);
+    expect(fim).toBeGreaterThan(inicio);
+    expect(fonteMacro.slice(inicio, fim)).not.toContain('"HOLD"');
+  });
+
   it("EMPTY → Preparação (nada selecionado pelo cliente)", () => {
     const disposicao = disposicaoRetomada([]);
     expect(disposicao.tipo).toBe("SEM_RETOMADA");
@@ -184,11 +228,14 @@ describe("GATE: SERVER-DRIVEN RECOVERY AUTHORITY — efeito legado removido (fon
     expect(recorte).not.toContain("/api/campaigns/persisted");
   });
 
-  it("B·D: efeitos de retomada são EXATAMENTE 4 — sem efeito de hash (request por hash não pode iniciar nem concorrer)", () => {
-    // UX-FLOW-01B.1: loadMe, workspace/status, descoberta + readiness 03B
-    // (slice-03B: efeito read-only de /api/campaigns/operational-readiness).
+  it("B·D: efeitos são EXATAMENTE 7 (GF-2 FINAL: +catálogo server-driven +prévia server-side; GF-3 F6: +blob URL da credencial) — sem efeito de hash (request por hash não pode iniciar nem concorrer)", () => {
+    // UX-FLOW-01B.1: loadMe, workspace/status, descoberta + readiness 03B.
+    // GF-2 FINAL: efeitos read-only de /api/campaigns/template-selecionaveis
+    // (catálogo do registry) e de /api/campaigns/preview-registro (prévia
+    // pelo MESMO renderer do envio). GF-3 CORRECTIVE-01 (F6): ciclo de vida
+    // do blob URL da credencial (create/revoke). Nenhum efeito de hash legado.
     const usos = fonteComponente.split("useEffect(").length - 1;
-    expect(usos).toBe(4);
+    expect(usos).toBe(7);
   });
 
   it("C·F: ciclo de hash EXTINTO — zero leitura e zero gravação de ic_campanha_hash (UX-FLOW-01B.1)", () => {
@@ -232,9 +279,9 @@ describe("GATE: SERVER-DRIVEN RECOVERY AUTHORITY — efeito legado removido (fon
     expect(recorte.split("let ativo = true;").length - 1).toBe(1);
     expect(recorte.split("ativo = false;").length - 1).toBe(1);
     expect(recorte).toContain("if (!ativo) return;");
-    // File-wide: cleanup `ativo` nos 3 efeitos async restantes (status +
-    // descoberta + readiness 03B).
-    expect(fonteComponente.split("let ativo = true;").length - 1).toBe(3);
+    // File-wide: cleanup `ativo` nos 5 efeitos async (status + descoberta +
+    // readiness 03B + catálogo GF-2 FINAL + prévia server-side GF-2 FINAL).
+    expect(fonteComponente.split("let ativo = true;").length - 1).toBe(5);
   });
 
   it("J: retomada é ZERO-MUTAÇÃO — nenhum POST na janela server-driven", () => {
@@ -281,5 +328,229 @@ describe("GATE: ciclo de hash extinto — Session Storage não é autoridade", (
     const recorte = fonteComponente.slice(janela, fimJanela);
     expect(recorte).not.toContain("/api/campaigns/persisted");
     expect(recorte).not.toContain("fetch(");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-01 (F2) — CROSS_OPERATOR_WORKSPACE_STATE = ISOLATED:
+// o logout confirmado limpa TODO o estado ligado ao operador montado. Prova
+// estrutural sobre a fonte real (mesmo mecanismo dos gates anteriores —
+// ambiente node, sem jsdom): a função canônica limparEstadoOperador é
+// declarada UMA vez, referenciada pelo logout SIGNED_OUT, e cobre cada
+// setter do estado do operador. Nenhuma persistência/localStorage.
+// ---------------------------------------------------------------------------
+describe("GF3 F2 — isolamento de estado entre operadores no logout", () => {
+  const blocoLimpeza = (): string => {
+    const inicio = fonteComponente.indexOf("const limparEstadoOperador = () => {");
+    const fim = fonteComponente.indexOf("const [painelAdmin, setPainelAdmin]");
+    expect(inicio).toBeGreaterThan(0);
+    expect(fim).toBeGreaterThan(inicio);
+    return fonteComponente.slice(inicio, fim);
+  };
+
+  it("PREVIOUS_OPERATOR_DATA_VISIBLE=false: limparEstadoOperador cobre os 18 estados do operador", () => {
+    const bloco = blocoLimpeza();
+    for (const chamada of [
+      "setArquivo(null);",
+      "setAvaliacaoArquivo(null);",
+      "setMapeamento({});",
+      "setBase(null);",
+      "setAprovacao(null);",
+      "setConfirmacaoAprovacao(\"\");",
+      "setExcluidos([]);",
+      "setPreviaIndice(0);",
+      "setErroEtapa(\"\");",
+      "setPainelAdmin(false);",
+      "setOperadores([]);",
+      "setCredencialUnica(null);",
+      "setCredencialSalvaConfirmada(false);",
+      "setAcaoMensagem(\"\");",
+      "setAcaoErro(\"\");",
+      "setCampanha(null);",
+      "setRetomada(LIMPEZA_RETOMADA.retomada);",
+      "setModoRetomada(LIMPEZA_RETOMADA.modo);",
+    ]) {
+      expect(bloco).toContain(chamada);
+    }
+  });
+
+  it("logout SIGNED_OUT invoca a limpeza canônica UMA vez + me/token; operador anterior não sobrevive", () => {
+    const blocoLogout = mid('if (campaignLogoutDisposition(response.status) === "SIGNED_OUT")');
+    const fimLogout = blocoLogout.indexOf("setFeedback(\"Não foi possível confirmar a saída");
+    const recorte = fimLogout > 0 ? blocoLogout.slice(0, fimLogout) : blocoLogout;
+    expect(recorte.split("limparEstadoOperador();").length - 1).toBe(1);
+    expect(recorte).toContain("setMe(null);");
+    expect(recorte).toContain('setToken("");');
+    // Nenhum setter operacional sobrevive fora da limpeza canônica no logout
+    // (todos os resets passam a passar por limparEstadoOperador).
+    for (const proibido of [
+      "setArquivo(null);",
+      "setBase(null);",
+      "setAprovacao(null);",
+      "setCredencialUnica(null);",
+      "setOperadores([]);",
+    ]) {
+      expect(recorte).not.toContain(proibido);
+    }
+    // Retomada server-driven (me=null) zera campanha/modo/retomada — nenhuma
+    // request pendente do operador A restaura estado para o operador B.
+    const blocoRetomada = mid('if (!me) {');
+    expect(blocoRetomada).toContain('setModoRetomada("INDEFINIDO")');
+    expect(blocoRetomada).toContain("setCampanha(null)");
+  });
+
+  it("nenhuma persistência/localStorage para estado do operador", () => {
+    expect(fonteComponente).not.toContain("localStorage.");
+    expect(fonteComponente).not.toContain("localStorage[");
+    // sessionStorage permanece restrito à limpeza HISTÓRICA do hash legado.
+    expect(fonteComponente.split("sessionStorage.").length - 1).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-01 (F6) — CREDENTIAL_BLOB_URL_REVOKED: UM URL por
+// credencial, criado em useEffect (NUNCA no JSX/render) e revogado quando a
+// credencial muda, o modal fecha ou o componente desmonta.
+// ---------------------------------------------------------------------------
+describe("GF3 F6 — ciclo de vida do blob URL da credencial", () => {
+  it("URL.createObjectURL só existe dentro do useEffect (nunca no JSX)", () => {
+    expect(fonteComponente.split("URL.createObjectURL(").length - 1).toBe(1);
+    expect(fonteComponente.split("URL.revokeObjectURL(").length - 1).toBe(1);
+    const inicioEfeito = fonteComponente.indexOf("const [credencialBlobUrl, setCredencialBlobUrl]");
+    const efeito = fonteComponente.slice(inicioEfeito);
+    const blocoEfeito = efeito.slice(efeito.indexOf("useEffect(() => {"), efeito.indexOf("}, [credencialUnica]);"));
+    expect(blocoEfeito).toContain("URL.createObjectURL(");
+    expect(blocoEfeito).toContain("URL.revokeObjectURL(url);");
+  });
+
+  it("dependência [credencialUnica] revoga na troca/fechamento; cleanup cobre desmontagem; JSX usa credencialBlobUrl", () => {
+    expect(fonteComponente).toContain("}, [credencialUnica]);");
+    const inicioEfeito = fonteComponente.indexOf("const [credencialBlobUrl, setCredencialBlobUrl]");
+    const efeito = fonteComponente.slice(inicioEfeito, inicioEfeito + 1200);
+    expect(efeito).toContain("if (!credencialUnica) {");
+    expect(efeito).toContain("setCredencialBlobUrl(null);");
+    expect(fonteComponente).toContain('href={credencialBlobUrl ?? undefined}');
+    expect(fonteComponente).not.toContain("href={URL.createObjectURL");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02 (F5) — CROSS_OPERATOR_TEMPLATE_STATE / PREVIEW_STATE:
+// o logout confirmado limpa TAMBÉM os estados de template/prévia (catálogo,
+// seleção, prévia renderizada, índice, carregando, erro). Nenhum localStorage/
+// sessionStorage. Prova estrutural sobre a fonte real (mesmo mecanismo GF3 F2).
+// ---------------------------------------------------------------------------
+describe("GF3 C2 F5 — logout isola estados de template/prévia entre operadores", () => {
+  const blocoLimpeza = (): string => {
+    const inicio = fonteComponente.indexOf("const limparEstadoOperador = () => {");
+    const fim = fonteComponente.indexOf("const [painelAdmin, setPainelAdmin]");
+    expect(inicio).toBeGreaterThan(0);
+    expect(fim).toBeGreaterThan(inicio);
+    return fonteComponente.slice(inicio, fim);
+  };
+
+  it("limparEstadoOperador cobre os estados de template/prévia (F5)", () => {
+    const bloco = blocoLimpeza();
+    for (const chamada of [
+      "setTemplatesSelecionaveis([]);",
+      "setTemplateSelecionada(\"\");",
+      "setPreviaMensagemServidor(null);",
+      "setPreviaIndice(0);",
+      "setPreviaCarregando(false);",
+      "setPreviaErro(\"\");",
+    ]) {
+      expect(bloco).toContain(chamada);
+    }
+  });
+
+  it("logout SIGNED_OUT segue pela limpeza canônica (sem resets paralelos de template/prévia)", () => {
+    const blocoLogout = mid('if (campaignLogoutDisposition(response.status) === "SIGNED_OUT")');
+    const recorte = blocoLogout.slice(0, blocoLogout.indexOf("setFeedback"));
+    expect(recorte.split("limparEstadoOperador();").length - 1).toBe(1);
+    // Nenhum reset de template/prévia fora da limpeza canônica:
+    for (const proibido of [
+      "setTemplatesSelecionaveis([]);",
+      "setTemplateSelecionada(\"\");",
+      "setPreviaMensagemServidor(null);",
+    ]) {
+      expect(recorte).not.toContain(proibido);
+    }
+  });
+
+  it("sem persistência/localStorage de catálogo/seleção/prévia", () => {
+    expect(fonteComponente).not.toContain("localStorage.");
+    expect(fonteComponente).not.toContain("templatesSelecionaveis`");
+    expect(fonteComponente.split("sessionStorage.").length - 1).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02 (F6) — TEMPLATE_CATALOG_FOLLOWS_SESSION: o catálogo só
+// é requisitado com sessão autenticada; sem `me` ⇒ catálogo limpo e NENHUMA
+// request; troca de operador ⇒ resposta stale ignorada (cleanup `ativo`) e
+// recarga. Sem polling (dependência única [me]).
+// ---------------------------------------------------------------------------
+describe("GF3 C2 F6 — catálogo segue o ciclo de vida da sessão", () => {
+  it("efeito do catálogo depende de `me` (sem request desautenticado; sem polling)", () => {
+    const inicio = fonteComponente.indexOf("catálogo de templates selecionáveis vem SEMPRE do servidor");
+    expect(inicio).toBeGreaterThan(0);
+    const fim = fonteComponente.indexOf("}, [me]);", inicio);
+    expect(fim).toBeGreaterThan(inicio);
+    const bloco = fonteComponente.slice(inicio, fim + "}, [me]);".length);
+    expect(bloco).toContain("if (!me) {");
+    expect(bloco).toContain("setTemplatesSelecionaveis([]);");
+    expect(bloco).toContain('"/api/campaigns/template-selecionaveis"');
+    expect(bloco).toContain("let ativo = true;");
+    expect(bloco).toContain("ativo = false;");
+    // Dependência ÚNICA [me] — sem polling:
+    expect(bloco.endsWith("}, [me]);")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF-3 CORRECTIVE-02 (F7-UI) — PREVIEW_INDEX_FOLLOWS_NAVIGATION: a prévia
+// pré-aprovação usa POST /api/campaigns/template-preview com o MESMO payload
+// pendente do authorize e o índice navegável previaIndice — nada de linha=1
+// fixa. O browser NUNCA fornece subject/texto/HTML/remetente/Reply-To.
+// ---------------------------------------------------------------------------
+describe("GF3 C2 F7-UI — prévia pré-aprovação navega por previaIndice (server-rendered)", () => {
+  it("efeito da prévia usa POST template-preview + previaIndice (sem linha=1)", () => {
+    const inicio = fonteComponente.indexOf("PRÉVIA PRÉ-APROVAÇÃO");
+    expect(inicio).toBeGreaterThan(0);
+    const fim = fonteComponente.indexOf("}, [templateSelecionada, previaIndice, aptosParaAprovacao]);", inicio);
+    expect(fim).toBeGreaterThan(inicio);
+    const bloco = fonteComponente.slice(inicio, fim);
+    expect(bloco).toContain('"/api/campaigns/template-preview"');
+    expect(bloco).toContain("method: \"POST\"");
+    expect(bloco).toContain("previaIndice: indiceSolicitado + 1");
+    expect(bloco).toContain("templateVersao: templateSelecionada");
+    expect(bloco).toContain("registros: aptosParaAprovacao.map");
+    // NUNCA mais chamada GET do preview-registro (com query) nem linha=1
+    // no fluxo pré-aprovação (a menção no comentário é do fluxo separado):
+    expect(bloco).not.toContain("preview-registro?");
+    expect(bloco).not.toContain("linha=1");
+    // O browser não fornece conteúdo de mensagem:
+    expect(bloco).not.toContain("subject:");
+    expect(bloco).not.toContain("textBody:");
+    expect(bloco).not.toContain("htmlBody:");
+    expect(bloco).not.toContain("replyTo");
+    // Cleanup stale presente:
+    expect(bloco).toContain("ativo = false;");
+  });
+
+  it("fonte: nenhuma CHAMADA ao preview-registro permanece e linha=1 foi extinta", () => {
+    expect(fonteComponente).not.toContain("preview-registro?");
+    expect(fonteComponente).not.toContain("linha=1");
+    // As únicas menções restantes são comentários de contrato (fluxo
+    // pós-persist separado no servidor):
+    for (const mencao of fonteComponente.split("preview-registro")) {
+      // nenhuma menção é uma chamada fetchJson direta
+      expect(mencao.startsWith("fetchJson")).toBe(false);
+    }
+  });
+
+  it("erro de prévia é estado do operador e é renderizado (role=alert)", () => {
+    expect(fonteComponente).toContain("const [previaErro, setPreviaErro] = useState(\"\");");
+    expect(fonteComponente).toContain('role="alert">{previaErro}</p>');
   });
 });

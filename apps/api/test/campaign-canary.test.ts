@@ -46,6 +46,12 @@ import {
   injetarProvedorCanarioParaTeste,
 } from "../src/server.js";
 import { chaveIdempotenciaExecucao } from "../src/campaign-execution.js";
+// GF-3 CORRECTIVE-02 (F8) — a fixture V2 é construída com os helpers
+// canônicos de PRODUÇÃO (mesmo padrão da fixture do campaign-execution).
+import {
+  contentHashDoTemplateSelecionado,
+  hashAprovacaoCampanha,
+} from "../src/campaigns.js";
 import {
   ACAO_AUTORIZADA_EXECUCAO,
   fingerprintDestinatarioCampanha,
@@ -518,6 +524,8 @@ describe("SLICE_03C.2A.1 — mapeamento do provider (erros → resultado, AUTO_R
         {
           ordem: 1,
           estado: "ENFILEIRADO",
+          template_versao: "pf-expedicao-carteira-2026-v2",
+          hash_aprovacao: "b".repeat(64),
           destinatario_fingerprint: fingerprintDestinatarioCampanha("canario.classe@exemplo.test"),
           snapshot_registros: {
             registros: [
@@ -634,6 +642,53 @@ describe("SLICE_03C.2A.1 — mapeamento do provider (erros → resultado, AUTO_R
     } as never);
     const resultado = await provider.enviar(comando);
     expect(resultado.tipo).toBe("ENVIADO");
+  });
+
+  it("2B1D-H. provider resolve pela versão CONGELADA no lote: versão não registrada ⇒ FALHA_PRE_PROVIDER sanitizada, zero gateway", async () => {
+    let chamadasGateway = 0;
+    const gatewayEspiao = {
+      send: async () => {
+        chamadasGateway += 1;
+        throw new Error("gateway não deveria ser invocado com versão inválida");
+      },
+      getStatus: async () => {
+        throw new Error("n/a");
+      },
+    } as never;
+    // Linha com versão DESCONHECIDA: falha sanitizada ANTES do gateway.
+    const providerComVersao = new ProvedorGmailCampanha({
+      pool: {
+        query: async () => ({
+          rows: [
+            {
+              ordem: 1,
+              estado: "ENFILEIRADO",
+              template_versao: "versao-sintetica-nao-registrada-2B1D",
+              hash_aprovacao: "",
+              destinatario_fingerprint: fingerprintDestinatarioCampanha("canario.classe@exemplo.test"),
+              snapshot_registros: {
+                registros: [
+                  {
+                    profissional_id: "PF-CLS-0001",
+                    nome: "Sintetico Classe",
+                    email_normalizado: "canario.classe@exemplo.test",
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      } as never,
+      campanhaId: randomUUID(),
+      gateway: gatewayEspiao,
+      env: { CAMPAIGN_SENDER_ADDRESS: "carteiras@crtba.org.br" },
+    });
+    const resultado = await providerComVersao.enviar(comando);
+    expect(resultado).toEqual({
+      tipo: "FALHA_PRE_PROVIDER",
+      motivo: "TEMPLATE_VERSAO_NAO_REGISTRADA",
+    });
+    expect(chamadasGateway).toBe(0);
   });
 });
 
@@ -803,6 +858,20 @@ describe("SLICE_03C.2A — HTTP fail-closed (contrato determinístico)", () => {
     expect(resposta.corpo).toContain("INDIVIDUAL_OPERATOR_AUTH_REQUIRED");
   });
 
+  it("GF3 F1 — canary-send exige EXECUTOR: 403 OPERATOR_ROLE_FORBIDDEN ANTES de política/preflight (zero claim/token/provider/rede)", async () => {
+    // Sessão com formato válido (cookie __Host-): a resolução de identidade
+    // exige banco; sem DATABASE_URL a rota responde 401/503 — a prova
+    // determinística dos 403 por papel é DB-gated (Parte 5). Aqui provamos
+    // APENAS que a rota NUNCA responde 409 CAMPAIGN_CANARY_SEND_DISABLED sem
+    // sessão EXECUTOR (a guarda de papel precede a checagem de política).
+    const resposta = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
+      headers: { cookie: COOKIE_SESSAO },
+      corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+    });
+    expect(resposta.status).not.toBe(409);
+    expect(resposta.corpo).not.toContain("CAMPAIGN_CANARY_SEND_DISABLED");
+  });
+
   it("corpo com autoridade adicional → 401 (auth precede validação do corpo); nunca 200", async () => {
     const comExtras = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
       headers: { cookie: COOKIE_SESSAO },
@@ -896,6 +965,49 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE!, max: 4 });
   });
 
+  // GF-3 CORRECTIVE-01 (F1) — matriz de autoridade do canário: somente
+  // EXECUTOR passa da guarda de papel. Qualquer outro papel ⇒ 403 estável
+  // ANTES de preflight/claim/token/provider (zero claim, zero rede).
+  it("2B1A-F1. CANARY_REQUIRES_EXECUTOR: PREPARADOR/REVISOR/APROVADOR/SUPERVISOR ⇒ 403; EXECUTOR segue para os gates normais", async () => {
+    adminCookie = await bootstrapAdmin();
+    const preparador = await provisionarOperadorPapeis(["PREPARADOR"]);
+    const revisor = await provisionarOperadorPapeis(["REVISOR"]);
+    const aprovador = await provisionarOperadorPapeis(["APROVADOR"]);
+    const supervisor = await provisionarOperadorPapeis(["SUPERVISOR"]);
+    const executor = await provisionarOperadorPapeis(["EXECUTOR"]);
+
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    try {
+      for (const [rotulo, cookie] of [
+        ["PREPARADOR", preparador],
+        ["REVISOR", revisor],
+        ["APROVADOR", aprovador],
+        ["SUPERVISOR", supervisor],
+      ] as const) {
+        const resposta = await despachar("POST", "/api/campaigns/canary-send", {
+          headers: { cookie, "content-type": "application/json" },
+          corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+        });
+        expect(resposta.status, `papel ${rotulo} deveria ser 403`).toBe(403);
+        expect(resposta.corpo).toContain("OPERATOR_ROLE_FORBIDDEN");
+      }
+      // EXECUTOR: a guarda de papel é SUPERADA — a execução segue para os
+      // gates normais (política canarySendEnabled fechada por padrão ⇒ 409
+      // CAMPAIGN_CANARY_SEND_DISABLED é a resposta esperada neste cenário).
+      const executorResposta = await despachar("POST", "/api/campaigns/canary-send", {
+        headers: { cookie: executor, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+      });
+      expect(executorResposta.status).toBe(409);
+      expect(executorResposta.corpo).toContain("CAMPAIGN_CANARY_SEND_DISABLED");
+      // Nenhuma chamada de rede em NENHUM cenário da matriz.
+      expect(espiaoRede).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   // 03C.2A.4 — registro da cena (prova estrutural; nenhuma variável de
   // repositório é lida ou alterada — a matriz é constante do próprio teste).
   let matrizCenarioRegistrada: readonly [CenarioCanario, boolean, boolean, boolean] | undefined;
@@ -935,6 +1047,30 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     fingerprints: readonly string[];
   }
 
+  /**
+   * GF3 F1 — provisiona operador com papéis EXATOS e devolve o cookie de
+   * sessão (mesmo contrato admin/provision + session dos testes 2B1A-H*).
+   */
+  async function provisionarOperadorPapeis(papeis: readonly string[]): Promise<string> {
+    const credencial = tokenSintetico("f1-" + papeis.join("-"));
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: adminCookie, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-F1-" + randomUUID().slice(0, 8),
+        displayName: "Operador F1 " + papeis.join("+"),
+        roles: [...papeis],
+        credentialHash: createHash("sha256").update(credencial).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencial })),
+    });
+    expect(login.status).toBe(200);
+    return firstCookie(login.headers["set-cookie"]);
+  }
+
   async function criarCenaCanario(params: {
     readonly operatorId: string;
     readonly emails: readonly string[];
@@ -947,20 +1083,41 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     const agora = new Date().toISOString();
     // C — identidade ÚNICA da cena (hex 64): evita colisão em
     // UNIQUE(fingerprint_arquivo, hash_aprovacao) entre cenas consecutivas.
-    const hashAprovacao = fingerprintUnico("aprovacao-" + campanhaId);
-    const fingerprintArquivo = fingerprintUnico("arquivo-" + campanhaId);
+    // GF-3 CORRECTIVE-02 (F8) — a fixture é V2 CONSISTENTE: snapshot com
+    // versão + contentHash + marcador de contrato, e hash_aprovacao
+    // recalculado pelo dispatcher canônico de produção sobre EXATAMENTE o
+    // snapshot persistido (RECOMPUTATION_INPUT_COMPLETE; nada de hash
+    // sintético a-CANÔNICO). Única fonte de unicidade: o e-mail sintético
+    // (contentHash/registros derivam dele; campanhaId entra no
+    // fingerprint_arquivo para a UNIQUE do schema).
     const registros = params.emails.map((email, indice) => ({
       profissional_id: "PF-CNR-" + String(indice + 1).padStart(4, "0"),
       nome: "Sintetico Canary " + String(indice + 1),
       email_normalizado: email,
       status_validacao: "APTO",
     }));
+    const contentHashCanario = contentHashDoTemplateSelecionado("pf-expedicao-carteira-2026-v2") ?? "";
+    const snapshot = {
+      template_versao: "pf-expedicao-carteira-2026-v2",
+      template_content_hash: contentHashCanario,
+      approval_hash_version: "CAMPANHA_APROVACAO_V2" as const,
+      registros,
+    };
+    // Hash da aprovação: dispatcher canônico de PRODUÇÃO sobre o snapshot
+    // EXATO persistido (GF-3 CORRECTIVE-02/F8 — RECOMPUTATION_INPUT_COMPLETE).
+    const hashAprovacao = hashAprovacaoCampanha({
+      contrato: "CAMPANHA_APROVACAO_V2" as const,
+      templateVersao: snapshot.template_versao,
+      templateContentHash: snapshot.template_content_hash,
+      registros,
+    });
+    const fingerprintArquivo = fingerprintUnico("arquivo-" + campanhaId);
     await p.query(
-      "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'CNR_TESTE_V1', $4, $5::jsonb, $6, $6, 0, $6, 'LOTE_CRIADO', $7, $7)",
-      [campanhaId, params.operatorId, fingerprintArquivo, hashAprovacao, JSON.stringify({ registros, total: registros.length }), registros.length, agora],
+      "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'pf-expedicao-carteira-2026-v2', $4, $5::jsonb, $6, $6, 0, $6, 'LOTE_CRIADO', $7, $7)",
+      [campanhaId, params.operatorId, fingerprintArquivo, hashAprovacao, JSON.stringify(snapshot), registros.length, agora],
     );
     await p.query(
-      "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'CNR_TESTE_V1', $4, $5, $6)",
+      "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'pf-expedicao-carteira-2026-v2', $4, $5, $6)",
       [loteCampanhaId, campanhaId, "CNR_LOTE_" + loteCampanhaId.slice(0, 8), params.estadoLote ?? "ATIVO", registros.length, agora],
     );
     const fingerprints: string[] = [];

@@ -1,0 +1,39 @@
+{
+  "goldenVersion": 1,
+  "sintetico": true,
+  "nota": "Golden DURÁVEL do registry v2 (GF-2 CORRETIVO §6). Dados 100% sintéticos (nome fictício, endereço fictício, domínio .test, correlationCode fixo sem PII, nenhum UUID operacional, nenhum dado dos XLSX de referência). Comparação INTEGRAL via API pública real do registry: templateId, templateVersion, status, scope, dataMode, subject, textBody, htmlBody, metadados públicos, contentHash e definitionHash.",
+  "renderInput": {
+    "professionalName": "Profissional Teste",
+    "correlationCode": "PF26PREVIEW000000000000000000000000",
+    "exibicao": {
+      "telefone": "(00) 00000-0000",
+      "cep": "00000-000",
+      "logradouro": "Rua Teste",
+      "numero": "123",
+      "complemento": "S/N",
+      "bairro": "Bairro Teste",
+      "cidade": "Salvador",
+      "uf": "BA"
+    },
+    "remetente": {
+      "name": "CRT-BA | Carteiras Profissionais",
+      "address": "carteiras@crtba.org.br"
+    }
+  },
+  "templateId": "PF_EXPEDICAO_CARTEIRA",
+  "templateVersion": "pf-expedicao-carteira-2026-v2",
+  "status": "APPROVED",
+  "scope": "PF_CAMPAIGN",
+  "dataMode": "PREFILLED_CONFIRMATION",
+  "subject": "Campanha de Atualização Cadastral e Expedição da Carteira Profissional — CRTBA",
+  "textBody": "Prezado(a) profissional,\n\nInformamos que sua carteira profissional física do Conselho Regional dos\nTécnicos Industriais da Bahia (CRTBA) está pronta para envio.\n\nPara garantir a correta expedição do documento, solicitamos a conferência e\nconfirmação dos seus dados cadastrais antes da emissão da ordem de postagem.\n\nDados cadastrais para confirmação\n\nNome Completo: Profissional Teste\nLogradouro / Endereço: Rua Teste\nNúmero: 123\nComplemento: S/N\nBairro: Bairro Teste\nCidade / UF: Salvador / BA\nCEP: 00000-000\nTelefone Principal: (00) 00000-0000\nWhatsApp Atualizado: informar/confirmar na resposta\n\nPrazo de confirmação\n\nPedimos que responda a esta mensagem ou atualize suas informações no\nSINCETI em até 5 (cinco) dias úteis, para inclusão no lote prioritário de\nenvio.\n\nHavendo divergência nos dados de endereçamento, a postagem poderá\npermanecer temporariamente pendente até a regularização cadastral.\n\nApós a postagem, as informações de rastreamento serão disponibilizadas\npelos canais institucionais aplicáveis.\n\nPara orientações adicionais, acesse www.crtba.org.br ou utilize os canais\noficiais de atendimento do CRT-BA.\n\nProtocolo: PF26PREVIEW000000000000000000000000\n\nAgradecemos sua colaboração para manter o cadastro atualizado e contribuir para a correta entrega do documento profissional.\n\nAtenciosamente,\nConselho Regional dos Técnicos Industriais da Bahia — CRTBA",
+  "htmlBody": "<p>Prezado(a) profissional,<br /><br />Informamos que sua carteira profissional física do Conselho Regional dos<br />Técnicos Industriais da Bahia (CRTBA) está pronta para envio.<br /><br />Para garantir a correta expedição do documento, solicitamos a conferência e<br />confirmação dos seus dados cadastrais antes da emissão da ordem de postagem.<br /></p><h3>Dados cadastrais para confirmação</h3><p><strong>Nome Completo:</strong> Profissional Teste</p><p>Logradouro / Endereço: Rua Teste</p><p>Número: 123</p><p>Complemento: S/N</p><p>Bairro: Bairro Teste</p><p>Cidade / UF: Salvador / BA</p><p>CEP: 00000-000</p><p>Telefone Principal: (00) 00000-0000</p><p>WhatsApp Atualizado: informar/confirmar na resposta</p><h4>Prazo de confirmação</h4><p>Pedimos que responda a esta mensagem ou atualize suas informações no<br />SINCETI em até 5 (cinco) dias úteis, para inclusão no lote prioritário de<br />envio.<br /><br />Havendo divergência nos dados de endereçamento, a postagem poderá<br />permanecer temporariamente pendente até a regularização cadastral.<br /><br />Após a postagem, as informações de rastreamento serão disponibilizadas<br />pelos canais institucionais aplicáveis.</p><p>Para orientações adicionais, acesse www.crtba.org.br ou utilize os canais<br />oficiais de atendimento do CRT-BA.</p><p><strong>Protocolo:</strong> PF26PREVIEW000000000000000000000000</p><p>Agradecemos sua colaboração para manter o cadastro atualizado e contribuir para a correta entrega do documento profissional.\n</p><p>Atenciosamente,<br />Conselho Regional dos Técnicos Industriais da Bahia — CRTBA</p>",
+  "metadata": {
+    "publicMetadata": {
+      "dataMode": "PREFILLED_CONFIRMATION",
+      "dataModeReason": "Contrato terminal do owner (GF-2): campos de exibição pré-preenchidos a partir do snapshot congelado (telefone, CEP, logradouro, número, complemento, bairro, cidade, UF); ausente ⇒ Não informado; WhatsApp NUNCA inferido; CPF NUNCA renderizado."
+    },
+    "templateContentHash": "a0e89edfaed7aa9f733d5bcab9b2b92c4316cc4b857a0127042a3470f6037df1",
+    "templateDefinitionHash": "8317b53f49ead8c0815ef4befcf57358c01cef63d5c02e847fe9c52f2dafd6df"
+  }
+}

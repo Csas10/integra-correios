@@ -199,16 +199,55 @@ sem abrir capacidades da campanha:
   A regressão comprova saída não-zero, zero operador, zero evento
   `ADMIN_BOOTSTRAP_INICIAL` e zero artefato secreto.
 
-## Gate restante
+## Política operacional atual — flags PF_CAMPAIGN_* (GF-3 CORRECTIVE-01)
 
-Este incremento fecha o ciclo administrativo básico em código, mas a PR #12
-deve permanecer Draft até homologação independente desse ciclo. Persistência da
-campanha continua proibida.
+Toda a política da campanha é resolvida SERVER-SIDE
+(`carregarPoliticaCampanhaAtualizacao`) por variáveis de ambiente lidas como
+`=== "true"` (exigência de string exata; ausente ou qualquer outro valor ⇒
+fechado). **Padrão: fechado por padrão (fail-closed)** — cada capacidade só
+fica "armada" quando o operador define a flag correspondente como `"true"` no
+ambiente do servidor:
 
-Os gates executáveis permanecem:
+| Flag (`=== "true"` exato)           | Capacidade armada (default `false`)              |
+| ----------------------------------- | ------------------------------------------------ |
+| `PF_CAMPAIGN_ENABLED`               | superfície geral da campanha                     |
+| `PF_CAMPAIGN_PERSIST_ENABLED`       | `canPersistImport` (persistir aprovação)         |
+| `PF_CAMPAIGN_BATCH_ENABLED`         | `canCreateBatch` (criar lote HOLD)               |
+| `PF_CAMPAIGN_PREPARE_ENABLED`       | `canPrepareBatch` (preparar lote)                |
+| `PF_CAMPAIGN_EXECUTE_ENABLED`       | `canExecute` (claim/execute de itens)            |
+| `REAL_SEND_ENABLED`                 | `realSendEnabled` (envio REAL habilitado)        |
+| `PF_CAMPAIGN_CANARY_SEND_ENABLED`   | `canarySendEnabled` (canário armado)             |
 
-```
-canPersistImport = false
-canCreateBatch   = false
-canExecute       = false
-```
+Nenhuma dessas capacidades é permanente: sem a variável definida como `"true"`,
+a capacidade correspondente permanece fechada (nenhum claim, nenhum token,
+nenhum provider, nenhuma rede).
+
+### Rota de canário (`POST /api/campaigns/canary-send`)
+
+A rota do canário chega ao provider Gmail REAL **somente** quando TODOS os
+gates server-side estiverem armados simultaneamente:
+
+1. sessão individual válida com papel **EXECUTOR** (qualquer outro papel ⇒
+   403 `OPERATOR_ROLE_FORBIDDEN` ANTES de preflight/claim/token/provider);
+2. `PF_CAMPAIGN_CANARY_SEND_ENABLED === "true"` (senão 409
+   `CAMPAIGN_CANARY_SEND_DISABLED` — zero claim, zero rede);
+3. `PF_CAMPAIGN_EXECUTE_ENABLED === "true"` (execução elegível);
+4. `REAL_SEND_ENABLED === "true"` (envio real habilitado);
+5. destinatário canário configurado server-side
+   (`PF_CAMPAIGN_CANARY_RECIPIENT_FINGERPRINT`) com fingerprint conferido;
+6. readiness OAuth presente (CONNECTION_READY) e conta OAuth ativa da conta
+   esperada; tokens permanecem cifrados; refresh segue a disciplina
+   FALHA_PRE_PROVIDER (nunca AMBIGUO);
+7. snapshot/versão/fingerprint íntegros (preflight e revalidações server-side).
+
+A ausência de **qualquer** item bloqueia o envio (403/409/422 sanitizados, com
+`claims = 0` e nenhuma chamada de rede). Nenhuma autorização de envio é
+concedida por esta documentação: o armamento é decisão operacional do owner,
+flag a flag, no servidor.
+
+### Papéis e escopos (autoridade server-side)
+
+- `POST /api/campaigns/canary-send` — **somente EXECUTOR** (GF-3 CORRECTIVE-01);
+- persistência/lote/execução seguem exigindo os papéis operacionais já
+  homologados (`exigirOperadorCampanha`, 403 `OPERATOR_ROLE_FORBIDDEN`);
+- `ADMIN_TECNICO` administra identidade, NUNCA campanha.

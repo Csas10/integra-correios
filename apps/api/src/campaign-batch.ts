@@ -44,6 +44,10 @@ import {
   type ResultadoTentativaExecucao,
 } from "./campaign-execution.js";
 import type { PfUpdateCampaignPolicy } from "./campaigns.js";
+import {
+  avaliarReadinessOauthCanario,
+  provedorWiringReady,
+} from "./campaign-canary.js";
 
 // ---------------------------------------------------------------------------
 // PREFLIGHT READ-ONLY — bloqueios sanitizados estáveis
@@ -63,6 +67,13 @@ export const BLOQUEIOS_LOTE = {
   ENFILEIRADO_PENDENTE: "BATCH_EXECUTION_IN_PROGRESS_OR_UNRESOLVED",
   AMBIGUIDADE_NAO_RESOLVIDA: "BATCH_AMBIGUITY_UNRESOLVED",
   NADA_A_EXECUTAR: "BATCH_SEM_ITENS_PREPARADOS",
+  // GF5.2A — mail readiness consolidada (mesmos códigos do canário).
+  OAUTH_CONFIG: "OAUTH_CONFIGURATION_REQUIRED",
+  OAUTH_CONEXAO: "OAUTH_NOT_CONNECTED",
+  OAUTH_CONTA_AUSENTE: "OAUTH_EXPECTED_ACCOUNT_MISSING",
+  OAUTH_CONTA_DIVERGENTE: "OAUTH_ACCOUNT_MISMATCH",
+  OAUTH_CRIPTO: "OAUTH_ENCRYPTION_KEY_MISSING",
+  WIRING: "PROVIDER_WIRING_NOT_READY",
 } as const;
 
 export interface EntradaPreflightLote {
@@ -71,6 +82,15 @@ export interface EntradaPreflightLote {
   /** Papéis do operador resolvidos SERVER-SIDE pela sessão. */
   readonly papeis: readonly string[];
   readonly politica: PfUpdateCampaignPolicy;
+  /**
+   * GF5.2A — contexto server-side: o fingerprinter HMAC canônico para o
+   * casamento conta esperada × persistida. NUNCA derivado/aceito do
+   * browser; a ausência fail-closed bloqueia OAUTH_* em vez de construir
+   * fingerprinter com chave vazia.
+   */
+  readonly contexto?: {
+    readonly fingerprinter?: import("@integra-correios/persistence").HmacSha256Fingerprinter;
+  };
 }
 
 export type ResultadoPreflightLote =
@@ -207,6 +227,20 @@ export async function preflightLoteCampanha(
     bloqueios.push(BLOQUEIOS_LOTE.PROVA_KEY_INDISPONIVEL);
   }
 
+  // 5b. GF5.2A — READINESS da plataforma de e-mail CONSOLIDADA, reutilizando
+  // EXATAMENTE os primitivos canônicos do canário (nenhuma segunda
+  // implementação OAuth): avaliarReadinessOauthCanario (ESTRITAMENTE
+  // read-only: zero token decrypt/refresh, zero Google/Gmail, zero provider)
+  // + provedorWiringReady. Sem fingerprinter canônico ⇒ fail-closed no
+  // casamento de conta (nunca fingerprinter de chave vazia).
+  const oauth = await avaliarReadinessOauthCanario(pool, entrada.contexto?.fingerprinter);
+  if (!oauth.oauthConfigurationReady) bloqueios.push(BLOQUEIOS_LOTE.OAUTH_CONFIG);
+  if (!oauth.oauthExpectedAccountConfigured) bloqueios.push(BLOQUEIOS_LOTE.OAUTH_CONTA_AUSENTE);
+  if (!oauth.oauthEncryptionConfigurationReady) bloqueios.push(BLOQUEIOS_LOTE.OAUTH_CRIPTO);
+  if (!oauth.oauthConnectionStored) bloqueios.push(BLOQUEIOS_LOTE.OAUTH_CONEXAO);
+  else if (!oauth.oauthStoredAccountMatchesExpected) bloqueios.push(BLOQUEIOS_LOTE.OAUTH_CONTA_DIVERGENTE);
+  if (!provedorWiringReady()) bloqueios.push(BLOQUEIOS_LOTE.WIRING);
+
   // 6. Canário ENVIADO com evidência durável (selecionado ≠ enviado).
   if (!(await canarioComSucessoDuravel(pool, linhaLote.id))) {
     bloqueios.push(BLOQUEIOS_LOTE.CANARIO_NAO_ENVIADO);
@@ -307,6 +341,10 @@ export async function executarLoteCampanha(
     readonly campanhaId: string;
     readonly papeis: readonly string[];
     readonly politica: PfUpdateCampaignPolicy;
+    /** GF5.2A — mesmo contexto do preflight (fingerprinter canônico). */
+    readonly contexto?: {
+      readonly fingerprinter?: import("@integra-correios/persistence").HmacSha256Fingerprinter;
+    };
     readonly fornecedor: FornecedorProvedoresLote;
     /** Injetável para testes; default = compositor canônico server-side. */
     readonly emitirProvas?: typeof emitirProvasServerSideCampanha;
@@ -324,6 +362,7 @@ export async function executarLoteCampanha(
     campanhaId: entrada.campanhaId,
     papeis: entrada.papeis,
     politica: entrada.politica,
+    ...(entrada.contexto ? { contexto: entrada.contexto } : {}),
   });
   if (!preflight.elegivel) {
     return {

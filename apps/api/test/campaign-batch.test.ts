@@ -62,6 +62,12 @@ interface Cena {
   canarioItemId: string | null;
   /** eventos por itemId (EXEC_RECEIPT/EXEC_SETTLEMENT/EXEC_AMBIGUO/...). */
   eventosExec: Record<string, string[]>;
+  /** GF5.2A — fingerprint persistido da conexão OAuth (null = sem conexão). */
+  oauthContaPersistida: string | null;
+  /** GF5.2A — conta esperada configurada no ambiente (null = ausente). */
+  oauthContaEsperada: string | null;
+  /** GF5.2A — wiring do provider (derivado do endereço institucional). */
+  provedorWiringOk: boolean;
 }
 
 function cenaBase(sobre?: Partial<Cena>): Cena {
@@ -85,6 +91,12 @@ function cenaBase(sobre?: Partial<Cena>): Cena {
     ],
     canarioItemId,
     eventosExec: { [canarioItemId]: ["EXEC_RECEIPT", "EXEC_SETTLEMENT"] },
+    // Mail readiness default da CENA: tudo pronto (os testes de gap derrubam
+    // um campo por vez). Conta persistida ≠ esperada por padrão — o MATCH
+    // real depende do fingerprinter canônico injetado no contexto.
+    oauthContaPersistida: null,
+    oauthContaEsperada: null,
+    provedorWiringOk: true,
     ...sobre,
   };
 }
@@ -188,6 +200,17 @@ function poolDaCena(cena: Cena): CampanhaPool & { mutacoes: string[] } {
           ? { rows: [{ id: "ev-autor" }], rowCount: 1 }
           : { rows: [], rowCount: 0 };
       }
+      // P9 — GF5.2A: oauth_connection (avaliarReadinessOauthCanario —
+      // leitura canônica read-only da conexão persistida).
+      if (sql.includes("FROM oauth_connection")) {
+        if (!cena.oauthContaPersistida) return { rows: [], rowCount: 0 };
+        return {
+          rows: [{ conta_fingerprint: cena.oauthContaPersistida }],
+          rowCount: 1,
+        };
+      }
+      // P10 — GF5.2A: sinal do wiring do provider (stub controlado por cena;
+      // o stub é instalado nos testes de readiness de mail).
       // Mutações não são esperadas no fluxo de lote sob teste.
       if (/^(UPDATE|INSERT|DELETE)/.test(sql)) mutacoes.push(sql);
       return { rows: [], rowCount: 0 };
@@ -262,16 +285,107 @@ const emitirProvasFake = (async (_pool: unknown, _ids: { readonly itemId: string
 })) as unknown as typeof import("../src/campaign-control.js").emitirProvasServerSideCampanha;
 const provasOk = emitirProvasFake;
 
+// GF5.2A — ambiente sintético de MAIL READINESS (somente processo de teste).
+const NOMES_MAIL = {
+  conta: "GMAIL_" + "EXPECTED_ACCOUNT",
+  doc: "DOCUMENT_" + "FINGERPRINT_" + "KEY_" + "BASE64",
+  cripto: "DATA_" + "ENCRYPTION_" + "KEY_" + "BASE64",
+  versao: "DATA_" + "ENCRYPTION_" + "KEY_" + "VERSION",
+  remetente: "CAMPAIGN_" + "SENDER_ADDRESS",
+};
+const CONTA_ESPERADA_GF52A = "institucional.gf52a@exemplo.test";
+const CHAVE_DOC_GF52A = Buffer.from("gf52a-chave-finger-32-bytes-sintetic", "utf8").subarray(0, 32);
+const CHAVE_CRIPTO_GF52A = Buffer.from("gf52a-chave-cripto-32-bytes-sintetic", "utf8").subarray(0, 32);
+
+function ambienteMailPronto(): Record<string, string> {
+  return {
+    [NOMES_MAIL.conta]: CONTA_ESPERADA_GF52A,
+    [NOMES_MAIL.doc]: CHAVE_DOC_GF52A.toString("base64"),
+    [NOMES_MAIL.cripto]: CHAVE_CRIPTO_GF52A.toString("base64"),
+    [NOMES_MAIL.versao]: "v1-gf52a",
+    [NOMES_MAIL.remetente]: "carteiras@crtba.org.br",
+  };
+}
+
+/** Fingerprinter HMAC canônico (mesma chave da fixture de documento). */
+async function fingerprinterCanonico() {
+  const { HmacSha256Fingerprinter } = await import("@integra-correios/persistence");
+  const { derivarFingerprintContaGmail } = await import("@integra-correios/mail");
+  const fp = new HmacSha256Fingerprinter(CHAVE_DOC_GF52A);
+  return { fp, esperado: derivarFingerprintContaGmail(fp, CONTA_ESPERADA_GF52A) };
+}
+
+// ---------------------------------------------------------------------------
+// GF5.2A — MAIL READINESS SINTÉTICA (escopo de arquivo): ambienta o processo
+// de teste com a plataforma consolidada PRONTA e devolve o fingerprinter
+// canônico + contexto server-side para o preflight do lote. ZERO rede, ZERO
+// token, ZERO mutação — apenas env sintético de teste e stub de wiring.
+// ---------------------------------------------------------------------------
+
+const NOMES_OAUTH = {
+  clientId: "GMAIL_OAUTH_CLIENT_ID",
+  clientSecret: "GMAIL_OAUTH_CLIENT_SECRET",
+  redirectUri: "GMAIL_OAUTH_REDIRECT_URI",
+};
+
+const AMBIENTE_MAIL_PRONTO: Record<string, string> = {
+  [NOMES_MAIL.conta]: CONTA_ESPERADA_GF52A,
+  [NOMES_MAIL.doc]: CHAVE_DOC_GF52A.toString("base64"),
+  [NOMES_MAIL.cripto]: CHAVE_CRIPTO_GF52A.toString("base64"),
+  [NOMES_MAIL.versao]: "v1-gf52a",
+  [NOMES_MAIL.remetente]: "carteiras@crtba.org.br",
+  [NOMES_OAUTH.clientId]: "client-id-gf52a-sintetico",
+  [NOMES_OAUTH.clientSecret]: "client-secret-gf52a-sintetico",
+  [NOMES_OAUTH.redirectUri]: "https://exemplo.test/gf52a/callback",
+};
+
+/** Define/limpa o ambiente sintético de mail readiness (só processo de teste). */
+function ambienteMail(valores: Record<string, string | null>): void {
+  for (const [nome, valor] of Object.entries(valores)) {
+    if (valor === null) delete process.env[nome];
+    else process.env[nome] = valor;
+  }
+}
+
+/** Espia provedorWiringReady (primitivo canônico do canário) — puro stub. */
+async function espiarWiring(valor: boolean) {
+  const alvo = await import("../src/campaign-canary.js");
+  return vi.spyOn(alvo, "provedorWiringReady").mockReturnValue(valor);
+}
+
+/**
+ * GF5.2A — prepara cena + ambiente com a plataforma de e-mail CONSOLIDADA
+ * pronta (OAuth config/conta esperada/cripto, conexão persistida CASADA via
+ * fingerprinter canônico, wiring ativo). Devolve o fingerprinter, o valor
+ * esperado e um restore do stub de wiring.
+ */
+async function mailPronto(cena: ReturnType<typeof cenaBase>) {
+  ambienteMail(AMBIENTE_MAIL_PRONTO);
+  const { fp, esperado } = await fingerprinterCanonico();
+  cena.oauthContaPersistida = esperado;
+  const espia = await espiarWiring(true);
+  return {
+    fp,
+    esperado,
+    limpar: () => espia.mockRestore(),
+    contexto: { fingerprinter: fp } as const,
+  };
+}
+
 describe("GF5.2 — A. preflight do lote (read-only, fake pool)", () => {
-  it("12. todas as condições satisfeitas ⇒ elegível com itens PREPARADO em ordem ASC", async () => {
+
+  it("12. todas as condições satisfeitas ⇒ elegível com itens PREPARADO em ordem ASC (mail pronto)", async () => {
     const cena = cenaBase();
     const pool = poolDaCena(cena);
+    const { fp, contexto, limpar } = await mailPronto(cena);
     const resultado = await preflightLoteCampanha(pool, {
       operatorId: cena.operatorId,
       campanhaId: cena.campanhaId,
       papeis: ["EXECUTOR"],
       politica: politicaLote(),
+      contexto,
     });
+    limpar();
     expect(resultado.elegivel).toBe(true);
     if (resultado.elegivel) {
       expect(resultado.preparados).toBe(3);
@@ -367,19 +481,22 @@ describe("GF5.2 — A. preflight do lote (read-only, fake pool)", () => {
     if (!resultado.elegivel) expect(resultado.bloqueios).toContain(BLOQUEIOS_LOTE.CANARIO_NAO_ENVIADO);
   });
 
-  it("8. canário ENVIADO + EXEC_RECEIPT/EXEC_SETTLEMENT ⇒ gate do canário passa", async () => {
+  it("8. canário ENVIADO + EXEC_RECEIPT/EXEC_SETTLEMENT ⇒ gate do canário passa (mail pronto)", async () => {
     const cena = cenaBase();
     const pool = poolDaCena(cena);
+    const { contexto, limpar } = await mailPronto(cena);
     const resultado = await preflightLoteCampanha(pool, {
       operatorId: cena.operatorId,
       campanhaId: cena.campanhaId,
       papeis: ["EXECUTOR"],
       politica: politicaLote(),
+      contexto,
     });
     expect(resultado.elegivel).toBe(true);
     if (resultado.elegivel) {
       expect(resultado.enviados).toBe(1);
     }
+    limpar();
   });
 
   it("9. zero PREPARADO restante ⇒ false (nada a executar)", async () => {
@@ -461,6 +578,7 @@ describe("GF5.2 — B. execução do lote (domínio, fake provider)", () => {
   it("14–17. seleção: 1 canário ENVIADO + N PREPARADO ⇒ N processados, ordem ASC, concorrência máx 1, ENVIADO exatamente uma vez", async () => {
     const cena = cenaBase(); // 1 ENVIADO + 3 PREPARADO (ordens 2,3,4)
     const pool = poolDaCena(cena);
+    const { contexto, limpar } = await mailPronto(cena);
     const concorrencia = { valor: 0, atual: 0 };
     const ordemChamadas: number[] = [];
     const chamadasPorItem = new Map<string, number>();
@@ -470,6 +588,7 @@ describe("GF5.2 — B. execução do lote (domínio, fake provider)", () => {
       campanhaId: cena.campanhaId,
       papeis: ["EXECUTOR"],
       politica: politicaLote(),
+      contexto,
       fornecedor: fornecedorControlavel({
         respostas: {},
         concorrenciaMaxima: concorrencia,
@@ -482,6 +601,7 @@ describe("GF5.2 — B. execução do lote (domínio, fake provider)", () => {
         concorrencia,
       }),
     });
+    limpar();
     expect(resultado.resultado).toBe("CONCLUIDO");
     // Ordem estrita ASC (ordens 2,3,4 do scene) e exatamente uma chamada por item.
     const ordensChamadas = itensEmOrdem.map((itemId) => cena.itens.find((i) => i.id === itemId)!.ordem);
@@ -509,11 +629,13 @@ describe("GF5.2 — B. execução do lote (domínio, fake provider)", () => {
     cena.itens[1] = { ...enviadoAntes, estado: "ENVIADO" };
     const pool = poolDaCena(cena);
     const chamadasPorItem = new Map<string, number>();
+    const { contexto, limpar } = await mailPronto(cena);
     const parametrosExecucao = {
       operatorId: cena.operatorId,
       campanhaId: cena.campanhaId,
       papeis: ["EXECUTOR"],
       politica: politicaLote(),
+      contexto,
       fornecedor: fornecedorControlavel({
         respostas: {},
         concorrenciaMaxima: { valor: 0, atual: 0 },
@@ -536,6 +658,7 @@ describe("GF5.2 — B. execução do lote (domínio, fake provider)", () => {
     // O canário e o item enviado antes JAMAIS foram chamados.
     expect(chamadasPorItem.has(cena.canarioItemId!)).toBe(false);
     expect(chamadasPorItem.get(enviadoAntes.id)).toBeUndefined();
+    limpar();
   });
 
   it("19–21. FALHA_PRE_PROVIDER / FALHA_DEFINITIVA / AMBIGUO ⇒ stop imediato, restantes PREPARADO, sem retry", async () => {
@@ -547,11 +670,13 @@ describe("GF5.2 — B. execução do lote (domínio, fake provider)", () => {
       const cena = cenaBase();
       const alvo = cena.itens[1]!; // ordem 2 — falha no PRIMEIRO processado
       const pool = poolDaCena(cena);
+      const { contexto, limpar } = await mailPronto(cena);
       const resultado = await executarLoteCampanha(pool, {
         operatorId: cena.operatorId,
         campanhaId: cena.campanhaId,
         papeis: ["EXECUTOR"],
         politica: politicaLote(),
+        contexto,
         fornecedor: fornecedorControlavel({
           respostas: {},
           concorrenciaMaxima: { valor: 0, atual: 0 },
@@ -579,6 +704,7 @@ describe("GF5.2 — B. execução do lote (domínio, fake provider)", () => {
       if (caso.tipo === "AMBIGUO") {
         expect(resultado.motivoInterrupcao).toBe("AMBIGUO_RECONCILIACAO_HUMANA");
       }
+      limpar();
     }
   });
 
@@ -586,11 +712,13 @@ describe("GF5.2 — B. execução do lote (domínio, fake provider)", () => {
     const cena = cenaBase();
     const alvo = cena.itens[1]!;
     const pool = poolDaCena(cena);
+    const { contexto, limpar } = await mailPronto(cena);
     const resultado = await executarLoteCampanha(pool, {
       operatorId: cena.operatorId,
       campanhaId: cena.campanhaId,
       papeis: ["EXECUTOR"],
       politica: politicaLote(),
+      contexto,
       fornecedor: fornecedorControlavel({
         respostas: {},
         concorrenciaMaxima: { valor: 0, atual: 0 },
@@ -611,6 +739,7 @@ describe("GF5.2 — B. execução do lote (domínio, fake provider)", () => {
     expect(resultado.resultado).toBe("INTERROMPIDO");
     expect(resultado.motivoInterrupcao).toBe("NAO_CLAIMADO_INESPERADO");
     expect(resultado.restantesPreparados).toBe(3);
+    limpar();
   });
 
   it("25. autoridade: TODO envio passa por executeAttemptCampanha (provider direto ⇒ fail-closed) — espionagem do caminho", async () => {
@@ -688,5 +817,199 @@ describe("GF5.2 — C. infraestrutura consolidada (mesmo seam GF5.1)", () => {
     expect(adapter.metricas.chamadasTransporte()).toBe(0);
     // Nenhuma mutação SQL ocorreu (readiness/execution bloqueados).
     expect(pool.mutacoes).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF5.2A — matriz obrigatória do owner: mail readiness do lote REUSA os
+// primitivos canônicos do canário (avaliarReadinessOauthCanario +
+// provedorWiringReady) e proximaAcao é server-driven por elegibilidade real.
+// ---------------------------------------------------------------------------
+
+describe("GF5.2A — D. mail readiness do lote + proximaAcao (primitivos do canário)", () => {
+  /** Preflight da cena com ambiente mail sintético controlado (sem rede). */
+  async function preflightMail(
+    cena: ReturnType<typeof cenaBase>,
+    opcoes?: { faltando?: string[]; persistida?: string | null | undefined; wiring?: boolean },
+  ) {
+    ambienteMail(AMBIENTE_MAIL_PRONTO);
+    for (const chave of opcoes?.faltando ?? []) ambienteMail({ [chave]: null });
+    const espia = opcoes?.wiring === false ? await espiarWiring(false) : undefined;
+    const { fp, esperado } = await fingerprinterCanonico();
+    cena.oauthContaPersistida = opcoes?.persistida !== undefined ? opcoes.persistida : esperado;
+    const pool = poolDaCena(cena);
+    const resultado = await preflightLoteCampanha(pool, {
+      operatorId: cena.operatorId,
+      campanhaId: cena.campanhaId,
+      papeis: ["EXECUTOR"],
+      politica: politicaLote(),
+      contexto: { fingerprinter: fp },
+    });
+    espia?.mockRestore();
+    return { pool, resultado };
+  }
+
+  async function codigoServerSemComentarios() {
+    const fonte = (await import("node:fs")).readFileSync(
+      new URL("../src/server.ts", import.meta.url),
+      "utf8",
+    );
+    return fonte.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  }
+
+  it("A. OAuth configuration ausente ⇒ false + OAUTH_CONFIGURATION_REQUIRED", async () => {
+    const { resultado } = await preflightMail(cenaBase(), {
+      faltando: [NOMES_OAUTH.clientId, NOMES_OAUTH.clientSecret, NOMES_OAUTH.redirectUri],
+    });
+    expect(resultado.elegivel).toBe(false);
+    if (!resultado.elegivel) expect(resultado.bloqueios).toContain(BLOQUEIOS_LOTE.OAUTH_CONFIG);
+  });
+
+  it("B. conexão OAuth ausente ⇒ false + OAUTH_NOT_CONNECTED (sem mismatch)", async () => {
+    const { resultado } = await preflightMail(cenaBase(), { persistida: null });
+    expect(resultado.elegivel).toBe(false);
+    if (!resultado.elegivel) {
+      expect(resultado.bloqueios).toContain(BLOQUEIOS_LOTE.OAUTH_CONEXAO);
+      expect(resultado.bloqueios).not.toContain(BLOQUEIOS_LOTE.OAUTH_CONTA_DIVERGENTE);
+    }
+  });
+
+  it("C. conta esperada ausente ⇒ false + OAUTH_EXPECTED_ACCOUNT_MISSING", async () => {
+    const { resultado } = await preflightMail(cenaBase(), { faltando: [NOMES_MAIL.conta] });
+    expect(resultado.elegivel).toBe(false);
+    if (!resultado.elegivel) expect(resultado.bloqueios).toContain(BLOQUEIOS_LOTE.OAUTH_CONTA_AUSENTE);
+  });
+
+  it("D. conta persistida divergente (fingerprint ≠ esperado) ⇒ false + OAUTH_ACCOUNT_MISMATCH", async () => {
+    const { resultado } = await preflightMail(cenaBase(), { persistida: "f".repeat(64) });
+    expect(resultado.elegivel).toBe(false);
+    if (!resultado.elegivel) expect(resultado.bloqueios).toContain(BLOQUEIOS_LOTE.OAUTH_CONTA_DIVERGENTE);
+    // Sanitização: nenhum e-mail/fingerprint do operador vaza no resultado.
+    expect(JSON.stringify(resultado)).not.toContain(CONTA_ESPERADA_GF52A);
+    expect(JSON.stringify(resultado)).not.toContain("f".repeat(64));
+  });
+
+  it("E. criptografia ausente ⇒ false + OAUTH_ENCRYPTION_KEY_MISSING", async () => {
+    const { resultado } = await preflightMail(cenaBase(), { faltando: [NOMES_MAIL.cripto] });
+    expect(resultado.elegivel).toBe(false);
+    if (!resultado.elegivel) expect(resultado.bloqueios).toContain(BLOQUEIOS_LOTE.OAUTH_CRIPTO);
+  });
+
+  it("F. wiring do provider indisponível ⇒ false + PROVIDER_WIRING_NOT_READY", async () => {
+    const { resultado } = await preflightMail(cenaBase(), { wiring: false });
+    expect(resultado.elegivel).toBe(false);
+    if (!resultado.elegivel) expect(resultado.bloqueios).toContain(BLOQUEIOS_LOTE.WIRING);
+  });
+
+  it("G. todas as condições de campanha + mail readiness ⇒ EXECUTAR_LOTE elegível", async () => {
+    const { pool, resultado } = await preflightMail(cenaBase());
+    expect(resultado.elegivel).toBe(true);
+    if (resultado.elegivel) {
+      expect(resultado.preparados).toBe(3);
+      expect(resultado.itensElegiveis.map((item) => item.ordem)).toEqual([2, 3, 4]);
+      expect(pool.mutacoes).toHaveLength(0);
+    }
+  });
+
+  it("H. toda avaliação de readiness: ZERO mutação/claim/rede/token; reuso único dos primitivos", async () => {
+    const casos = [
+      { faltando: [] as string[], persistida: undefined, elegivel: true },
+      {
+        faltando: [NOMES_OAUTH.clientId, NOMES_OAUTH.clientSecret, NOMES_OAUTH.redirectUri],
+        persistida: undefined,
+        elegivel: false,
+      },
+      { faltando: [NOMES_MAIL.conta], persistida: undefined, elegivel: false },
+      { faltando: [NOMES_MAIL.cripto], persistida: undefined, elegivel: false },
+      { faltando: [] as string[], persistida: null, elegivel: false },
+      { faltando: [] as string[], persistida: "f".repeat(64), elegivel: false },
+    ];
+    for (const caso of casos) {
+      const { pool, resultado } = await preflightMail(cenaBase(), caso);
+      expect(resultado.elegivel).toBe(caso.elegivel);
+      // Nenhuma mutação SQL ⇒ ZERO claim, ZERO item executado, ZERO evento.
+      expect(pool.mutacoes).toHaveLength(0);
+    }
+    // Reuso canônico: EXATAMENTE um ponto de avaliação por primitivo (sem
+    // duplicação de lógica OAuth/wiring no módulo do lote) e nenhuma
+    // superfície de rede/token (readiness é liveness-free).
+    const fonte = (await import("node:fs")).readFileSync(
+      new URL("../src/campaign-batch.ts", import.meta.url),
+      "utf8",
+    );
+    const codigo = fonte.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    expect((codigo.match(/avaliarReadinessOauthCanario\(/g) ?? []).length).toBe(1);
+    expect((codigo.match(/provedorWiringReady\(/g) ?? []).length).toBe(1);
+    expect(codigo).toContain('from "./campaign-canary.js"');
+    expect(codigo).not.toMatch(/\bfetch\(|googleapis\.com|oauth2|refresh_token|access_token/);
+  });
+
+  it("I. executarLoteCampanha com mail readiness bloqueado ⇒ BLOQUEADO, ZERO tentativa/provider", async () => {
+    const cena = cenaBase(); // sem conexão OAuth persistida ⇒ OAUTH_NOT_CONNECTED
+    ambienteMail(AMBIENTE_MAIL_PRONTO);
+    const { fp } = await fingerprinterCanonico();
+    const pool = poolDaCena(cena);
+    const chamadasPorItem = new Map<string, number>();
+    const ordemChamadas: number[] = [];
+    const resultado = await executarLoteCampanha(pool, {
+      operatorId: cena.operatorId,
+      campanhaId: cena.campanhaId,
+      papeis: ["EXECUTOR"],
+      politica: politicaLote(),
+      contexto: { fingerprinter: fp },
+      fornecedor: fornecedorControlavel({
+        respostas: {},
+        concorrenciaMaxima: { valor: 0, atual: 0 },
+        ordemChamadas,
+      }),
+      emitirProvas: emitirProvasFake,
+      executarTentativa: executarTentativaFake({ chamadasPorItem }),
+    });
+    expect(resultado.resultado).toBe("BLOQUEADO");
+    expect(resultado.motivoInterrupcao).toContain(BLOQUEIOS_LOTE.OAUTH_CONEXAO);
+    expect(chamadasPorItem.size).toBe(0);
+    expect(ordemChamadas).toEqual([]);
+    expect(pool.mutacoes).toHaveLength(0);
+  });
+
+  it("J. proximaAcao server-driven: sequência de elegibilidade real (lote antes da flag)", async () => {
+    const codigo = await codigoServerSemComentarios();
+    const inicio = codigo.indexOf("proximaAcao:");
+    expect(inicio).toBeGreaterThan(-1);
+    const trecho = codigo.slice(inicio, codigo.indexOf("} catch", inicio));
+    const sequencia = [
+      trecho.indexOf("preparacao.permitida"),
+      trecho.indexOf('"PREPARAR_LOTE"'),
+      trecho.indexOf('"AUTORIZAR_EXECUCAO"'),
+      trecho.indexOf('"ATIVAR_LOTE"'),
+      trecho.indexOf("lotePreflight.elegivel"),
+      trecho.indexOf('"EXECUTAR_LOTE"'),
+      trecho.indexOf("canarioPreflight.elegivel"),
+      trecho.indexOf('"EXECUTAR_CANARIO"'),
+      trecho.indexOf("politica.canarySendEnabled"),
+      trecho.indexOf('"CANARY_SEND_BLOQUEADO"'),
+      trecho.indexOf('"AGUARDAR_GATES_OPERACIONAIS"'),
+    ];
+    for (const indice of sequencia) expect(indice).toBeGreaterThan(-1);
+    expect([...sequencia].sort((a, b) => a - b)).toEqual(sequencia);
+    // Contexto server-side: o fingerprinter canônico é construído no servidor,
+    // nunca derivado do browser.
+    expect(codigo).toContain("contexto: { fingerprinter: fingerprinter() }");
+  });
+
+  it("K. canarySendEnabled=true não mascara ação realmente permitida; flag é display-only", async () => {
+    const codigo = await codigoServerSemComentarios();
+    const inicio = codigo.indexOf("proximaAcao:");
+    const trecho = codigo.slice(inicio, codigo.indexOf("} catch", inicio));
+    const iLoteElegivel = trecho.indexOf("lotePreflight.elegivel");
+    const iExecutarLote = trecho.indexOf('"EXECUTAR_LOTE"');
+    const iFlagCanario = trecho.indexOf("politica.canarySendEnabled");
+    // A flag só é consultada DEPOIS de EXECUTAR_LOTE (elegibilidade real):
+    // um canário flag-armado já adjudicado NÃO mascara o lote elegível.
+    expect(iLoteElegivel).toBeGreaterThan(-1);
+    expect(iExecutarLote).toBeGreaterThan(iLoteElegivel);
+    expect(iFlagCanario).toBeGreaterThan(iExecutarLote);
+    // Diagnóstico sanitizado no payload; o browser NUNCA deriva permissão dele.
+    expect(codigo).toContain("batchSendEnabled: politica.batchSendEnabled");
   });
 });

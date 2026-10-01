@@ -1970,6 +1970,7 @@ const ROTAS: readonly Rota[] = [
           campanhaId,
           papeis: identity.roles,
           politica,
+          contexto: { fingerprinter: fingerprinter() },
         });
         json(res, 200, {
           campanha: { campanhaId, estado: "LOTE_CRIADO" },
@@ -1985,6 +1986,9 @@ const ROTAS: readonly Rota[] = [
             canExecute: politica.canExecute,
             realSendEnabled: politica.realSendEnabled,
             canarySendEnabled: politica.canarySendEnabled,
+            // GF5.2A — apenas diagnóstico (DISPLAY ONLY): o browser NUNCA
+            // deriva permissão desta flag; a autoridade é acao.EXECUTAR_LOTE.
+            batchSendEnabled: politica.batchSendEnabled,
           },
           autorizacaoHumana: {
             concedida: estoque.autorizacaoHumana.concedida,
@@ -2044,17 +2048,22 @@ const ROTAS: readonly Rota[] = [
           },
           executavel: false,
           envioRealDesabilitado: !politica.realSendEnabled,
+          // GF5.2A — proximaAcao deriva da ELEGIBILIDADE REAL de cada ação
+          // (estado + condições), NUNCA de flag acesa isolada: um canário
+          // flag-armado que já foi adjudicado NÃO mascara o lote elegível.
           proximaAcao: preparacao.permitida
             ? "PREPARAR_LOTE"
             : autorizacao.permitida
               ? "AUTORIZAR_EXECUCAO"
               : ativacao.permitida
                 ? "ATIVAR_LOTE"
-                : politica.canarySendEnabled
-                  ? "CANARY_SEND_BLOQUEADO"
-                  : lotePreflight.elegivel
-                    ? "EXECUTAR_LOTE"
-                    : "AGUARDAR_GATES_OPERACIONAIS",
+                : lotePreflight.elegivel
+                  ? "EXECUTAR_LOTE"
+                  : canarioPreflight.elegivel
+                    ? "EXECUTAR_CANARIO"
+                    : politica.canarySendEnabled
+                      ? "CANARY_SEND_BLOQUEADO"
+                      : "AGUARDAR_GATES_OPERACIONAIS",
         });
       } catch (error) {
         erroControleCampanha(res, error);

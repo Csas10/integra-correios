@@ -161,6 +161,13 @@ export interface PfUpdateCampaignPolicy {
    * fail-closed: ausente/vazio/"1"/"TRUE"/qualquer outro valor ⇒ false.
    */
   readonly canarySendEnabled: boolean;
+  /**
+   * GF5.2 — armar a EXECUÇÃO DE LOTE controlada (gate INDEPENDENTE do
+   * canário). Default fail-closed: ausente/qualquer valor ≠ "true" ⇒ false.
+   * Necessária, NUNCA suficiente; a execução real exige adjudicação própria
+   * do owner. Armar o canário NUNCA implica autorizar o lote.
+   */
+  readonly batchSendEnabled: boolean;
 }
 
 type Environment = Readonly<Record<string, string | undefined>>;
@@ -178,6 +185,7 @@ export function carregarPoliticaCampanhaAtualizacao(
     canPrepareBatch: env.PF_CAMPAIGN_PREPARE_ENABLED === "true",
     realSendEnabled: env.REAL_SEND_ENABLED === "true",
     canarySendEnabled: env.PF_CAMPAIGN_CANARY_SEND_ENABLED === "true",
+    batchSendEnabled: env.PF_CAMPAIGN_BATCH_SEND_ENABLED === "true",
   };
 }
 

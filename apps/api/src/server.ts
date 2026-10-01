@@ -100,6 +100,8 @@ import {
 // arma com PF_CAMPAIGN_CANARY_SEND_ENABLED=true (política) e a UI não tem
 // handler de envio.
 import { criarCampanhaGmailRuntime } from "./campaign-gmail-runtime.js";
+// GF5.2 — preflight READ-ONLY do lote controlado (EXECUTAR_LOTE no readiness).
+import { preflightLoteCampanha } from "./campaign-batch.js";
 import {
   ProvedorGmailCampanha,
   avaliarReadinessOauthCanario,
@@ -1957,6 +1959,19 @@ const ROTAS: readonly Rota[] = [
           politica,
           contexto: { fingerprinter: fingerprinter() },
         });
+        // GF5.2 — EXECUTAR_LOTE: mesma disciplina read-only do canário; a
+        // elegibilidade EFETIVA = papel EXECUTOR ∧ preflight do lote
+        // (política batchSendEnabled ∧ canExecute ∧ realSendEnabled, lote
+        // ATIVO, autorização vigente, canário ENVIADO com evidência durável,
+        // sem ENFILEIRADO pendente, sem ambiguidade não resolvida, ≥1
+        // PREPARADO). Zero claim/mutação/token/rede na derivação.
+        const lotePreflight = await preflightLoteCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId,
+          papeis: identity.roles,
+          politica,
+          contexto: { fingerprinter: fingerprinter() },
+        });
         json(res, 200, {
           campanha: { campanhaId, estado: "LOTE_CRIADO" },
           lote: {
@@ -1971,6 +1986,9 @@ const ROTAS: readonly Rota[] = [
             canExecute: politica.canExecute,
             realSendEnabled: politica.realSendEnabled,
             canarySendEnabled: politica.canarySendEnabled,
+            // GF5.2A — apenas diagnóstico (DISPLAY ONLY): o browser NUNCA
+            // deriva permissão desta flag; a autoridade é acao.EXECUTAR_LOTE.
+            batchSendEnabled: politica.batchSendEnabled,
           },
           autorizacaoHumana: {
             concedida: estoque.autorizacaoHumana.concedida,
@@ -2021,18 +2039,31 @@ const ROTAS: readonly Rota[] = [
                   : canarioPreflight.bloqueios
                 : ["OPERATOR_ROLE_FORBIDDEN"],
             },
+            // GF5.2 — autoridade server-side; o browser NUNCA deriva a
+            // elegibilidade do lote localmente.
+            EXECUTAR_LOTE: {
+              permitida: lotePreflight.elegivel,
+              bloqueios: lotePreflight.elegivel ? [] : lotePreflight.bloqueios,
+            },
           },
           executavel: false,
           envioRealDesabilitado: !politica.realSendEnabled,
+          // GF5.2A — proximaAcao deriva da ELEGIBILIDADE REAL de cada ação
+          // (estado + condições), NUNCA de flag acesa isolada: um canário
+          // flag-armado que já foi adjudicado NÃO mascara o lote elegível.
           proximaAcao: preparacao.permitida
             ? "PREPARAR_LOTE"
             : autorizacao.permitida
               ? "AUTORIZAR_EXECUCAO"
               : ativacao.permitida
                 ? "ATIVAR_LOTE"
-                : politica.canarySendEnabled
-                  ? "CANARY_SEND_BLOQUEADO"
-                  : "AGUARDAR_GATES_OPERACIONAIS",
+                : lotePreflight.elegivel
+                  ? "EXECUTAR_LOTE"
+                  : canarioPreflight.elegivel
+                    ? "EXECUTAR_CANARIO"
+                    : politica.canarySendEnabled
+                      ? "CANARY_SEND_BLOQUEADO"
+                      : "AGUARDAR_GATES_OPERACIONAIS",
         });
       } catch (error) {
         erroControleCampanha(res, error);

@@ -55,6 +55,7 @@ const politicaFechada: PoliticaExecucaoCampanha = {
   canPrepareBatch: false,
   realSendEnabled: false,
   canarySendEnabled: false,
+    batchSendEnabled: false,
 };
 const politicaAberta: PoliticaExecucaoCampanha = {
   ...politicaFechada,
@@ -126,6 +127,7 @@ describe("SLICE_03A.1 — política: autoridade única e fail-closed (BEHAVIORAL
       canPrepareBatch: false,
       realSendEnabled: false,
       canarySendEnabled: false,
+    batchSendEnabled: false,
     });
   });
 

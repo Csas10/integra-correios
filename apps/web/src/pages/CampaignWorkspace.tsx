@@ -54,6 +54,9 @@ type ReadinessOperacional = {
     canExecute: boolean;
     realSendEnabled: boolean;
     canarySendEnabled: boolean;
+    // GF5.3 — apenas diagnóstico (DISPLAY ONLY): a autoridade do botão é
+    // EXCLUSIVAMENTE acoes.EXECUTAR_LOTE.permitida.
+    batchSendEnabled: boolean;
   };
   autorizacaoHumana: { concedida: boolean; referenciaPresente: boolean };
   // SLICE-03C.1 — campos de ativação (não sensíveis: nenhum fingerprint,
@@ -74,6 +77,10 @@ type ReadinessOperacional = {
     // preflight canônico read-only do envio real); o cliente nunca reconstrói
     // elegibilidade a partir de flags locais.
     EXECUTAR_CANARIO: AcaoOperacao;
+    // GF5.3 — ação do lote derivada EXCLUSIVAMENTE pelo servidor (mesmo
+    // preflight canônico read-only do executarLoteCampanha); o cliente nunca
+    // reconstrói elegibilidade a partir de flags/contagens locais.
+    EXECUTAR_LOTE: AcaoOperacao;
   };
   // SLICE-03C.2A — OAuth readiness read-only (estados sanitizados).CONNECTED
   // significa SOMENTE "persistido + conta esperada correspondente" — nunca
@@ -440,6 +447,42 @@ async function executarCanarioOperacional(
   });
 }
 
+// GF5.3 — execução limitada do lote: EXATAMENTE a rota canônica
+// POST /api/campaigns/batch-send, com corpo restrito a { campanhaId }.
+// Nenhum operatorId, loteCampanhaId, itemId/ids, destinatário, e-mail,
+// fingerprint, template, assunto, corpo, provider, prova, dado de OAuth,
+// chave de idempotência, limit, batchSize, maxItems, offset, cursor, retry
+// ou flag é enviado pelo cliente — o servidor reconstrói TODA a autoridade e
+// aplica a janela server-side (máx 10 itens por invocação). Nenhum retry
+// automático existe nesta função.
+type ResultadoLoteOperacional = {
+  resultado: string;
+  campanhaId?: string;
+  loteCampanhaId?: string;
+  totalItens?: number;
+  preparadosInicio?: number;
+  enviadosAntes?: number;
+  processadosNestaExecucao?: number;
+  enviadosNestaExecucao?: number;
+  falhasNestaExecucao?: number;
+  restantesPreparados?: number;
+  ultimaOrdemProcessada?: number;
+  motivoInterrupcao?: string;
+  janelaItensPorExecucao?: number;
+  continuaSomenteComNovaAcaoHumana?: boolean;
+  erro?: string;
+};
+
+async function executarLoteOperacional(
+  campanhaId: string,
+): Promise<ResultadoLoteOperacional> {
+  return fetchJson<ResultadoLoteOperacional>("/api/campaigns/batch-send", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ campanhaId }),
+  });
+}
+
 async function obterCampanhaDetalhe(campanhaId: string): Promise<CampanhaPersistida> {
   const resposta = await fetchJson<{ campanha: CampanhaPersistida }>(
     `/api/campaigns/detail?campanhaId=${encodeURIComponent(campanhaId)}`,
@@ -592,6 +635,10 @@ export function CampaignWorkspace() {
   // impedir duplo clique durante o POST em andamento. A elegibilidade em si
   // é SEMPRE do servidor (readiness.acoes.EXECUTAR_CANARIO).
   const [canarioPendente, setCanarioPendente] = useState(false);
+  // GF5.3 — guarda dedicada de duplo clique/reação da execução do lote:
+  // enquanto verdadeira, o botão do lote fica desabilitado (uma confirmação
+  // humana = exatamente UM POST).
+  const [lotePendente, setLotePendente] = useState(false);
 
   async function loadMe(): Promise<boolean> {
     try {
@@ -1479,6 +1526,103 @@ export function CampaignWorkspace() {
       setReadiness(null);
     } finally {
       setCanarioPendente(false);
+    }
+  }
+
+  // GF5.3 — execução limitada do lote: elegibilidade vem EXCLUSIVAMENTE do
+  // readiness server-driven (acoes.EXECUTAR_LOTE.permitida); o cliente NUNCA
+  // deriva permissão de batchSendEnabled/canExecute/realSendEnabled/lote.estado/
+  // OAuth/estado do canário/contagens ou qualquer combinação local deles.
+  // Confirmação humana explícita ⇒ exatamente UM POST; cancelar ⇒ ZERO POST;
+  // PARCIAL aguarda NOVA ação humana (AUTO_CONTINUE=false); nenhuma repetição
+  // automática (sem timer, sem loop, sem fila, sem fetch a si mesmo).
+  async function executarLoteOperacionalUI(): Promise<void> {
+    if (!campanha?.campanhaId || acaoPendente !== null || lotePendente || canarioPendente) return;
+    const confirmado = window.confirm(
+      "Executar a janela do lote controlado?\n" +
+        "Com os gates de produção armados, mensagens reais podem ser enviadas pelo Gmail.\n" +
+        "Esta invocação processa no máximo 10 itens elegíveis (janela definida pelo servidor), em ordem crescente, uma a uma.\n" +
+        "Não há retry automático. Se restarem itens PREPARADO, uma nova ação humana explícita será necessária para continuar.",
+    );
+    if (!confirmado) {
+      setAcaoMensagem("");
+      setAcaoErro("");
+      return;
+    }
+    setLotePendente(true);
+    setAcaoMensagem("");
+    setAcaoErro("");
+    // (A) FAIL-CLOSED antes do despacho: o readiness antigo é invalidado para
+    // que um EXECUTAR_LOTE.permitida=true obsoleto não reabilite o botão após
+    // a conclusão. Somente uma leitura NOVA do servidor reabilita a ação.
+    setReadiness(null);
+    setReadinessErro("");
+    const contagens = (corpo: ResultadoLoteOperacional): string =>
+      " (" +
+      "processados " + String(corpo.processadosNestaExecucao ?? 0) +
+      " · enviados " + String(corpo.enviadosNestaExecucao ?? 0) +
+      " · falhas " + String(corpo.falhasNestaExecucao ?? 0) +
+      " · restantes PREPARADO " + String(corpo.restantesPreparados ?? 0) +
+      ")";
+    try {
+      // (B) MUTAÇÃO adjudicada primeiro: o resultado do POST é preservado
+      // mesmo que a sincronização read-only posterior falhe.
+      const corpo = await executarLoteOperacional(campanha.campanhaId);
+      if (corpo.resultado === "PARCIAL") {
+        setAcaoMensagem(
+          "Lote: PARCIAL — janela do servidor consumida" + contagens(corpo) +
+            ". Continuação somente com nova ação humana explícita (sem continuação automática).",
+        );
+      } else if (corpo.resultado === "INTERROMPIDO") {
+        setAcaoMensagem(
+          "Lote: INTERROMPIDO — " + (corpo.motivoInterrupcao ?? "motivo não informado") +
+            contagens(corpo) +
+            ". Adjudicação humana necessária; não repetir automaticamente.",
+        );
+      } else {
+        setAcaoMensagem("Lote: " + corpo.resultado + contagens(corpo));
+      }
+      // Sincronização READ-ONLY com domínio de erro PRÓPRIO (não compartilha
+      // o catch da mutação): nada aqui pode reescrever a mensagem acima.
+      try {
+        const [detalhe, corpoReadiness] = await Promise.all([
+          obterCampanhaDetalhe(campanha.campanhaId),
+          obterReadinessOperacional(campanha.campanhaId),
+        ]);
+        setCampanha(detalhe);
+        setReadiness(corpoReadiness);
+        setReadinessErro("");
+      } catch {
+        // (F) falha de sincronização: o resultado do POST permanece exibido;
+        // readiness fica inválido e o operador deve reler o estado
+        // autoritativo antes de qualquer nova ação. ZERO segundo POST.
+        setReadiness(null);
+        setReadinessErro(
+          "Falha na sincronização do estado pós-execução — recarregue/consulte o estado persistido antes de nova ação.",
+        );
+      }
+    } catch (error: unknown) {
+      setAcaoMensagem("");
+      if (error instanceof ApiCampanhaError && error.status >= 400 && error.status < 500) {
+        // (E) rejeição DEFINITIVA do servidor (4xx): exibida como é — sem
+        // "não conclusivo", sem inventar envio, sem repetição automática.
+        setAcaoErro(
+          error.message +
+            " — Rejeição definitiva do servidor. Consulte o estado persistido antes de qualquer nova tentativa.",
+        );
+      } else {
+        // (D) rede/transporte/5xx: POTENCIALMENTE NÃO CONCLUSIVO — um ou mais
+        // itens podem já ter sido settlementados antes da falha do HTTP;
+        // comportamento conservador; ZERO repetição automática.
+        setAcaoErro(
+          (error instanceof ApiCampanhaError ? error.message : "Execução do lote indisponível.") +
+            " Resultado potencialmente NÃO CONCLUSIVO (falha de rede/servidor): itens podem já ter sido processados. Não repetir automaticamente; recarregue/verifique o estado persistido — somente um readiness novo do servidor autoriza continuação.",
+        );
+      }
+      // Sem readiness fresco o botão não rearma: estado fail-closed.
+      setReadiness(null);
+    } finally {
+      setLotePendente(false);
     }
   }
 
@@ -2430,7 +2574,9 @@ export function CampaignWorkspace() {
                     Políticas: canPrepareBatch={String(readiness.politicas.canPrepareBatch)} ·
                     canExecute={String(readiness.politicas.canExecute)} ·
                     realSendEnabled={String(readiness.politicas.realSendEnabled)} ·
-                    canarySendEnabled={String(readiness.politicas.canarySendEnabled)}
+                    canarySendEnabled={String(readiness.politicas.canarySendEnabled)} ·{" "}
+                    batchSendEnabled={String(readiness.politicas.batchSendEnabled)} (somente
+                    diagnóstico; a autoridade é a ação EXECUTAR_LOTE)
                   </li>
                   <li>
                     OAuth: configuração={String(readiness.oauth.configurationReady)} · conexão
@@ -2528,6 +2674,31 @@ export function CampaignWorkspace() {
                     {canarioPendente
                       ? "Executando canário…"
                       : "Executar canário controlado"}
+                  </button>
+
+                  {/* GF5.3 — Executar lote: ÚNICA superfície de execução do
+                      lote, governada EXCLUSIVAMENTE pelo readiness
+                      server-driven (EXECUTAR_LOTE.permitida) + guarda de
+                      duplo clique (lotePendente). Janela limitada do
+                      servidor (máx 10 itens); PARCIAL/INTERROMPIDO aguardam
+                      nova ação humana explícita. O rótulo Continuar lote é
+                      derivado SOMENTE do estado sanitizado do servidor e não
+                      altera a autoridade. */}
+                  <button
+                    type="button"
+                    disabled={
+                      !readiness.acoes.EXECUTAR_LOTE.permitida ||
+                      acaoPendente !== null ||
+                      canarioPendente ||
+                      lotePendente
+                    }
+                    onClick={() => void executarLoteOperacionalUI()}
+                  >
+                    {lotePendente
+                      ? "Executando lote…"
+                      : (readiness.lote.contagemPorEstado.PREPARADO ?? 0) > 10
+                        ? "Continuar lote"
+                        : "Executar lote"}
                   </button>
                 </div>
                 <small role="status">

@@ -138,8 +138,9 @@ describe("SLICE_03B — Macroetapa 4: plano de controle operacional (frontend)",
         /Promise\.all\(\[\s*obterCampanhaDetalhe\(campanha\.campanhaId\),\s*obterReadinessOperacional\(campanha\.campanhaId\),\s*\]\)/g,
       ) ?? []
     ).length;
-    // PREPARAR/AUTORIZAR/ATIVAR (1) + pós-canário (1) = 2 pontos de sincronia.
-    expect(recargas).toBe(2);
+    // PREPARAR/AUTORIZAR/ATIVAR (1) + pós-canário (1) + pós-lote GF5.3 (1)
+    // = 3 pontos de sincronia (mesmo padrão server-driven).
+    expect(recargas).toBe(3);
     expect(codigo).toContain("setCampanha(detalhe)");
     expect(codigo).toContain("setReadiness(corpoReadiness)");
     // Nenhuma transição/estado local é inferido do POST.
@@ -268,5 +269,181 @@ describe("SLICE_03B — Macroetapa 4: plano de controle operacional (frontend)",
   it("zero Gmail/zero mutação: a tela não invoca rota produtiva de envio", () => {
     expect(FONTE_WORKSPACE).not.toContain("/api/execute");
     expect(FONTE_WORKSPACE).not.toContain("gmail");
+  });
+});
+// ---------------------------------------------------------------------------
+// GF5.3 — Executar lote: matriz obrigatória da UI (17–31). Provas por leitura
+// de fonte (mesmo padrão das suítes de controle): autoridade EXCLUSIVA do
+// readiness server-driven, confirmação humana, guardas de duplo clique,
+// fail-closed de readiness e domínios de erro separados.
+// ---------------------------------------------------------------------------
+describe("GF5.3 — Executar lote (UI): autoridade server-driven e guardas", () => {
+  const codigo = FONTE_WORKSPACE.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+  function trechoEntre(inicio: string, fim: string): string {
+    const i = codigo.indexOf(inicio);
+    expect(i, "âncora inicial: " + inicio).toBeGreaterThan(-1);
+    const j = codigo.indexOf(fim, i);
+    expect(j, "âncora final: " + fim).toBeGreaterThan(-1);
+    return codigo.slice(i, j);
+  }
+
+  // (17) botão existe + (18) governado EXCLUSIVAMENTE por
+  // readiness.acoes.EXECUTAR_LOTE.permitida (+ guardas locais de pendência).
+  it("17+18. botão do lote existe e é governado EXCLUSIVAMENTE por EXECUTAR_LOTE.permitida", () => {
+    const indice = codigo.indexOf('!readiness.acoes.EXECUTAR_LOTE.permitida');
+    expect(indice).toBeGreaterThan(-1);
+    const abertura = codigo.lastIndexOf("<button", indice);
+    const botao = codigo.slice(abertura, codigo.indexOf("</button>", indice));
+    expect(botao).toContain("type=\"button\"");
+    // Nenhuma derivação local de elegibilidade (flags/contagens/estado):
+    expect(botao).not.toContain("batchSendEnabled");
+    expect(botao).not.toContain("canExecute");
+    expect(botao).not.toContain("realSendEnabled");
+    expect(botao).not.toContain("lote.estado");
+    expect(botao).not.toContain("oauth");
+  });
+
+  // (19) nenhuma reconstrução local da elegibilidade do lote no arquivo.
+  it("19. nenhuma reconstrução local de elegibilidade (rota única + permissão só do servidor)", () => {
+    const api = trechoEntre(
+      "async function executarLoteOperacional(",
+      "class ApiCampanhaError",
+    );
+    expect(api).toContain('"/api/campaigns/batch-send"');
+    expect(api).toContain("body: JSON.stringify({ campanhaId })");
+    // Nenhuma segunda rota/loop/derivação de permissão no cliente.
+    expect(api).not.toContain("permitida");
+    expect(api).not.toContain("|| readiness.politicas");
+  });
+
+  // (20) confirmação humana explícita com conteúdo objetivo + (21) cancelar
+  // ⇒ ZERO POST + (26) nenhuma repetição automática (timer/loop/fila).
+  it("20+21+26. confirmação objetiva; cancelar ⇒ ZERO POST; nenhum retry/timer/loop", () => {
+    const fn = trechoEntre(
+      "async function executarLoteOperacionalUI(",
+      "const visaoMacro = useMemo(",
+    );
+    expect(fn).toContain("window.confirm(");
+    expect(fn).toContain("no máximo 10 itens");
+    expect(fn).toContain("Não há retry automático");
+    expect(fn).toContain("nova ação humana explícita");
+    // Cancelar ⇒ ZERO POST: o fetch só ocorre DEPOIS do gate do confirm.
+    const iConfirm = fn.indexOf("window.confirm(");
+    const iFetch = fn.indexOf("await executarLoteOperacional(");
+    expect(iFetch).toBeGreaterThan(iConfirm);
+    // Cancelar ⇒ ZERO POST: o gate "if (!confirmado) … return;" fica entre o
+    // confirm e o despacho (nunca depois do POST).
+    const iGate = fn.indexOf("if (!confirmado)");
+    expect(iGate).toBeGreaterThan(iConfirm);
+    expect(fn.slice(iGate, iFetch)).toContain("return;");
+    // Nenhuma repetição automática em nenhum lugar do arquivo.
+    expect(codigo).not.toMatch(/setInterval\(|setTimeout\([^,]*executarLote|autoContinue/i);
+  });
+
+  // (22) exatamente UM POST por confirmação + (24) guarda dedicada de duplo
+  // clique/reação + (25) readiness invalidado antes do despacho.
+  it("22+24+25. uma confirmação = um POST; lotePendente; setReadiness(null) antes do despacho", () => {
+    const fn = trechoEntre(
+      "async function executarLoteOperacionalUI(",
+      "const visaoMacro = useMemo(",
+    );
+    expect(fn).toContain("if (!campanha?.campanhaId || acaoPendente !== null || lotePendente || canarioPendente) return;");
+    expect(fn).toContain("setLotePendente(true)");
+    expect(fn).toContain("setReadiness(null);");
+    expect(fn).toContain("await executarLoteOperacional(campanha.campanhaId)");
+    // Exatamente UMA chamada de POST dentro do handler.
+    expect(fn.match(/await executarLoteOperacional\(/g) ?? []).toHaveLength(1);
+    expect(fn).toContain('} finally {\n      setLotePendente(false);\n    }');
+  });
+
+  // (23) corpo EXATAMENTE { campanhaId } (nenhuma autoridade adicional).
+  it("23. corpo do POST é exatamente { campanhaId }", () => {
+    const api = trechoEntre(
+      "async function executarLoteOperacional(",
+      "class ApiCampanhaError",
+    );
+    expect(api).toContain('body: JSON.stringify({ campanhaId })');
+    expect(api).not.toMatch(/JSON\.stringify\(\{[^}]*limit|batchSize|maxItems|offset|cursor|itemIds|operatorId/);
+  });
+
+  // (27) PARCIAL não auto-continua: mensagem exige nova ação humana; nenhuma
+  // re-invocação do POST em nenhum ramo do handler.
+  it("27. PARCIAL ⇒ mensagem explícita de continuação manual; ZERO auto-continue", () => {
+    const fn = trechoEntre(
+      "async function executarLoteOperacionalUI(",
+      "const visaoMacro = useMemo(",
+    );
+    expect(fn).toContain('"PARCIAL"');
+    expect(fn).toContain("Continuação somente com nova ação humana explícita");
+    // Nenhum ramo chama o POST novamente (nem condicionalmente).
+    expect(fn.match(/await executarLoteOperacional\(/g) ?? []).toHaveLength(1);
+  });
+
+  // (28) resultado DEFINITIVO do POST sobrevive à falha de refresh (domínios
+  // de erro separados; readiness nulo; nenhuma reescrita da mensagem).
+  it("28. resultado do POST preservado se a sincronização pós-execução falhar", () => {
+    const fn = trechoEntre(
+      "async function executarLoteOperacionalUI(",
+      "const visaoMacro = useMemo(",
+    );
+    const iMutacao = fn.indexOf("await executarLoteOperacional(campanha.campanhaId)");
+    const iSync = fn.indexOf("try {\n        const [detalhe, corpoReadiness]");
+    const iFalhaSync = fn.indexOf('"Falha na sincronização do estado pós-execução');
+    expect(iSync).toBeGreaterThan(iMutacao);
+    expect(iFalhaSync).toBeGreaterThan(iSync);
+    // A sincronização é um try/catch PRÓPRIO dentro do try da mutação: falha
+    // de refresh não apaga mensagem nem dispara novo POST.
+    const blocoSync = fn.slice(iSync, iFalhaSync + 200);
+    expect(blocoSync).toContain("catch");
+    expect(blocoSync).toContain("setReadiness(null)");
+  });
+
+  // (29) 4xx ⇒ rejeição DEFINITIVA (sem "não conclusivo").
+  it("29. 4xx é classificado como rejeição definitiva", () => {
+    const fn = trechoEntre(
+      "async function executarLoteOperacionalUI(",
+      "const visaoMacro = useMemo(",
+    );
+    const i4xx = fn.indexOf("error.status >= 400 && error.status < 500");
+    expect(i4xx).toBeGreaterThan(-1);
+    const ramo4xx = fn.slice(i4xx, fn.indexOf("} else {", i4xx));
+    expect(ramo4xx).toContain("Rejeição definitiva do servidor");
+    expect(ramo4xx).not.toContain("NÃO CONCLUSIVO");
+  });
+
+  // (30) rede/5xx ⇒ POTENCIALMENTE NÃO CONCLUSIVO (itens podem ter sido
+  // settlementados; sem retry; somente readiness novo autoriza continuação).
+  it("30. rede/5xx é conservador: potencialmente não conclusivo, sem retry", () => {
+    const fn = trechoEntre(
+      "async function executarLoteOperacionalUI(",
+      "const visaoMacro = useMemo(",
+    );
+    expect(fn).toContain("NÃO CONCLUSIVO");
+    expect(fn).toContain("podem já ter sido processados");
+    expect(fn).toContain("somente um readiness novo do servidor autoriza continuação");
+  });
+
+  // (31) aggregate exibido sem PII: somente contagens + motivo sanitizado.
+  it("31. contagens agregadas exibidas sem recipient PII", () => {
+    const fn = trechoEntre(
+      "async function executarLoteOperacionalUI(",
+      "const visaoMacro = useMemo(",
+    );
+    expect(fn).toContain("processadosNestaExecucao");
+    expect(fn).toContain("enviadosNestaExecucao");
+    expect(fn).toContain("restantesPreparados");
+    // Nenhum campo de PII/segredo é lido do resultado do POST.
+    expect(fn).not.toMatch(/receipt|fingerprint|access_token|email|destinatario/);
+  });
+
+  // Complemento — rótulo Continuar lote derivado SOMENTE de estado sanitizado
+  // do servidor (contagem PREPARADO do readiness), sem mudar a autoridade.
+  it("complemento. rótulo Continuar lote deriva apenas de contagem sanitizada do readiness", () => {
+    const indice = codigo.indexOf('!readiness.acoes.EXECUTAR_LOTE.permitida');
+    const abertura = codigo.lastIndexOf("<button", indice);
+    const botao = codigo.slice(abertura, codigo.indexOf("</button>", indice));
+    expect(botao).toContain('"Continuar lote"');
+    expect(botao).toContain("contagemPorEstado.PREPARADO");
   });
 });

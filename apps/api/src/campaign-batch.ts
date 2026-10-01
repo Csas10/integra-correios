@@ -76,6 +76,15 @@ export const BLOQUEIOS_LOTE = {
   WIRING: "PROVIDER_WIRING_NOT_READY",
 } as const;
 
+/**
+ * GF5.3 — JANELA DE EXECUÇÃO POR INVOCAÇÃO HTTP (server-side; NUNCA do
+ * browser). Limite SUPERIOR de itens PREPARADO processados em uma única
+ * execução do lote. Não é limite de destinatários da campanha: lotes maiores
+ * são concluídos por janelas sucessivas, cada uma com nova autorização humana
+ * explícita e novo preflight canônico (resumível do estado durável).
+ */
+export const MAX_BATCH_ITEMS_PER_HTTP_RUN = 10;
+
 export interface EntradaPreflightLote {
   readonly operatorId: string;
   readonly campanhaId: string;
@@ -314,7 +323,7 @@ export interface FornecedorProvedoresLote {
 export type ResultadoExecucaoLote = {
   readonly campanhaId: string;
   readonly loteCampanhaId: string;
-  readonly resultado: "CONCLUIDO" | "INTERROMPIDO" | "BLOQUEADO";
+  readonly resultado: "CONCLUIDO" | "PARCIAL" | "INTERROMPIDO" | "BLOQUEADO";
   readonly totalItens: number;
   readonly preparadosInicio: number;
   readonly enviadosAntes: number;
@@ -354,6 +363,14 @@ export async function executarLoteCampanha(
      * EXATAMENTE por executeAttemptCampanha (claim/provas/settlement).
      */
     readonly executarTentativa?: typeof executeAttemptCampanha;
+    /**
+     * GF5.3 — teto SERVER-SIDE de itens processados nesta execução (janela
+     * limitada). A rota HTTP de produção injeta EXATAMENTE a constante
+     * MAX_BATCH_ITEMS_PER_HTTP_RUN; testes podem injetar valores menores.
+     * NUNCA origina de request/body/query/header/cookie. O restante dos itens
+     * PREPARADO permanece PREPARADO (lote resumível por nova invocação).
+     */
+    readonly maxItensNestaExecucao?: number;
   },
 ): Promise<ResultadoExecucaoLote> {
   // 1–2. Preflight canônico: bloqueado ⇒ ZERO claim/provider.
@@ -392,7 +409,15 @@ export async function executarLoteCampanha(
   let restantesPreparados = preparadosInicio;
 
   // 3–7. Sequencial estrito (sem Promise.all, sem worker, sem scheduler).
-  for (const item of preflight.itensElegiveis) {
+  // GF5.3 — janela server-side: no máximo maxItensNestaExecucao itens são
+  // processados nesta invocação (default = constante canônica; nunca do
+  // cliente). Itens além da janela permanecem PREPARADO ⇒ resultado PARCIAL.
+  const limiteJanela =
+    entrada.maxItensNestaExecucao !== undefined && entrada.maxItensNestaExecucao >= 0
+      ? entrada.maxItensNestaExecucao
+      : MAX_BATCH_ITEMS_PER_HTTP_RUN;
+  const janelaItens = preflight.itensElegiveis.slice(0, limiteJanela);
+  for (const item of janelaItens) {
     // Provas server-side por item (mesmo compositor canônico do canário;
     // deriva lote/item do estado durável — nada do cliente).
     const provasResultado = await emitirProvas(
@@ -469,9 +494,11 @@ export async function executarLoteCampanha(
     campanhaId: entrada.campanhaId,
     loteCampanhaId: preflight.loteCampanhaId,
     resultado:
-      motivoInterrupcao === undefined
-        ? "CONCLUIDO"
-        : "INTERROMPIDO",
+      motivoInterrupcao !== undefined
+        ? "INTERROMPIDO"
+        : restantesPreparados > 0
+          ? "PARCIAL"
+          : "CONCLUIDO",
     totalItens: preflight.totalItens,
     preparadosInicio,
     enviadosAntes: preflight.enviados,

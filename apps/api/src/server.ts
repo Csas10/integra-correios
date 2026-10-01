@@ -100,6 +100,8 @@ import {
 // arma com PF_CAMPAIGN_CANARY_SEND_ENABLED=true (política) e a UI não tem
 // handler de envio.
 import { criarCampanhaGmailRuntime } from "./campaign-gmail-runtime.js";
+// GF5.2 — preflight READ-ONLY do lote controlado (EXECUTAR_LOTE no readiness).
+import { preflightLoteCampanha } from "./campaign-batch.js";
 import {
   ProvedorGmailCampanha,
   avaliarReadinessOauthCanario,
@@ -1957,6 +1959,18 @@ const ROTAS: readonly Rota[] = [
           politica,
           contexto: { fingerprinter: fingerprinter() },
         });
+        // GF5.2 — EXECUTAR_LOTE: mesma disciplina read-only do canário; a
+        // elegibilidade EFETIVA = papel EXECUTOR ∧ preflight do lote
+        // (política batchSendEnabled ∧ canExecute ∧ realSendEnabled, lote
+        // ATIVO, autorização vigente, canário ENVIADO com evidência durável,
+        // sem ENFILEIRADO pendente, sem ambiguidade não resolvida, ≥1
+        // PREPARADO). Zero claim/mutação/token/rede na derivação.
+        const lotePreflight = await preflightLoteCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId,
+          papeis: identity.roles,
+          politica,
+        });
         json(res, 200, {
           campanha: { campanhaId, estado: "LOTE_CRIADO" },
           lote: {
@@ -2021,6 +2035,12 @@ const ROTAS: readonly Rota[] = [
                   : canarioPreflight.bloqueios
                 : ["OPERATOR_ROLE_FORBIDDEN"],
             },
+            // GF5.2 — autoridade server-side; o browser NUNCA deriva a
+            // elegibilidade do lote localmente.
+            EXECUTAR_LOTE: {
+              permitida: lotePreflight.elegivel,
+              bloqueios: lotePreflight.elegivel ? [] : lotePreflight.bloqueios,
+            },
           },
           executavel: false,
           envioRealDesabilitado: !politica.realSendEnabled,
@@ -2032,7 +2052,9 @@ const ROTAS: readonly Rota[] = [
                 ? "ATIVAR_LOTE"
                 : politica.canarySendEnabled
                   ? "CANARY_SEND_BLOQUEADO"
-                  : "AGUARDAR_GATES_OPERACIONAIS",
+                  : lotePreflight.elegivel
+                    ? "EXECUTAR_LOTE"
+                    : "AGUARDAR_GATES_OPERACIONAIS",
         });
       } catch (error) {
         erroControleCampanha(res, error);

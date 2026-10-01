@@ -114,6 +114,7 @@ function politicaBase(): PfUpdateCampaignPolicy {
     canPrepareBatch: true,
     realSendEnabled: false,
     canarySendEnabled: false,
+    batchSendEnabled: false,
   };
 }
 

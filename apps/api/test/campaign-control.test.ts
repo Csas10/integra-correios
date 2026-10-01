@@ -81,6 +81,7 @@ const politicaFechada: PfUpdateCampaignPolicy = {
   canPrepareBatch: false,
   realSendEnabled: false,
   canarySendEnabled: false,
+    batchSendEnabled: false,
 };
 
 // Fonte dos módulos — provas estruturais (Parte 2).
@@ -121,6 +122,7 @@ describe("SLICE_03B — política de preparação e elegibilidade por ação (BE
       canPrepareBatch: false,
       realSendEnabled: false,
       canarySendEnabled: false,
+    batchSendEnabled: false,
     });
   });
 

@@ -67,7 +67,7 @@ const CHAVES_SINTETICAS = [
 const CHAVE_PROVA_BASE64 = Buffer.from("chave-de-prova-sintetica-gf53-32bytes!!", "utf8").subarray(0, 32).toString("base64");
 const CHAVE_FINGERPRINT_FIXTURE_B64 = Buffer.from("fp-fixture-key-gf53---32bytes!!!!", "utf8").subarray(0, 32).toString("base64");
 const CONTA_ESPERADA = "institucional.gf53@exemplo.test";
-const OAUTH_NONCE_FIXTURE = Buffer.from("noncegf53x", "utf8"); // exatamente 12 bytes
+const OAUTH_NONCE_FIXTURE = Buffer.from("noncegf53xyz", "utf8"); // exatamente 12 bytes
 const OAUTH_AUTH_TAG_FIXTURE = Buffer.alloc(16); // exatamente 16 bytes
 
 /** Token sintético ÚNICO por semente: 43–128 chars, [A-Za-z0-9_-]. */

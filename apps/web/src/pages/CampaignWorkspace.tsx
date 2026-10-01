@@ -70,6 +70,10 @@ type ReadinessOperacional = {
     AUTORIZAR_EXECUCAO: AcaoOperacao;
     ATIVAR_LOTE: AcaoOperacao;
     EXECUTAR_ITEM: AcaoOperacao;
+    // GF4.5 — ação do canário derivada EXCLUSIVAMENTE pelo servidor (mesmo
+    // preflight canônico read-only do envio real); o cliente nunca reconstrói
+    // elegibilidade a partir de flags locais.
+    EXECUTAR_CANARIO: AcaoOperacao;
   };
   // SLICE-03C.2A — OAuth readiness read-only (estados sanitizados).CONNECTED
   // significa SOMENTE "persistido + conta esperada correspondente" — nunca
@@ -412,6 +416,30 @@ async function ativarLoteOperacional(campanhaId: string): Promise<ResultadoContr
   });
 }
 
+// GF4.5 — canário controlado: EXATAMENTE a rota canônica
+// POST /api/campaigns/canary-send, com corpo restrito a { campanhaId }.
+// Nenhum operatorId, loteId, itemId, destinatário, e-mail, fingerprint,
+// prova, hash, dado de OAuth, provider, valor de flag ou chave de
+// idempotência é enviado pelo cliente — o servidor reconstrói TODA a
+// autoridade. Nenhum retry automático existe nesta função.
+type ResultadoCanarioOperacional = {
+  resultado: string;
+  itemId?: string;
+  receipt?: { messageId?: string; provider?: string; acceptedAt?: string };
+  motivo?: string;
+  erro?: string;
+};
+
+async function executarCanarioOperacional(
+  campanhaId: string,
+): Promise<ResultadoCanarioOperacional> {
+  return fetchJson<ResultadoCanarioOperacional>("/api/campaigns/canary-send", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ campanhaId }),
+  });
+}
+
 async function obterCampanhaDetalhe(campanhaId: string): Promise<CampanhaPersistida> {
   const resposta = await fetchJson<{ campanha: CampanhaPersistida }>(
     `/api/campaigns/detail?campanhaId=${encodeURIComponent(campanhaId)}`,
@@ -560,6 +588,10 @@ export function CampaignWorkspace() {
   const [acaoPendente, setAcaoPendente] = useState<"PREPARAR" | "AUTORIZAR" | "ATIVAR" | null>(null);
   const [acaoMensagem, setAcaoMensagem] = useState("");
   const [acaoErro, setAcaoErro] = useState("");
+  // GF4.5 — guarda local de clique pendente do canário: usada SOMENTE para
+  // impedir duplo clique durante o POST em andamento. A elegibilidade em si
+  // é SEMPRE do servidor (readiness.acoes.EXECUTAR_CANARIO).
+  const [canarioPendente, setCanarioPendente] = useState(false);
 
   async function loadMe(): Promise<boolean> {
     try {
@@ -1326,21 +1358,97 @@ export function CampaignWorkspace() {
           : acao === "AUTORIZAR"
             ? await autorizarExecucaoOperacional(campanha.campanhaId)
             : await ativarLoteOperacional(campanha.campanhaId);
-      // Recarrega o readiness server-driven ANTES de exibir o resultado: o
-      // estado exibido passa a refletir o banco, não a resposta da ação.
-      const corpoReadiness = await obterReadinessOperacional(campanha.campanhaId);
+      // GF4.5 — sincronização SERVER-DRIVEN pós-mutação: recarrega AMBOS os
+      // recursos autoritativos (detail + readiness) antes de apresentar o
+      // estado. O novo estado NUNCA é inferido da resposta do POST; nenhuma
+      // transição local (ex.: PREPARADO → ATIVO) existe.
+      const [detalhe, corpoReadiness] = await Promise.all([
+        obterCampanhaDetalhe(campanha.campanhaId),
+        obterReadinessOperacional(campanha.campanhaId),
+      ]);
+      setCampanha(detalhe);
       setReadiness(corpoReadiness);
       setReadinessErro("");
       setAcaoMensagem(corpo.status + (corpo.aviso ? " — " + corpo.aviso : ""));
     } catch (error: unknown) {
+      // GF4.5 — falha na mutação OU na leitura autoritativa: nenhum estado
+      // de sucesso é inventado; o operador é orientado a reler o estado
+      // persistido; o POST NUNCA é repetido automaticamente.
       setAcaoMensagem("");
       setAcaoErro(
-        error instanceof ApiCampanhaError
+        (error instanceof ApiCampanhaError
           ? error.message
-          : "Ação operacional indisponível.",
+          : "Ação operacional indisponível.") +
+          " Estado não sincronizado — recarregue/consulte o estado persistido antes de repetir qualquer ação.",
       );
     } finally {
       setAcaoPendente(null);
+    }
+  }
+
+  // GF4.5 — execução controlada do canário: elegibilidade vem EXCLUSIVAMENTE
+  // do readiness server-driven (acoes.EXECUTAR_CANARIO.permitida); o cliente
+  // NUNCA deriva permissão de canExecute/realSendEnabled/canarySendEnabled/
+  // lote.estado/OAuth/canarySelected ou qualquer combinação local deles.
+  // Confirmação humana explícita ⇒ exatamente UM POST; cancelar ⇒ ZERO POST;
+  // nenhuma repetição automática (ambiguidade exige adjudicação do owner).
+  async function executarCanarioOperacionalUI(): Promise<void> {
+    if (!campanha?.campanhaId || acaoPendente !== null || canarioPendente) return;
+    const confirmado = window.confirm(
+      "Executar o canário real controlado?\n" +
+        "Esta ação poderá realizar exatamente um envio real pelo Gmail para o destinatário canário configurado no servidor.\n" +
+        "Não haverá lote completo nem retry automático.\n" +
+        "Confirme somente se o gate de canário foi explicitamente autorizado.",
+    );
+    if (!confirmado) {
+      setAcaoMensagem("");
+      setAcaoErro("");
+      return;
+    }
+    setCanarioPendente(true);
+    setAcaoMensagem("");
+    setAcaoErro("");
+    try {
+      const corpo = await executarCanarioOperacional(campanha.campanhaId);
+      // Pós-canário: recarrega AMBOS os recursos autoritativos antes de
+      // apresentar o estado durável; nada é inferido localmente (não existe
+      // transição ENVIADO no cliente).
+      const [detalhe, corpoReadiness] = await Promise.all([
+        obterCampanhaDetalhe(campanha.campanhaId),
+        obterReadinessOperacional(campanha.campanhaId),
+      ]);
+      setCampanha(detalhe);
+      setReadiness(corpoReadiness);
+      setReadinessErro("");
+      if (corpo.resultado === "AMBIGUO") {
+        // Resultado não conclusivo: NUNCA repetir o POST automaticamente;
+        // apenas a leitura read-only acima foi realizada.
+        setAcaoMensagem("");
+        setAcaoErro(
+          "Resultado do canário não conclusivo. Não repetir automaticamente. Verifique o estado persistido antes de qualquer nova tentativa.",
+        );
+      } else {
+        setAcaoMensagem(
+          "Canário: " +
+            corpo.resultado +
+            (corpo.receipt?.messageId ? " — recibo " + corpo.receipt.messageId : corpo.motivo ? " — " + corpo.motivo : ""),
+        );
+      }
+    } catch (error: unknown) {
+      // Falha de rede/transporte após despacho é potencialmente AMBÍGUA:
+      // comportamento conservador — ZERO repetição automática, apenas o
+      // aviso sanitizado (a releitura de estado não é automática aqui para
+      // nunca mascarar o resultado pendente com um estado supostamente
+      // atual; o operador relê o estado explicitamente).
+      setAcaoMensagem("");
+      setAcaoErro(
+        (error instanceof ApiCampanhaError
+          ? error.message
+          : "Canário indisponível.") +
+          " Resultado do canário não conclusivo. Não repetir automaticamente. Verifique o estado persistido antes de qualquer nova tentativa.",
+      );
+    } finally {
+      setCanarioPendente(false);
     }
   }
 
@@ -2364,15 +2472,28 @@ export function CampaignWorkspace() {
                   >
                     {acaoPendente === "ATIVAR" ? "Ativando…" : "Ativar lote"}
                   </button>
-                  {/* SLICE-03C.1 — Executar permanece SEMPRE disabled, sem
-                      onClick: nenhum handler chama execute-attempt no cliente.
-                      SLICE-03C.2A — Executar canário também é SEM handler:
-                      gate operacional do owner pendente (STRICT NO SEND). */}
+                  {/* SLICE-03C.1 — Executar (genérico) permanece SEMPRE
+                      disabled e SEM onClick: nenhum handler chama
+                      execute-attempt no cliente. GF4.5 — Executar canário é
+                      o ÚNICO caminho de envio exposto, governado
+                      EXCLUSIVAMENTE pelo readiness server-driven
+                      (EXECUTAR_CANARIO.permitida) + guarda de duplo clique;
+                      com as políticas fechadas ele permanece desabilitado. */}
                   <button type="button" disabled>
                     Executar (provider indisponível — envio não autorizado)
                   </button>
-                  <button type="button" disabled>
-                    Executar canário (gate operacional pendente — envio não autorizado)
+                  <button
+                    type="button"
+                    disabled={
+                      !readiness.acoes.EXECUTAR_CANARIO.permitida ||
+                      acaoPendente !== null ||
+                      canarioPendente
+                    }
+                    onClick={() => void executarCanarioOperacionalUI()}
+                  >
+                    {canarioPendente
+                      ? "Executando canário…"
+                      : "Executar canário controlado"}
                   </button>
                 </div>
                 <small role="status">

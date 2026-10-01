@@ -104,6 +104,7 @@ import {
   ProvedorGmailCampanha,
   avaliarReadinessOauthCanario,
   enviarCanarioCampanha,
+  preflightCanarioCampanha,
   statusOauthFromReadiness,
 } from "./campaign-canary.js";
 import type { ProvedorEnvioCampanha } from "./campaign-execution.js";
@@ -1933,6 +1934,21 @@ const ROTAS: readonly Rota[] = [
         // descriptografado; CONNECTED não prova token/refresh/reachability/
         // send-as (03C.2B1).
         const oauthEstado = statusOauthFromReadiness(oauth);
+        // GF4.5 — a ação de canário exposta ao UI é derivada SERVER-SIDE
+        // pelo MESMO preflight canônico do envio real
+        // (preflightCanarioCampanha), em modo ESTRITAMENTE READ-ONLY: zero
+        // claim, zero outbox, zero evento, zero carga/descriptografia/refresh
+        // de token, zero Google/Gmail/provider. A resposta expõe SOMENTE o
+        // par sanitizado { permitida, bloqueios } — nenhum destinatário,
+        // fingerprint, prova, token ou segredo. O browser NUNCA reconstrói
+        // elegibilidade; POST /api/campaigns/canary-send permanece a ÚNICA
+        // autoridade de mutação/envio do canário.
+        const canarioPreflight = await preflightCanarioCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId,
+          politica,
+          contexto: { fingerprinter: fingerprinter() },
+        });
         json(res, 200, {
           campanha: { campanhaId, estado: "LOTE_CRIADO" },
           lote: {
@@ -1984,6 +2000,13 @@ const ROTAS: readonly Rota[] = [
             AUTORIZAR_EXECUCAO: { permitida: autorizacao.permitida, bloqueios: autorizacao.bloqueios },
             ATIVAR_LOTE: { permitida: ativacao.permitida, bloqueios: ativacao.bloqueios },
             EXECUTAR_ITEM: { permitida: execucao.permitida, bloqueios: execucao.bloqueios },
+            // GF4.5 — derivação canônica do MESMO preflight do envio real;
+            // sem fabricar verde a partir de flags grossas: qualquer
+            // inconsistência real aparece como bloqueio sanitizado.
+            EXECUTAR_CANARIO: {
+              permitida: canarioPreflight.elegivel,
+              bloqueios: canarioPreflight.elegivel ? [] : canarioPreflight.bloqueios,
+            },
           },
           executavel: false,
           envioRealDesabilitado: !politica.realSendEnabled,

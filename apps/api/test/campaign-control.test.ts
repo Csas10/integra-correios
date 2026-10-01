@@ -900,7 +900,10 @@ describe("SLICE_03B — estrutura de fonte (SOURCE_STRUCTURE)", () => {
   it("interface Macroetapa 4: readiness server-driven, HOLD visível, execução desabilitada", () => {
     expect(FONTE_WORKSPACE).toContain("operational-readiness");
     expect(FONTE_WORKSPACE).toContain("Controle operacional (readiness)");
-    expect(FONTE_WORKSPACE).toContain("execução indisponível");
+    // GF5.4A — copy estática removida: estado de execução do lote deriva do
+    // EXECUTAR_LOTE server-driven (permitida/bloqueios), nunca de frase fixa.
+    expect(FONTE_WORKSPACE).toContain("EXECUTAR_LOTE.bloqueios");
+    expect(FONTE_WORKSPACE).not.toContain("execução indisponível");
     // O botão de execução da Macroetapa 4 permanece SEMPRE desabilitado.
     const indice = FONTE_WORKSPACE.indexOf("Controle operacional (readiness)");
     const trecho = FONTE_WORKSPACE.slice(indice, indice + 8600);

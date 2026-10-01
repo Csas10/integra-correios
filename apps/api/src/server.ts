@@ -100,8 +100,16 @@ import {
 // arma com PF_CAMPAIGN_CANARY_SEND_ENABLED=true (política) e a UI não tem
 // handler de envio.
 import { criarCampanhaGmailRuntime } from "./campaign-gmail-runtime.js";
-// GF5.2 — preflight READ-ONLY do lote controlado (EXECUTAR_LOTE no readiness).
-import { preflightLoteCampanha } from "./campaign-batch.js";
+// GF5.2/5.3 — preflight READ-ONLY + execução limitada do lote controlado.
+import {
+  MAX_BATCH_ITEMS_PER_HTTP_RUN,
+  executarLoteCampanha,
+  preflightLoteCampanha,
+  type FornecedorProvedoresLote,
+} from "./campaign-batch.js";
+// GF5.3 — SEAM consolidado GF5.1: a rota do lote monta o MESMO adapter
+// canônico do canário (nenhuma segunda implementação OAuth/transporte).
+import { montarConsolidatedMailAdapter } from "./campaign-consolidated-mail.js";
 import {
   ProvedorGmailCampanha,
   avaliarReadinessOauthCanario,
@@ -122,6 +130,28 @@ export function injetarProvedorCanarioParaTeste(
   provider: ProvedorEnvioCampanha | null,
 ): void {
   provedorCanarioParaTeste = provider;
+}
+
+// ---------------------------------------------------------------------------
+// GF5.3 — TEST-ONLY PROVIDER INJECTION para o LOTE (mesmo contrato do canário,
+// TEST_PROVIDER_DEPENDENCY_INJECTION=true): dependency injection de FÁBRICA,
+// NUNCA selecionável por request (query/body/header/cookie), NUNCA por flag
+// genérica, NUNCA por NODE_ENV. O runtime normal SEMPRE compõe o adapter
+// consolidado GF5.1 (montarConsolidatedMailAdapter). Nenhum fake de teste vaza
+// para a autoridade de controle de produção.
+// ---------------------------------------------------------------------------
+let fornecedorLoteParaTeste: FornecedorProvedoresLote | null = null;
+export function injetarFornecedorLoteParaTeste(
+  fornecedor: FornecedorProvedoresLote | null,
+): void {
+  fornecedorLoteParaTeste = fornecedor;
+}
+
+function fornecedorLoteRuntime(
+  provedorPadrao: (campanhaId: string) => ProvedorEnvioCampanha,
+): FornecedorProvedoresLote {
+  if (fornecedorLoteParaTeste) return fornecedorLoteParaTeste;
+  return { provedorParaCampanha: provedorPadrao };
 }
 
 function provedorCanarioRuntime(campanhaId: string): ProvedorEnvioCampanha {
@@ -268,6 +298,9 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "POST /api/campaigns/authorize-execution",
   "POST /api/campaigns/activate",
   "POST /api/campaigns/canary-send",
+  // GF5.3 — superfície governada do lote: sessão individual + papel EXECUTOR
+  // (exigirOperadorCampanha); nunca o fallback legacy do piloto.
+  "POST /api/campaigns/batch-send",
   "POST /api/campaigns/execute-attempt",
 ]);
 
@@ -2306,6 +2339,110 @@ const ROTAS: readonly Rota[] = [
           ? { motivo: tentativa.motivo }
           : {}),
       });
+    },
+  },
+  {
+    // GF5.3 — BATCH SEND GOVERNADO (PUBLICAÇÃO DA SUPERFÍCIE DE CONTROLE).
+    // Cadeia de autoridade: guarda EXECUTOR (mesma semântica canônica do
+    // canary-send) → corpo EXATAMENTE { campanhaId } (nenhuma autoridade
+    // adicional do cliente: operatorId/lote/item/destinatário/fingerprint/
+    // template/subject/body/provider/proof/OAuth/idempotência/limit/flags
+    // são REJEITADOS) → política canônica única → executarLoteCampanha
+    // (que reexecuta o preflightLoteCampanha canônico: READINESS PERMISSION =
+    // BATCH EXECUTION PREFLIGHT AUTHORITY) → executeAttemptCampanha por item
+    // → seam consolidado GF5.1 → GmailMailGateway. Nenhuma regra de lote é
+    // reimplementada neste arquivo; nenhum caminho HTTP → provider.enviar
+    // existe. Janela server-side: EXATAMENTE MAX_BATCH_ITEMS_PER_HTTP_RUN
+    // itens por invocação — o browser NUNCA fornece limites; PARCIAL aguarda
+    // NOVA ação humana explícita (AUTO_CONTINUE=false; sem retry, sem timer,
+    // sem fila, sem fetch a si mesmo).
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/batch-send",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_EXECUTOR_ROLES);
+      if (!identity) return;
+      let body: { campanhaId?: unknown };
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as typeof body;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_BATCH_JSON_INVALID" });
+        return;
+      }
+      if (!operatorUuidValido(body.campanhaId)) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) é obrigatório.",
+          codigo: "CAMPAIGN_BATCH_INVALID",
+        });
+        return;
+      }
+      const recebidas = Object.keys(body as Record<string, unknown>).filter((k) => k !== "campanhaId");
+      if (recebidas.length > 0) {
+        json(res, 422, {
+          erro: "Somente campanhaId é aceito — nenhuma autoridade adicional do cliente.",
+          codigo: "CAMPAIGN_BATCH_BODY_AUTHORITY",
+        });
+        return;
+      }
+      try {
+        // SEAM consolidado GF5.1 (canário e lote convergem no MESMO adapter);
+        // DI exclusiva de teste quando instalada — nunca selecionável pelo
+        // request e nunca por NODE_ENV/flag genérica.
+        const adapter = montarConsolidatedMailAdapter({
+          env: process.env,
+          pool: requireDbPool(),
+        });
+        const resultado = await executarLoteCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId: body.campanhaId as string,
+          papeis: identity.roles,
+          politica: carregarPoliticaCampanhaAtualizacao(),
+          contexto: { fingerprinter: fingerprinter() },
+          fornecedor: fornecedorLoteRuntime(adapter.provedorParaCampanha),
+          maxItensNestaExecucao: MAX_BATCH_ITEMS_PER_HTTP_RUN,
+        });
+        if (resultado.resultado === "BLOQUEADO") {
+          // Preflight canônico negou ANTES de qualquer claim/provider: 409
+          // determinístico com os bloqueios sanitizados e ZERO execução.
+          json(res, 409, {
+            erro: "Execução do lote bloqueada — nenhum item foi iniciado.",
+            codigo: "CAMPAIGN_BATCH_BLOCKED",
+            bloqueios: (resultado.motivoInterrupcao ?? "").split(","),
+            claims: 0,
+          });
+          return;
+        }
+        // CONCLUIDO / PARCIAL / INTERROMPIDO são resultados ADJUDICADOS do
+        // domínio (200; INTERROMPIDO NUNCA é convertido em 500 genérico).
+        // Aggregate sanitizado: contagens e ordem — sem e-mail, nome, CPF,
+        // fingerprint, prova, HMAC, OAuth, token ou resposta bruta do
+        // provider.
+        json(res, 200, {
+          resultado: resultado.resultado,
+          campanhaId: resultado.campanhaId,
+          loteCampanhaId: resultado.loteCampanhaId,
+          totalItens: resultado.totalItens,
+          preparadosInicio: resultado.preparadosInicio,
+          enviadosAntes: resultado.enviadosAntes,
+          processadosNestaExecucao: resultado.processadosNestaExecucao,
+          enviadosNestaExecucao: resultado.enviadosNestaExecucao,
+          falhasNestaExecucao: resultado.falhasNestaExecucao,
+          restantesPreparados: resultado.restantesPreparados,
+          ...(resultado.ultimaOrdemProcessada === undefined
+            ? {}
+            : { ultimaOrdemProcessada: resultado.ultimaOrdemProcessada }),
+          ...(resultado.motivoInterrupcao === undefined
+            ? {}
+            : { motivoInterrupcao: resultado.motivoInterrupcao }),
+          ...(resultado.resultado === "PARCIAL"
+            ? {
+                janelaItensPorExecucao: MAX_BATCH_ITEMS_PER_HTTP_RUN,
+                continuaSomenteComNovaAcaoHumana: true,
+              }
+            : {}),
+        });
+      } catch (error) {
+        erroControleCampanha(res, error);
+      }
     },
   },
   {

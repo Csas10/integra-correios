@@ -54,6 +54,9 @@ type ReadinessOperacional = {
     canExecute: boolean;
     realSendEnabled: boolean;
     canarySendEnabled: boolean;
+    // GF5.3 — apenas diagnóstico (DISPLAY ONLY): a autoridade do botão é
+    // EXCLUSIVAMENTE acoes.EXECUTAR_LOTE.permitida.
+    batchSendEnabled: boolean;
   };
   autorizacaoHumana: { concedida: boolean; referenciaPresente: boolean };
   // SLICE-03C.1 — campos de ativação (não sensíveis: nenhum fingerprint,
@@ -74,6 +77,10 @@ type ReadinessOperacional = {
     // preflight canônico read-only do envio real); o cliente nunca reconstrói
     // elegibilidade a partir de flags locais.
     EXECUTAR_CANARIO: AcaoOperacao;
+    // GF5.3 — ação do lote derivada EXCLUSIVAMENTE pelo servidor (mesmo
+    // preflight canônico read-only do executarLoteCampanha); o cliente nunca
+    // reconstrói elegibilidade a partir de flags/contagens locais.
+    EXECUTAR_LOTE: AcaoOperacao;
   };
   // SLICE-03C.2A — OAuth readiness read-only (estados sanitizados).CONNECTED
   // significa SOMENTE "persistido + conta esperada correspondente" — nunca
@@ -253,7 +260,7 @@ const ETAPAS: readonly { readonly numero: Etapa; readonly titulo: string; readon
   { numero: 6, titulo: "Revisão dos profissionais", descricao: "Base final por identificador institucional." },
   { numero: 7, titulo: "Prévia das mensagens", descricao: "Destinatário mascarado, assunto e corpo do template." },
   { numero: 8, titulo: "Aprovação", descricao: "Hash de congelamento do conteúdo (SHA-256)." },
-  { numero: 9, titulo: "Execução controlada", descricao: "Bloqueada nesta fase (canExecute=false)." },
+  { numero: 9, titulo: "Execução controlada", descricao: "Execução controlada pelo servidor; gates visíveis no readiness." },
   { numero: 10, titulo: "Acompanhamento", descricao: "Contadores operacionais e trilha de auditoria." },
 ];
 
@@ -440,6 +447,42 @@ async function executarCanarioOperacional(
   });
 }
 
+// GF5.3 — execução limitada do lote: EXATAMENTE a rota canônica
+// POST /api/campaigns/batch-send, com corpo restrito a { campanhaId }.
+// Nenhum operatorId, loteCampanhaId, itemId/ids, destinatário, e-mail,
+// fingerprint, template, assunto, corpo, provider, prova, dado de OAuth,
+// chave de idempotência, limit, batchSize, maxItems, offset, cursor, retry
+// ou flag é enviado pelo cliente — o servidor reconstrói TODA a autoridade e
+// aplica a janela server-side (máx 10 itens por invocação). Nenhum retry
+// automático existe nesta função.
+type ResultadoLoteOperacional = {
+  resultado: string;
+  campanhaId?: string;
+  loteCampanhaId?: string;
+  totalItens?: number;
+  preparadosInicio?: number;
+  enviadosAntes?: number;
+  processadosNestaExecucao?: number;
+  enviadosNestaExecucao?: number;
+  falhasNestaExecucao?: number;
+  restantesPreparados?: number;
+  ultimaOrdemProcessada?: number;
+  motivoInterrupcao?: string;
+  janelaItensPorExecucao?: number;
+  continuaSomenteComNovaAcaoHumana?: boolean;
+  erro?: string;
+};
+
+async function executarLoteOperacional(
+  campanhaId: string,
+): Promise<ResultadoLoteOperacional> {
+  return fetchJson<ResultadoLoteOperacional>("/api/campaigns/batch-send", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ campanhaId }),
+  });
+}
+
 async function obterCampanhaDetalhe(campanhaId: string): Promise<CampanhaPersistida> {
   const resposta = await fetchJson<{ campanha: CampanhaPersistida }>(
     `/api/campaigns/detail?campanhaId=${encodeURIComponent(campanhaId)}`,
@@ -592,6 +635,10 @@ export function CampaignWorkspace() {
   // impedir duplo clique durante o POST em andamento. A elegibilidade em si
   // é SEMPRE do servidor (readiness.acoes.EXECUTAR_CANARIO).
   const [canarioPendente, setCanarioPendente] = useState(false);
+  // GF5.3 — guarda dedicada de duplo clique/reação da execução do lote:
+  // enquanto verdadeira, o botão do lote fica desabilitado (uma confirmação
+  // humana = exatamente UM POST).
+  const [lotePendente, setLotePendente] = useState(false);
 
   async function loadMe(): Promise<boolean> {
     try {
@@ -1340,7 +1387,7 @@ export function CampaignWorkspace() {
       AUTORIZAR:
         "Autorizar a execução? Um registro auditado da autorização humana será criado. Nenhum envio é realizado.",
       ATIVAR:
-        "Ativar o lote? O lote sai de PREPARADO para ATIVO com um canário selecionado pelo servidor. O provider permanece indisponível — nada é enviado.",
+        "Ativar o lote? O lote sai de PREPARADO para ATIVO com um canário selecionado pelo servidor. A ativação não executa envios; o estado do provider é o informado pelo readiness.",
     };
     const resposta = window.confirm(perguntas[acao]);
     if (!resposta) {
@@ -1482,6 +1529,103 @@ export function CampaignWorkspace() {
     }
   }
 
+  // GF5.3 — execução limitada do lote: elegibilidade vem EXCLUSIVAMENTE do
+  // readiness server-driven (acoes.EXECUTAR_LOTE.permitida); o cliente NUNCA
+  // deriva permissão de batchSendEnabled/canExecute/realSendEnabled/lote.estado/
+  // OAuth/estado do canário/contagens ou qualquer combinação local deles.
+  // Confirmação humana explícita ⇒ exatamente UM POST; cancelar ⇒ ZERO POST;
+  // PARCIAL aguarda NOVA ação humana (AUTO_CONTINUE=false); nenhuma repetição
+  // automática (sem timer, sem loop, sem fila, sem fetch a si mesmo).
+  async function executarLoteOperacionalUI(): Promise<void> {
+    if (!campanha?.campanhaId || acaoPendente !== null || lotePendente || canarioPendente) return;
+    const confirmado = window.confirm(
+      "Executar a janela do lote controlado?\n" +
+        "Com os gates de produção armados, mensagens reais podem ser enviadas pelo Gmail.\n" +
+        "Esta invocação processa no máximo 10 itens elegíveis (janela definida pelo servidor), em ordem crescente, uma a uma.\n" +
+        "Não há retry automático. Se restarem itens PREPARADO, uma nova ação humana explícita será necessária para continuar.",
+    );
+    if (!confirmado) {
+      setAcaoMensagem("");
+      setAcaoErro("");
+      return;
+    }
+    setLotePendente(true);
+    setAcaoMensagem("");
+    setAcaoErro("");
+    // (A) FAIL-CLOSED antes do despacho: o readiness antigo é invalidado para
+    // que um EXECUTAR_LOTE.permitida=true obsoleto não reabilite o botão após
+    // a conclusão. Somente uma leitura NOVA do servidor reabilita a ação.
+    setReadiness(null);
+    setReadinessErro("");
+    const contagens = (corpo: ResultadoLoteOperacional): string =>
+      " (" +
+      "processados " + String(corpo.processadosNestaExecucao ?? 0) +
+      " · enviados " + String(corpo.enviadosNestaExecucao ?? 0) +
+      " · falhas " + String(corpo.falhasNestaExecucao ?? 0) +
+      " · restantes PREPARADO " + String(corpo.restantesPreparados ?? 0) +
+      ")";
+    try {
+      // (B) MUTAÇÃO adjudicada primeiro: o resultado do POST é preservado
+      // mesmo que a sincronização read-only posterior falhe.
+      const corpo = await executarLoteOperacional(campanha.campanhaId);
+      if (corpo.resultado === "PARCIAL") {
+        setAcaoMensagem(
+          "Lote: PARCIAL — janela do servidor consumida" + contagens(corpo) +
+            ". Continuação somente com nova ação humana explícita (sem continuação automática).",
+        );
+      } else if (corpo.resultado === "INTERROMPIDO") {
+        setAcaoMensagem(
+          "Lote: INTERROMPIDO — " + (corpo.motivoInterrupcao ?? "motivo não informado") +
+            contagens(corpo) +
+            ". Adjudicação humana necessária; não repetir automaticamente.",
+        );
+      } else {
+        setAcaoMensagem("Lote: " + corpo.resultado + contagens(corpo));
+      }
+      // Sincronização READ-ONLY com domínio de erro PRÓPRIO (não compartilha
+      // o catch da mutação): nada aqui pode reescrever a mensagem acima.
+      try {
+        const [detalhe, corpoReadiness] = await Promise.all([
+          obterCampanhaDetalhe(campanha.campanhaId),
+          obterReadinessOperacional(campanha.campanhaId),
+        ]);
+        setCampanha(detalhe);
+        setReadiness(corpoReadiness);
+        setReadinessErro("");
+      } catch {
+        // (F) falha de sincronização: o resultado do POST permanece exibido;
+        // readiness fica inválido e o operador deve reler o estado
+        // autoritativo antes de qualquer nova ação. ZERO segundo POST.
+        setReadiness(null);
+        setReadinessErro(
+          "Falha na sincronização do estado pós-execução — recarregue/consulte o estado persistido antes de nova ação.",
+        );
+      }
+    } catch (error: unknown) {
+      setAcaoMensagem("");
+      if (error instanceof ApiCampanhaError && error.status >= 400 && error.status < 500) {
+        // (E) rejeição DEFINITIVA do servidor (4xx): exibida como é — sem
+        // "não conclusivo", sem inventar envio, sem repetição automática.
+        setAcaoErro(
+          error.message +
+            " — Rejeição definitiva do servidor. Consulte o estado persistido antes de qualquer nova tentativa.",
+        );
+      } else {
+        // (D) rede/transporte/5xx: POTENCIALMENTE NÃO CONCLUSIVO — um ou mais
+        // itens podem já ter sido settlementados antes da falha do HTTP;
+        // comportamento conservador; ZERO repetição automática.
+        setAcaoErro(
+          (error instanceof ApiCampanhaError ? error.message : "Execução do lote indisponível.") +
+            " Resultado potencialmente NÃO CONCLUSIVO (falha de rede/servidor): itens podem já ter sido processados. Não repetir automaticamente; recarregue/verifique o estado persistido — somente um readiness novo do servidor autoriza continuação.",
+        );
+      }
+      // Sem readiness fresco o botão não rearma: estado fail-closed.
+      setReadiness(null);
+    } finally {
+      setLotePendente(false);
+    }
+  }
+
   // UX-FLOW-01A — a macroetapa visível é DERIVADA do estado operacional
   // (sessão, base, aprovação, campanha/lote). A navegação representa o
   // estado existente; nunca produz mutação apenas para avançar.
@@ -1563,7 +1707,13 @@ export function CampaignWorkspace() {
             </p>
           </div>
           <aside className="campaign-lock" aria-label="Estado da campanha">
-            <strong>Execução bloqueada nesta fase</strong>
+            <strong>
+              {readiness
+                ? readiness.acoes.EXECUTAR_LOTE.permitida
+                  ? "Lote apto para execução controlada"
+                  : "Execução condicionada aos gates operacionais"
+                : "Estado operacional aguardando sincronização"}
+            </strong>
             <span>Identidade individual ativa · aprovação com congelamento por hash</span>
           </aside>
         </header>
@@ -1847,8 +1997,8 @@ export function CampaignWorkspace() {
           <article><span>Excluídos</span><strong>{excluidos.length}</strong><small>Decisão humana registrada nesta sessão</small></article>
           <article><span>Aprovadas</span><strong>{aprovacao ? aprovacao.totalItens : 0}</strong><small>{aprovacao ? `Hash ${aprovacao.conteudoHash.slice(0, 12)}…` : "Nenhuma aprovação vigente"}</small></article>
           <article><span>Pendentes</span><strong>{base?.inconsistencias_pendentes ?? 0}</strong><small>Aguardando decisão do REVISOR</small></article>
-          <article><span>Enviados</span><strong>0</strong><small>canExecute=false nesta fase</small></article>
-          <article><span>Falhas</span><strong>0</strong><small>Nenhum envio autorizado</small></article>
+          <article><span>Enviados</span><strong>{readiness ? (readiness.lote.contagemPorEstado.ENVIADO ?? 0) : "—"}</strong><small>{readiness ? "Contagem durável do servidor (ENVIADO)" : "Aguardando estado operacional do servidor"}</small></article>
+          <article><span>Falhas</span><strong>{readiness ? (readiness.lote.contagemPorEstado.FALHOU ?? 0) : "—"}</strong><small>{readiness ? "Contagem durável do servidor (FALHOU)" : "Aguardando estado operacional do servidor"}</small></article>
         </section>
 
         <p className="campaign-actions-note">
@@ -1856,9 +2006,17 @@ export function CampaignWorkspace() {
           Ações disponíveis: {status?.availableActions.join(", ") || "—"}
         </p>
         <p className="campaign-actions-note">
-          Bloqueadas: EXECUTAR_LOTE (canExecute=false nesta fase) · ACOMPANHAR_PAUSAR_CANCELAR
-          (nenhum lote em execução — canCreateBatch=false) · ADMIN_TECNICO não recebe poder
-          operacional implícito.
+          {readiness
+            ? readiness.acoes.EXECUTAR_LOTE.permitida
+              ? "Executar lote: apto para execução controlada (janela limitada pelo servidor)."
+              : `Executar lote: condicionado aos gates operacionais — ${
+                  readiness.acoes.EXECUTAR_LOTE.bloqueios.length > 0
+                    ? readiness.acoes.EXECUTAR_LOTE.bloqueios.join(", ")
+                    : "políticas fechadas"
+                }.`
+            : "Executar lote: aguardando estado operacional do servidor."}{" "}
+          ACOMPANHAR_PAUSAR_CANCELAR requer lote em execução (estado do servidor) ·
+          ADMIN_TECNICO não recebe poder operacional implícito.
         </p>
 
         {erroEtapa ? (
@@ -2261,7 +2419,13 @@ export function CampaignWorkspace() {
               <li>Excluídos por decisão humana: {excluidos.length}</li>
               <li>Aprovadas: {aprovacao ? aprovacao.totalItens : 0}</li>
               <li>Pendentes de aprovação: {aprovacao ? 0 : aptosParaAprovacao.length}</li>
-              <li>Enviados: 0 · Falhas: 0 (canExecute=false)</li>
+              <li>
+                Enviados: {readiness ? (readiness.lote.contagemPorEstado.ENVIADO ?? 0) : "—"} ·
+                Falhas: {readiness ? (readiness.lote.contagemPorEstado.FALHOU ?? 0) : "—"} ·{" "}
+                {readiness
+                  ? "contagens duráveis do servidor"
+                  : "aguardando estado operacional do servidor"}
+              </li>
             </ul>
             {aprovacao ? (
               <div className="campaign-flow-stats">
@@ -2430,7 +2594,9 @@ export function CampaignWorkspace() {
                     Políticas: canPrepareBatch={String(readiness.politicas.canPrepareBatch)} ·
                     canExecute={String(readiness.politicas.canExecute)} ·
                     realSendEnabled={String(readiness.politicas.realSendEnabled)} ·
-                    canarySendEnabled={String(readiness.politicas.canarySendEnabled)}
+                    canarySendEnabled={String(readiness.politicas.canarySendEnabled)} ·{" "}
+                    batchSendEnabled={String(readiness.politicas.batchSendEnabled)} (somente
+                    diagnóstico; a autoridade é a ação EXECUTAR_LOTE)
                   </li>
                   <li>
                     OAuth: configuração={String(readiness.oauth.configurationReady)} · conexão
@@ -2454,7 +2620,8 @@ export function CampaignWorkspace() {
                     providerReady={String(readiness.ativacao.providerReady)}
                   </li>
                   <li>
-                    Provider: indisponível nesta fase · envio real desabilitado:{" "}
+                    Provider: providerReady={String(readiness.ativacao.providerReady)} (informado
+                    pelo servidor) · envio real desabilitado:{" "}
                     {String(readiness.envioRealDesabilitado)}
                   </li>
                   <li>
@@ -2470,9 +2637,9 @@ export function CampaignWorkspace() {
                       LOTE_{readiness.lote.estado === "HOLD" ? "CRIADO" : "PREPARADO"} /{" "}
                       {readiness.lote.estado}
                     </strong>{" "}
-                    — {readiness.lote.totalItens} itens · execução indisponível · motivo:{" "}
-                    {readiness.acoes.EXECUTAR_ITEM.bloqueios.join(", ") || "políticas fechadas"} ·
-                    próxima ação: {readiness.proximaAcao}
+                    {readiness.acoes.EXECUTAR_LOTE.permitida
+                      ? `— ${readiness.lote.totalItens} itens · execução: apta para execução controlada (janela limitada pelo servidor) · próxima ação: ${readiness.proximaAcao}`
+                      : `— ${readiness.lote.totalItens} itens · execução: condicionada aos gates operacionais · motivo: ${readiness.acoes.EXECUTAR_LOTE.bloqueios.join(", ") || "políticas fechadas"} · próxima ação: ${readiness.proximaAcao}`}
                   </p>
                 ) : null}
                 <div className="campaign-panel-actions">
@@ -2529,11 +2696,36 @@ export function CampaignWorkspace() {
                       ? "Executando canário…"
                       : "Executar canário controlado"}
                   </button>
+
+                  {/* GF5.3 — Executar lote: ÚNICA superfície de execução do
+                      lote, governada EXCLUSIVAMENTE pelo readiness
+                      server-driven (EXECUTAR_LOTE.permitida) + guarda de
+                      duplo clique (lotePendente). Janela limitada do
+                      servidor (máx 10 itens); PARCIAL/INTERROMPIDO aguardam
+                      nova ação humana explícita. O rótulo Continuar lote é
+                      derivado SOMENTE do estado sanitizado do servidor e não
+                      altera a autoridade. */}
+                  <button
+                    type="button"
+                    disabled={
+                      !readiness.acoes.EXECUTAR_LOTE.permitida ||
+                      acaoPendente !== null ||
+                      canarioPendente ||
+                      lotePendente
+                    }
+                    onClick={() => void executarLoteOperacionalUI()}
+                  >
+                    {lotePendente
+                      ? "Executando lote…"
+                      : (readiness.lote.contagemPorEstado.PREPARADO ?? 0) > 10
+                        ? "Continuar lote"
+                        : "Executar lote"}
+                  </button>
                 </div>
                 <small role="status">
                   Ações refletem a capacidade retornada pelo servidor; cada uma chama somente a
-                  sua rota e recarrega o readiness. Executar permanece indisponível — nenhum
-                  provider está montado nesta fatia e nada é enviado.
+                  sua rota e recarrega o readiness. A janela de execução é limitada pelo
+                  servidor; PARCIAL/INTERROMPIDO aguardam nova ação humana explícita.
                 </small>
               </>
             ) : null}
@@ -2551,8 +2743,8 @@ export function CampaignWorkspace() {
               </p>
             ) : (
               <p>
-                Contadores operacionais consolidados da sessão. Nenhum envio foi realizado; os
-                contadores de envio permanecem zerados por construção.
+                Contadores operacionais consolidados da sessão. Nenhum envio nesta sessão; os
+                contadores de envio derivam do estado operacional do servidor.
               </p>
             )}
             {campanha ? (
@@ -2570,7 +2762,7 @@ export function CampaignWorkspace() {
                   <tr><td>Aprovados</td><td>{campanha.totalAprovados}</td></tr>
                   <tr><td>Lote</td><td>{campanha.loteId ? `${campanha.loteCodigo ?? ""} · ${campanha.loteEstado}` : "não criado"}</td></tr>
                   <tr><td>Outbox (HOLD · não executável)</td><td>{campanha.outboxNaoExecutavel} de {campanha.outboxTotal}</td></tr>
-                  <tr><td>Executável pelo worker</td><td>0 — Gmail não foi chamado</td></tr>
+                  <tr><td>Executável pelo worker</td><td>0 — o worker não executa o outbox nesta arquitetura</td></tr>
                 </tbody>
               </table>
             ) : null}
@@ -2585,20 +2777,27 @@ export function CampaignWorkspace() {
                 <tr><td>Excluídos por decisão humana</td><td>{excluidos.length}</td></tr>
                 <tr><td>Mensagens aprovadas</td><td>{aprovacao ? aprovacao.totalItens : 0}</td></tr>
                 <tr><td>Mensagens pendentes</td><td>{base?.inconsistencias_pendentes ?? 0}</td></tr>
-                <tr><td>Enviados</td><td>0</td></tr>
-                <tr><td>Falhas</td><td>0</td></tr>
+                <tr><td>Enviados</td><td>{readiness ? (readiness.lote.contagemPorEstado.ENVIADO ?? 0) : "—"}</td></tr>
+                <tr><td>Falhas</td><td>{readiness ? (readiness.lote.contagemPorEstado.FALHOU ?? 0) : "—"}</td></tr>
               </tbody>
             </table>
             <ul className="campaign-flow-stats">
               <li>canPersistImport: {String(status?.campaign.canPersistImport ?? false)}</li>
               <li>canCreateBatch: {String(status?.campaign.canCreateBatch ?? false)}</li>
-              <li>canExecute: false · envio real bloqueado · Gmail não chamado</li>
+              <li>
+                Execução do lote:{" "}
+                {readiness
+                  ? readiness.acoes.EXECUTAR_LOTE.permitida
+                    ? "apta (gates do servidor satisfeitos)"
+                    : "condicionada aos gates operacionais"
+                  : "aguardando estado operacional do servidor"}
+              </li>
             </ul>
           </section>
         )}
 
         <section className="campaign-guardrail" aria-label="Regras de segurança">
-          <strong>Execução continua bloqueada: nada é enviado nesta fase.</strong>
+          <strong>Execução somente pelos gates operacionais do servidor (readiness); nada é enviado sem autorização explícita.</strong>
           <p>
             A identidade individual e os papéis são verificados no servidor em cada mutação.
             Persistência e criação de lote dependem de flags server-side explícitas (default

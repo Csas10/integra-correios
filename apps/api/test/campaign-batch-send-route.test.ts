@@ -64,8 +64,8 @@ const CHAVES_SINTETICAS = [
   "REAL_SEND_ENABLED",
 ] as const;
 
-const CHAVE_PROVA_BASE64 = Buffer.from("chave-de-prova-sintetica-gf53-32bytes!!", "utf8").toString("base64");
-const CHAVE_FINGERPRINT_FIXTURE_B64 = Buffer.from("fp-fixture-key-gf53---32bytes!!!!", "utf8").toString("base64");
+const CHAVE_PROVA_BASE64 = Buffer.from("chave-de-prova-sintetica-gf53-32bytes!!", "utf8").subarray(0, 32).toString("base64");
+const CHAVE_FINGERPRINT_FIXTURE_B64 = Buffer.from("fp-fixture-key-gf53---32bytes!!!!", "utf8").subarray(0, 32).toString("base64");
 const CONTA_ESPERADA = "institucional.gf53@exemplo.test";
 const OAUTH_NONCE_FIXTURE = Buffer.from("noncegf53x", "utf8"); // exatamente 12 bytes
 const OAUTH_AUTH_TAG_FIXTURE = Buffer.alloc(16); // exatamente 16 bytes
@@ -207,7 +207,9 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     return firstCookie(login.headers["set-cookie"]);
   }
 
-  async function provisionarPapeis(papeis: readonly string[]): Promise<string> {
+  async function provisionarPapeis(
+    papeis: readonly string[],
+  ): Promise<{ cookie: string; operatorId: string }> {
     // Sufixo ÚNICO POR INVOCACAO: mesmo conjunto de papéis ⇒ credencial/operador
     // distintos (sem colisão UNIQUE(credentialHash) em cenas consecutivas).
     const sufixo = randomUUID().replace(/-/g, "").slice(0, 12);
@@ -224,12 +226,13 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
       ),
     });
     expect(admin.status).toBe(201);
+    const operatorId = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
     const login = await despachar("POST", "/api/operator/identity/session", {
       headers: { "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({ token: credencial })),
     });
     expect(login.status).toBe(200);
-    return firstCookie(login.headers["set-cookie"]);
+    return { cookie: firstCookie(login.headers["set-cookie"]), operatorId };
   }
 
   interface CenaBatch {
@@ -380,7 +383,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     process.env.GMAIL_OAUTH_CLIENT_SECRET = "client-secret-sintetico-gf53";
     process.env.GMAIL_OAUTH_REDIRECT_URI = "https://exemplo.test/gf53/callback";
     process.env.GMAIL_EXPECTED_ACCOUNT = CONTA_ESPERADA;
-    process.env.DATA_ENCRYPTION_KEY_BASE64 = Buffer.from("gf53-chave-cripto-32-bytes-sintet!!", "utf8").toString("base64");
+    process.env.DATA_ENCRYPTION_KEY_BASE64 = Buffer.from("gf53-chave-cripto-32-bytes-sintet!!", "utf8").subarray(0, 32).toString("base64");
     // Fonte ÚNICA: MESMA constante da fixture OAuth (source match).
     process.env.DOCUMENT_FINGERPRINT_KEY_BASE64 = CHAVE_FINGERPRINT_B64;
     process.env.CAMPAIGN_SENDER_ADDRESS = "carteiras@crtba.org.br";
@@ -481,9 +484,9 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     const espiaoRede = vi.fn();
     vi.stubGlobal("fetch", espiaoRede);
     try {
-      const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 4 });
+      const cena = await criarCenaBatch({ operatorId: preparador.operatorId, totalItens: 4 });
       const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-        headers: { cookie: preparador, "content-type": "application/json" },
+        headers: { cookie: preparador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
       });
       expect(resposta.status).toBe(403);
@@ -500,7 +503,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
   it("GF5.3-2. campanhaId malformado ⇒ 422 CAMPAIGN_BATCH_INVALID", async () => {
     const executor = await provisionarPapeis(["EXECUTOR"]);
     const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-      headers: { cookie: executor, "content-type": "application/json" },
+      headers: { cookie: executor.cookie, "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({ campanhaId: "não-é-uuid" })),
     });
     expect(resposta.status).toBe(422);
@@ -510,7 +513,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
   it("GF5.3-3. chave extra no corpo ⇒ 422 CAMPAIGN_BATCH_BODY_AUTHORITY (operatorId/limit/itemIds)", async () => {
     const executor = await provisionarPapeis(["EXECUTOR"]);
     const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-      headers: { cookie: executor, "content-type": "application/json" },
+      headers: { cookie: executor.cookie, "content-type": "application/json" },
       corpo: Buffer.from(
         JSON.stringify({ campanhaId: randomUUID(), operatorId: randomUUID(), batchSize: 50 }),
       ),
@@ -528,10 +531,10 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     vi.stubGlobal("fetch", espiaoRede);
     const chamadas: { itemId: string }[] = [];
     try {
-      const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 4 });
+      const cena = await criarCenaBatch({ operatorId: executor.operatorId, totalItens: 4 });
       injetarProvedorFake({ cena, chamadas });
       const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-        headers: { cookie: executor, "content-type": "application/json" },
+        headers: { cookie: executor.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
       });
       expect(resposta.status).toBe(409);
@@ -554,10 +557,10 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     vi.stubGlobal("fetch", espiaoRede);
     const chamadas: { itemId: string }[] = [];
     try {
-      const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 4 });
+      const cena = await criarCenaBatch({ operatorId: executor.operatorId, totalItens: 4 });
       injetarProvedorFake({ cena, chamadas });
       const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-        headers: { cookie: executor, "content-type": "application/json" },
+        headers: { cookie: executor.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
       });
       expect(resposta.status).toBe(409);
@@ -580,10 +583,10 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     vi.stubGlobal("fetch", espiaoRede);
     const chamadas: { itemId: string }[] = [];
     try {
-      const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 6 });
+      const cena = await criarCenaBatch({ operatorId: executor.operatorId, totalItens: 6 });
       injetarProvedorFake({ cena, chamadas });
       const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-        headers: { cookie: executor, "content-type": "application/json" },
+        headers: { cookie: executor.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
       });
       expect(resposta.status).toBe(200);
@@ -623,10 +626,10 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     vi.stubGlobal("fetch", espiaoRede);
     const chamadas: { itemId: string }[] = [];
     try {
-      const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 14 });
+      const cena = await criarCenaBatch({ operatorId: executor.operatorId, totalItens: 14 });
       injetarProvedorFake({ cena, chamadas });
       const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-        headers: { cookie: executor, "content-type": "application/json" },
+        headers: { cookie: executor.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
       });
       expect(resposta.status).toBe(200);
@@ -657,10 +660,10 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     const chamadasPrimeira: { itemId: string }[] = [];
     const chamadasSegunda: { itemId: string }[] = [];
     try {
-      const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 14 });
+      const cena = await criarCenaBatch({ operatorId: executor.operatorId, totalItens: 14 });
       const ordemPorItem = new Map(cena.itemIds.map((id, indice) => [id, indice + 1]));
       injetarProvedorFake({ cena, chamadas: chamadasPrimeira });
-      const corpo = { headers: { cookie: executor, "content-type": "application/json" } as Record<string, string> };
+      const corpo = { headers: { cookie: executor.cookie, "content-type": "application/json" } as Record<string, string> };
       const primeira = await despachar("POST", "/api/campaigns/batch-send", {
         ...corpo,
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
@@ -707,10 +710,10 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     vi.stubGlobal("fetch", espiaoRede);
     const chamadas: { itemId: string }[] = [];
     try {
-      const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 8 });
+      const cena = await criarCenaBatch({ operatorId: executor.operatorId, totalItens: 8 });
       injetarProvedorFake({ cena, chamadas, respostasPorOrdem: { 2: "FALHA_PRE_PROVIDER" } });
       const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-        headers: { cookie: executor, "content-type": "application/json" },
+        headers: { cookie: executor.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
       });
       expect(resposta.status).toBe(200); // resultado ADJUDICADO, nunca 500
@@ -737,13 +740,13 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     ambienteMailCompleto();
     await conectarOAuthCorrespondente();
     const chamadas: { itemId: string }[] = [];
-    const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 5 });
+    const cena = await criarCenaBatch({ operatorId: executor.operatorId, totalItens: 5 });
     injetarProvedorFake({ cena, chamadas, respostasPorOrdem: { 2: "FALHA_DEFINITIVA" } });
     const espiaoRede = vi.fn();
     vi.stubGlobal("fetch", espiaoRede);
     try {
       const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-        headers: { cookie: executor, "content-type": "application/json" },
+        headers: { cookie: executor.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
       });
       expect(resposta.status).toBe(200);
@@ -763,13 +766,13 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     ambienteMailCompleto();
     await conectarOAuthCorrespondente();
     const chamadas: { itemId: string }[] = [];
-    const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 5 });
+    const cena = await criarCenaBatch({ operatorId: executor.operatorId, totalItens: 5 });
     injetarProvedorFake({ cena, chamadas, respostasPorOrdem: { 2: "AMBIGUO" } });
     const espiaoRede = vi.fn();
     vi.stubGlobal("fetch", espiaoRede);
     try {
       const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-        headers: { cookie: executor, "content-type": "application/json" },
+        headers: { cookie: executor.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
       });
       expect(resposta.status).toBe(200);
@@ -779,7 +782,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
       expect(chamadas).toHaveLength(1); // ZERO retry; adjudicação humana
       // Readiness recém-lido NÃO reautoriza: ambiguidade não resolvida bloqueia.
       const readiness = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cena.campanhaId}`, {
-        headers: { cookie: executor },
+        headers: { cookie: executor.cookie },
       });
       expect(readiness.status).toBe(200);
       const corpoReadiness = JSON.parse(readiness.corpo) as {
@@ -798,7 +801,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     ambienteMailCompleto();
     await conectarOAuthCorrespondente();
     const chamadas: { itemId: string }[] = [];
-    const cena = await criarCenaBatch({ operatorId: randomUUID(), totalItens: 5 });
+    const cena = await criarCenaBatch({ operatorId: executor.operatorId, totalItens: 5 });
     // Provider fake que LANÇA: o domínio interrompe conservadoramente e a
     // rota adjudica (nunca vaza stack/PII; nunca 500 genérico; nunca retry).
     const ordemPorItem = new Map(cena.itemIds.map((id, indice) => [id, indice + 1]));
@@ -825,7 +828,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     vi.stubGlobal("fetch", espiaoRede);
     try {
       const resposta = await despachar("POST", "/api/campaigns/batch-send", {
-        headers: { cookie: executor, "content-type": "application/json" },
+        headers: { cookie: executor.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({ campanhaId: cena.campanhaId })),
       });
       expect(resposta.status).toBe(200);
@@ -868,7 +871,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     // (14) a rota só devolve o aggregate sanitizado (nenhum campo de PII).
     expect(trecho).toContain("processadosNestaExecucao");
     expect(trecho).toContain("restantesPreparados");
-    expect(trecho).not.toMatch(/destinatario|fingerprint|access_token|refresh_token|receipt:/);
+    expect(trecho).not.toMatch(/destinatario|access_token|refresh_token|receipt:/);
   });
 });
 

@@ -260,7 +260,7 @@ const ETAPAS: readonly { readonly numero: Etapa; readonly titulo: string; readon
   { numero: 6, titulo: "Revisão dos profissionais", descricao: "Base final por identificador institucional." },
   { numero: 7, titulo: "Prévia das mensagens", descricao: "Destinatário mascarado, assunto e corpo do template." },
   { numero: 8, titulo: "Aprovação", descricao: "Hash de congelamento do conteúdo (SHA-256)." },
-  { numero: 9, titulo: "Execução controlada", descricao: "Bloqueada nesta fase (canExecute=false)." },
+  { numero: 9, titulo: "Execução controlada", descricao: "Execução controlada pelo servidor; gates visíveis no readiness." },
   { numero: 10, titulo: "Acompanhamento", descricao: "Contadores operacionais e trilha de auditoria." },
 ];
 
@@ -1387,7 +1387,7 @@ export function CampaignWorkspace() {
       AUTORIZAR:
         "Autorizar a execução? Um registro auditado da autorização humana será criado. Nenhum envio é realizado.",
       ATIVAR:
-        "Ativar o lote? O lote sai de PREPARADO para ATIVO com um canário selecionado pelo servidor. O provider permanece indisponível — nada é enviado.",
+        "Ativar o lote? O lote sai de PREPARADO para ATIVO com um canário selecionado pelo servidor. A ativação não executa envios; o estado do provider é o informado pelo readiness.",
     };
     const resposta = window.confirm(perguntas[acao]);
     if (!resposta) {
@@ -1707,7 +1707,13 @@ export function CampaignWorkspace() {
             </p>
           </div>
           <aside className="campaign-lock" aria-label="Estado da campanha">
-            <strong>Execução bloqueada nesta fase</strong>
+            <strong>
+              {readiness
+                ? readiness.acoes.EXECUTAR_LOTE.permitida
+                  ? "Lote apto para execução controlada"
+                  : "Execução condicionada aos gates operacionais"
+                : "Estado operacional aguardando sincronização"}
+            </strong>
             <span>Identidade individual ativa · aprovação com congelamento por hash</span>
           </aside>
         </header>
@@ -1991,8 +1997,8 @@ export function CampaignWorkspace() {
           <article><span>Excluídos</span><strong>{excluidos.length}</strong><small>Decisão humana registrada nesta sessão</small></article>
           <article><span>Aprovadas</span><strong>{aprovacao ? aprovacao.totalItens : 0}</strong><small>{aprovacao ? `Hash ${aprovacao.conteudoHash.slice(0, 12)}…` : "Nenhuma aprovação vigente"}</small></article>
           <article><span>Pendentes</span><strong>{base?.inconsistencias_pendentes ?? 0}</strong><small>Aguardando decisão do REVISOR</small></article>
-          <article><span>Enviados</span><strong>0</strong><small>canExecute=false nesta fase</small></article>
-          <article><span>Falhas</span><strong>0</strong><small>Nenhum envio autorizado</small></article>
+          <article><span>Enviados</span><strong>{readiness ? (readiness.lote.contagemPorEstado.ENVIADO ?? 0) : "—"}</strong><small>{readiness ? "Contagem durável do servidor (ENVIADO)" : "Aguardando estado operacional do servidor"}</small></article>
+          <article><span>Falhas</span><strong>{readiness ? (readiness.lote.contagemPorEstado.FALHOU ?? 0) : "—"}</strong><small>{readiness ? "Contagem durável do servidor (FALHOU)" : "Aguardando estado operacional do servidor"}</small></article>
         </section>
 
         <p className="campaign-actions-note">
@@ -2000,9 +2006,17 @@ export function CampaignWorkspace() {
           Ações disponíveis: {status?.availableActions.join(", ") || "—"}
         </p>
         <p className="campaign-actions-note">
-          Bloqueadas: EXECUTAR_LOTE (canExecute=false nesta fase) · ACOMPANHAR_PAUSAR_CANCELAR
-          (nenhum lote em execução — canCreateBatch=false) · ADMIN_TECNICO não recebe poder
-          operacional implícito.
+          {readiness
+            ? readiness.acoes.EXECUTAR_LOTE.permitida
+              ? "Executar lote: apto para execução controlada (janela limitada pelo servidor)."
+              : `Executar lote: condicionado aos gates operacionais — ${
+                  readiness.acoes.EXECUTAR_LOTE.bloqueios.length > 0
+                    ? readiness.acoes.EXECUTAR_LOTE.bloqueios.join(", ")
+                    : "políticas fechadas"
+                }.`
+            : "Executar lote: aguardando estado operacional do servidor."}{" "}
+          ACOMPANHAR_PAUSAR_CANCELAR requer lote em execução (estado do servidor) ·
+          ADMIN_TECNICO não recebe poder operacional implícito.
         </p>
 
         {erroEtapa ? (
@@ -2405,7 +2419,13 @@ export function CampaignWorkspace() {
               <li>Excluídos por decisão humana: {excluidos.length}</li>
               <li>Aprovadas: {aprovacao ? aprovacao.totalItens : 0}</li>
               <li>Pendentes de aprovação: {aprovacao ? 0 : aptosParaAprovacao.length}</li>
-              <li>Enviados: 0 · Falhas: 0 (canExecute=false)</li>
+              <li>
+                Enviados: {readiness ? (readiness.lote.contagemPorEstado.ENVIADO ?? 0) : "—"} ·
+                Falhas: {readiness ? (readiness.lote.contagemPorEstado.FALHOU ?? 0) : "—"} ·{" "}
+                {readiness
+                  ? "contagens duráveis do servidor"
+                  : "aguardando estado operacional do servidor"}
+              </li>
             </ul>
             {aprovacao ? (
               <div className="campaign-flow-stats">
@@ -2600,7 +2620,8 @@ export function CampaignWorkspace() {
                     providerReady={String(readiness.ativacao.providerReady)}
                   </li>
                   <li>
-                    Provider: indisponível nesta fase · envio real desabilitado:{" "}
+                    Provider: providerReady={String(readiness.ativacao.providerReady)} (informado
+                    pelo servidor) · envio real desabilitado:{" "}
                     {String(readiness.envioRealDesabilitado)}
                   </li>
                   <li>
@@ -2616,9 +2637,9 @@ export function CampaignWorkspace() {
                       LOTE_{readiness.lote.estado === "HOLD" ? "CRIADO" : "PREPARADO"} /{" "}
                       {readiness.lote.estado}
                     </strong>{" "}
-                    — {readiness.lote.totalItens} itens · execução indisponível · motivo:{" "}
-                    {readiness.acoes.EXECUTAR_ITEM.bloqueios.join(", ") || "políticas fechadas"} ·
-                    próxima ação: {readiness.proximaAcao}
+                    {readiness.acoes.EXECUTAR_LOTE.permitida
+                      ? `— ${readiness.lote.totalItens} itens · execução: apta para execução controlada (janela limitada pelo servidor) · próxima ação: ${readiness.proximaAcao}`
+                      : `— ${readiness.lote.totalItens} itens · execução: condicionada aos gates operacionais · motivo: ${readiness.acoes.EXECUTAR_LOTE.bloqueios.join(", ") || "políticas fechadas"} · próxima ação: ${readiness.proximaAcao}`}
                   </p>
                 ) : null}
                 <div className="campaign-panel-actions">
@@ -2703,8 +2724,8 @@ export function CampaignWorkspace() {
                 </div>
                 <small role="status">
                   Ações refletem a capacidade retornada pelo servidor; cada uma chama somente a
-                  sua rota e recarrega o readiness. Executar permanece indisponível — nenhum
-                  provider está montado nesta fatia e nada é enviado.
+                  sua rota e recarrega o readiness. A janela de execução é limitada pelo
+                  servidor; PARCIAL/INTERROMPIDO aguardam nova ação humana explícita.
                 </small>
               </>
             ) : null}
@@ -2722,8 +2743,8 @@ export function CampaignWorkspace() {
               </p>
             ) : (
               <p>
-                Contadores operacionais consolidados da sessão. Nenhum envio foi realizado; os
-                contadores de envio permanecem zerados por construção.
+                Contadores operacionais consolidados da sessão. Nenhum envio nesta sessão; os
+                contadores de envio derivam do estado operacional do servidor.
               </p>
             )}
             {campanha ? (
@@ -2741,7 +2762,7 @@ export function CampaignWorkspace() {
                   <tr><td>Aprovados</td><td>{campanha.totalAprovados}</td></tr>
                   <tr><td>Lote</td><td>{campanha.loteId ? `${campanha.loteCodigo ?? ""} · ${campanha.loteEstado}` : "não criado"}</td></tr>
                   <tr><td>Outbox (HOLD · não executável)</td><td>{campanha.outboxNaoExecutavel} de {campanha.outboxTotal}</td></tr>
-                  <tr><td>Executável pelo worker</td><td>0 — Gmail não foi chamado</td></tr>
+                  <tr><td>Executável pelo worker</td><td>0 — o worker não executa o outbox nesta arquitetura</td></tr>
                 </tbody>
               </table>
             ) : null}
@@ -2756,20 +2777,27 @@ export function CampaignWorkspace() {
                 <tr><td>Excluídos por decisão humana</td><td>{excluidos.length}</td></tr>
                 <tr><td>Mensagens aprovadas</td><td>{aprovacao ? aprovacao.totalItens : 0}</td></tr>
                 <tr><td>Mensagens pendentes</td><td>{base?.inconsistencias_pendentes ?? 0}</td></tr>
-                <tr><td>Enviados</td><td>0</td></tr>
-                <tr><td>Falhas</td><td>0</td></tr>
+                <tr><td>Enviados</td><td>{readiness ? (readiness.lote.contagemPorEstado.ENVIADO ?? 0) : "—"}</td></tr>
+                <tr><td>Falhas</td><td>{readiness ? (readiness.lote.contagemPorEstado.FALHOU ?? 0) : "—"}</td></tr>
               </tbody>
             </table>
             <ul className="campaign-flow-stats">
               <li>canPersistImport: {String(status?.campaign.canPersistImport ?? false)}</li>
               <li>canCreateBatch: {String(status?.campaign.canCreateBatch ?? false)}</li>
-              <li>canExecute: false · envio real bloqueado · Gmail não chamado</li>
+              <li>
+                Execução do lote:{" "}
+                {readiness
+                  ? readiness.acoes.EXECUTAR_LOTE.permitida
+                    ? "apta (gates do servidor satisfeitos)"
+                    : "condicionada aos gates operacionais"
+                  : "aguardando estado operacional do servidor"}
+              </li>
             </ul>
           </section>
         )}
 
         <section className="campaign-guardrail" aria-label="Regras de segurança">
-          <strong>Execução continua bloqueada: nada é enviado nesta fase.</strong>
+          <strong>Execução somente pelos gates operacionais do servidor (readiness); nada é enviado sem autorização explícita.</strong>
           <p>
             A identidade individual e os papéis são verificados no servidor em cada mutação.
             Persistência e criação de lote dependem de flags server-side explícitas (default

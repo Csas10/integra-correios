@@ -34,10 +34,11 @@ describe("SLICE_03B — Macroetapa 4: plano de controle operacional (frontend)",
     expect(FONTE_WORKSPACE).toContain("Próxima ação necessária");
   });
 
-  it("LOTE_CRIADO / HOLD permanece visível com motivo objetivo do bloqueio", () => {
-    expect(FONTE_WORKSPACE).toContain("execução indisponível");
+  it("LOTE_CRIADO / HOLD permanece visível com estado de execução derivado do servidor (GF5.4A)", () => {
     expect(FONTE_WORKSPACE).toContain("LOTE_");
-    expect(FONTE_WORKSPACE).toContain("EXECUTAR_ITEM.bloqueios");
+    expect(FONTE_WORKSPACE).toContain("EXECUTAR_LOTE.bloqueios");
+    // GF5.4A — nenhuma afirmação estática de execução indisponível.
+    expect(FONTE_WORKSPACE).not.toContain("execução indisponível");
   });
 
   it("confirmação de envio real desabilitado é exibida", () => {
@@ -233,7 +234,11 @@ describe("SLICE_03B — Macroetapa 4: plano de controle operacional (frontend)",
     );
     expect(entre.length).toBeLessThan(400);
     // E o painel {readiness ? …} não contém mais acaoMensagem/acaoErro:
-    const indicePainel = codigo.indexOf("{readiness ? (");
+    // (âncora precisa: GF5.4A introduziu {readiness ? ( server-driven nos
+    // contadores; o painel aqui é o do "Controle operacional (readiness)").
+    const indiceTituloPainel = codigo.indexOf("Controle operacional (readiness)");
+    expect(indiceTituloPainel).toBeGreaterThan(-1);
+    const indicePainel = codigo.indexOf("{readiness ? (", indiceTituloPainel);
     const fimPainel = codigo.indexOf("mostrarOperacao && (", indicePainel);
     const painel = codigo.slice(indicePainel, fimPainel);
     expect(painel).not.toContain("{acaoMensagem ?");
@@ -445,5 +450,124 @@ describe("GF5.3 — Executar lote (UI): autoridade server-driven e guardas", () 
     const botao = codigo.slice(abertura, codigo.indexOf("</button>", indice));
     expect(botao).toContain('"Continuar lote"');
     expect(botao).toContain("contagemPorEstado.PREPARADO");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GF5.4A — Corretiva de copy operacional estática (achado único Q18, MEDIUM,
+// do review GF5.4). Provas por leitura de fonte (mesmo padrão das suítes de
+// controle): a UI não afirma de forma incondicional que a execução está
+// bloqueada, que canExecute=false "nesta fase" ou que nada foi enviado.
+// Contagens e estado de execução derivam EXCLUSIVAMENTE do readiness
+// server-driven (contagemPorEstado / acoes.EXECUTAR_LOTE); sem readiness a
+// exibição é neutra ("—"). Contagens são DISPLAY ONLY e nunca alimentam
+// autoridade; o handler do lote permanece 1 confirmação + 1 POST, sem
+// continuação ou repetição automática.
+// ---------------------------------------------------------------------------
+describe("GF5.4A — copy operacional alinhada ao readiness (display-only)", () => {
+  const codigo = FONTE_WORKSPACE.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+  function trechoGF(inicio: string, fim: string): string {
+    const i = codigo.indexOf(inicio);
+    expect(i, "âncora inicial: " + inicio).toBeGreaterThan(-1);
+    const j = codigo.indexOf(fim, i);
+    expect(j, "âncora final: " + fim).toBeGreaterThan(-1);
+    return codigo.slice(i, j);
+  }
+
+  // (1) Nenhum contador Enviados/Falhas com zero literal estático.
+  it("1. contadores Enviados/Falhas não exibem zero literal estático", () => {
+    expect(codigo).not.toContain("<span>Enviados</span><strong>0</strong>");
+    expect(codigo).not.toContain("<span>Falhas</span><strong>0</strong>");
+    expect(codigo).not.toContain("<td>Enviados</td><td>0</td>");
+    expect(codigo).not.toContain("<td>Falhas</td><td>0</td>");
+    expect(codigo).not.toContain("Enviados: 0 · Falhas: 0");
+  });
+
+  // (2) Sem "canExecute=false nesta fase" como afirmação de estado atual.
+  it("2. sem afirmação estática canExecute=false nesta fase", () => {
+    expect(codigo).not.toContain("canExecute=false nesta fase");
+    expect(codigo).not.toContain("(canExecute=false)");
+  });
+
+  // (3) Sem nota incondicional "Bloqueadas: EXECUTAR_LOTE".
+  it("3. sem nota estática Bloqueadas: EXECUTAR_LOTE", () => {
+    expect(codigo).not.toContain("Bloqueadas: EXECUTAR_LOTE");
+  });
+
+  // (4) Estado atual deriva de EXECUTAR_LOTE.permitida/bloqueios; hero e nota
+  // do lote (HOLD/PREPARADO) sem contra-afirmação de bloqueio.
+  it("4. notas e hero derivam de EXECUTAR_LOTE.permitida (sem contra-afirmação de bloqueio)", () => {
+    const contadoresENota = trechoGF('aria-label="Contadores da campanha"', "{erroEtapa ?");
+    expect(contadoresENota).toContain("EXECUTAR_LOTE.permitida");
+    expect(contadoresENota).toContain("EXECUTAR_LOTE.bloqueios");
+    expect(contadoresENota).not.toContain("Bloqueadas:");
+    const hero = trechoGF('className="campaign-lock"', "</aside>");
+    expect(hero).toContain("EXECUTAR_LOTE.permitida");
+    expect(hero).not.toContain("Execução bloqueada nesta fase");
+    expect(hero).toContain("Estado operacional aguardando sincronização");
+    const notaLote = trechoGF("LOTE_{readiness.lote.estado", "campaign-panel-actions");
+    expect(notaLote).toContain("EXECUTAR_LOTE.permitida");
+    expect(notaLote).toContain("EXECUTAR_LOTE.bloqueios");
+    expect(notaLote).not.toContain("execução indisponível");
+  });
+
+  // (5)+(6) Enviados/Falhas derivam das contagens duráveis do servidor.
+  it("5+6. Enviados/Falhas derivam de contagemPorEstado.ENVIADO/FALHOU do servidor", () => {
+    expect(codigo).toContain("readiness.lote.contagemPorEstado.ENVIADO ?? 0");
+    expect(codigo).toContain("readiness.lote.contagemPorEstado.FALHOU ?? 0");
+    expect((codigo.match(/contagemPorEstado\.ENVIADO/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    expect((codigo.match(/contagemPorEstado\.FALHOU/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  // (7) Readiness indisponível ⇒ neutro ("—"), nunca zero/bloqueio fabricados.
+  it("7. readiness indisponível ⇒ contagens neutras, sem zero fabricado", () => {
+    expect(codigo).toContain('readiness.lote.contagemPorEstado.ENVIADO ?? 0) : "—"');
+    expect(codigo).toContain('readiness.lote.contagemPorEstado.FALHOU ?? 0) : "—"');
+    expect(codigo).toContain("Aguardando estado operacional do servidor");
+    expect(codigo).toContain("Estado operacional aguardando sincronização");
+  });
+
+  // (8) Autoridade do botão do lote permanece EXCLUSIVAMENTE
+  // readiness.acoes.EXECUTAR_LOTE.permitida; contagens não habilitam nada.
+  it("8. botão do lote permanece governado por EXECUTAR_LOTE.permitida", () => {
+    const indice = codigo.indexOf("!readiness.acoes.EXECUTAR_LOTE.permitida");
+    expect(indice).toBeGreaterThan(-1);
+    const abertura = codigo.lastIndexOf("<button", indice);
+    const botao = codigo.slice(abertura, codigo.indexOf("</button>", indice));
+    expect(botao).toContain("!readiness.acoes.EXECUTAR_LOTE.permitida");
+    expect(botao).not.toContain("contagemPorEstado.ENVIADO");
+    expect(botao).not.toContain("contagemPorEstado.FALHOU");
+    const blocosDisabled = codigo.match(/disabled=\{[^}]*\}/g) ?? [];
+    expect(blocosDisabled.length).toBeGreaterThan(0);
+    for (const bloco of blocosDisabled) {
+      expect(bloco).not.toContain("ENVIADO");
+      expect(bloco).not.toContain("FALHOU");
+    }
+  });
+
+  // (9) Nenhuma derivação local de autoridade a partir de contagens.
+  it("9. nenhuma derivação local de autoridade a partir de contagens", () => {
+    // Toda ocorrência de "permitida" é acesso de propriedade (leitura do
+    // readiness) ou chave do tipo AcaoOperacao — nunca variável local.
+    const totalPermitida = (codigo.match(/permitida/g) ?? []).length;
+    const acessosPermitida = (codigo.match(/\.permitida/g) ?? []).length;
+    const chavesTipoPermitida = (codigo.match(/permitida\s*:/g) ?? []).length;
+    expect(totalPermitida).toBe(acessosPermitida + chavesTipoPermitida);
+    expect(codigo).not.toMatch(/permitida\s*=(?!=)/);
+    expect(codigo).not.toMatch(/contagemPorEstado[^\n]{0,80}(permitida|disabled)/);
+  });
+
+  // (10) Handler inalterado: 1 confirmação, 1 POST, zero continuação
+  // automática/repetição.
+  it("10. handler do lote: 1 confirmação, 1 POST, zero continuação automática", () => {
+    const fn = trechoGF("async function executarLoteOperacionalUI(", "const visaoMacro = useMemo(");
+    expect((fn.match(/window\.confirm\(/g) ?? []).length).toBe(1);
+    expect((fn.match(/await executarLoteOperacional\(/g) ?? []).length).toBe(1);
+    expect(fn).toContain("setLotePendente(true)");
+    expect((fn.match(/setLotePendente\(false\)/g) ?? []).length).toBe(1);
+    expect(fn).not.toMatch(/setInterval|setTimeout/);
+    expect(fn).toContain("nova ação humana explícita");
+    expect(fn).not.toContain("AUTO_CONTINUE=true");
   });
 });

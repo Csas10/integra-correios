@@ -133,9 +133,11 @@ describe("SLICE_03B — Macroetapa 4: plano de controle operacional (frontend)",
     const codigo = FONTE_WORKSPACE
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .replace(/^\s*\/\/.*$/gm, "");
-    const recargas = codigo.split(
-      "Promise.all([\n        obterCampanhaDetalhe(campanha.campanhaId),\n        obterReadinessOperacional(campanha.campanhaId),\n      ])",
-    ).length - 1;
+    const recargas = (
+      codigo.match(
+        /Promise\.all\(\[\s*obterCampanhaDetalhe\(campanha\.campanhaId\),\s*obterReadinessOperacional\(campanha\.campanhaId\),\s*\]\)/g,
+      ) ?? []
+    ).length;
     // PREPARAR/AUTORIZAR/ATIVAR (1) + pós-canário (1) = 2 pontos de sincronia.
     expect(recargas).toBe(2);
     expect(codigo).toContain("setCampanha(detalhe)");
@@ -143,6 +145,98 @@ describe("SLICE_03B — Macroetapa 4: plano de controle operacional (frontend)",
     // Nenhuma transição/estado local é inferido do POST.
     expect(codigo).not.toMatch(/loteEstado\s*[:=]\s*"ATIVO"/);
     expect(codigo).not.toMatch(/loteEstado\s*[:=]\s*"PREPARADO"/);
+  });
+
+  // ---------------------------------------------------------------------
+  // GF4.5C.1 (FINDING 2) — adjudicação independente do resultado do POST
+  // vs. sincronização read-only, provada ESTRUTURALMENTE sobre o handler.
+  // ---------------------------------------------------------------------
+  it("GF4.5C.1 — fail-closed: readiness antigo é invalidado (setReadiness(null)) ANTES do despacho do canário", () => {
+    const codigo = FONTE_WORKSPACE
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    const indice = codigo.indexOf("async function executarCanarioOperacionalUI");
+    const fim = codigo.indexOf("  // UX-FLOW-01A", indice);
+    const handler = codigo.slice(indice, fim);
+    const indiceSet = handler.indexOf("setReadiness(null)");
+    const indicePost = handler.indexOf("executarCanarioOperacional(campanha.campanhaId)");
+    // A invalidação ocorre ANTES do POST (stale permitida=true não rearma).
+    expect(indiceSet).toBeGreaterThan(-1);
+    expect(indicePost).toBeGreaterThan(indiceSet);
+    // Nenhuma permissão substituta é derivada localmente.
+    expect(handler).not.toMatch(/permitida\s*[:=]\s*true/);
+  });
+
+  it("GF4.5C.1 — domínios de erro distintos: sincronização read-only tem catch PRÓPRIO e não reescreve o resultado", () => {
+    const indice = FONTE_WORKSPACE.indexOf("async function executarCanarioOperacionalUI");
+    const fim = FONTE_WORKSPACE.indexOf("  // UX-FLOW-01A", indice);
+    const handler = FONTE_WORKSPACE.slice(indice, fim);
+    // O POST é adjudicado PRIMEIRO (await executarCanarioOperacional) e a
+    // mensagem do resultado é definida ANTES do bloco de sincronização.
+    const indicePost = handler.indexOf("await executarCanarioOperacional(campanha.campanhaId)");
+    const indiceMsg = handler.indexOf("Canário: " + "");
+    expect(indicePost).toBeGreaterThan(-1);
+    // try/catch PRÓPRIO da sincronização (domínio separado da mutação):
+    const indiceSync = handler.indexOf("try {", indiceMsg > 0 ? indiceMsg : indicePost);
+    expect(indiceSync).toBeGreaterThan(-1);
+    const catchSync = handler.slice(indiceSync, handler.indexOf("} catch (error: unknown) {", indiceSync));
+    expect(catchSync).toContain("Falha na sincronização do estado pós-envio");
+    // A falha de refresh mantém o resultado: setReadiness(null) + erro de
+    // sincronização; NUNCA "não conclusivo" no catch da sincronização.
+    expect(catchSync).not.toContain("não conclusivo");
+    expect(catchSync).toContain("setReadiness(null)");
+  });
+
+  it("GF4.5C.1 — 4xx é rejeição DEFINITIVA (sem 'não conclusivo'); rede/5xx é conservador", () => {
+    const codigo = FONTE_WORKSPACE
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    const indice = codigo.indexOf("async function executarCanarioOperacionalUI");
+    const fim = codigo.indexOf("  // UX-FLOW-01A", indice);
+    const handler = codigo.slice(indice, fim);
+    expect(handler).toContain("error instanceof ApiCampanhaError && error.status >= 400 && error.status < 500");
+    expect(handler).toContain("Rejeição definitiva do servidor");
+    // O ramo 4xx NÃO apenda a frase de ambiguidade; o ramo conservador apenda
+    // "potencialmente não conclusivo".
+    const indice4xx = handler.indexOf("Rejeição definitiva do servidor");
+    const trecho4xx = handler.slice(handler.lastIndexOf("if (", indice4xx), indice4xx + 120);
+    expect(trecho4xx).not.toContain("não conclusivo");
+    expect(handler).toContain("potencialmente não conclusivo (falha de rede/servidor)");
+  });
+
+  it("GF4.5C.1 — AMBIGUO permanece não conclusivo; exatamente UM POST por confirmação; ZERO retry/timer", () => {
+    const codigo = FONTE_WORKSPACE
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    expect(codigo).toContain('corpo.resultado === "AMBIGUO"');
+    expect(codigo).toContain("Resultado do canário não conclusivo. Não repetir automaticamente.");
+    const indice = codigo.indexOf("async function executarCanarioOperacionalUI");
+    const fim = codigo.indexOf("  // UX-FLOW-01A", indice);
+    const handler = codigo.slice(indice, fim);
+    // Exatamente UM POST do canário no handler.
+    expect(handler.split("executarCanarioOperacional(campanha.campanhaId)").length - 1).toBe(1);
+    // Nenhum retry automático/timer/loop.
+    expect(codigo).not.toMatch(/setInterval|setTimeout\(\s*[a-zA-Z]*retry/i);
+    expect(handler).not.toContain("while (");
+  });
+
+  it("GF4.5C.1 — resultado/erro do canário exibidos INDEPENDENTES do readiness (mensagens fora do painel condicional)", () => {
+    const codigo = FONTE_WORKSPACE;
+    // Os parágrafos de mensagem existem FORA do bloco condicional {readiness ? …},
+    // imediatamente após o carregamento do readiness.
+    const indiceMensagem = codigo.indexOf('{/* GF4.5C.1 — resultado/erro do canário visíveis INDEPENDENTES do');
+    expect(indiceMensagem).toBeGreaterThan(-1);
+    const entre = codigo.slice(
+      codigo.indexOf("Carregando readiness operacional…"),
+      indiceMensagem,
+    );
+    expect(entre.length).toBeLessThan(400);
+    // E o painel {readiness ? …} não contém mais acaoMensagem/acaoErro:
+    const indicePainel = codigo.indexOf("{readiness ? (");
+    const fimPainel = codigo.indexOf("mostrarOperacao && (", indicePainel);
+    const painel = codigo.slice(indicePainel, fimPainel);
+    expect(painel).not.toContain("{acaoMensagem ?");
+    expect(painel).not.toContain("{acaoErro ?");
   });
 
   it("nenhuma autorização é derivada no cliente; ações refletem a capacidade do servidor", () => {

@@ -2061,6 +2061,67 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     }
   });
 
+  it("GF4.5C.1 — autoridade de papel no readiness: PREPARADOR sem EXECUTOR nunca recebe EXECUTAR_CANARIO.permitida=true, mesmo com preflight canônico satisfeito", async () => {
+    const credencialPre = tokenSintetico("gf45c1-pre");
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: await bootstrapAdmin(), "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-C1-" + randomUUID().slice(0, 8),
+        displayName: "Operador GF4.5C.1 PREPARADOR",
+        roles: ["PREPARADOR"],
+        credentialHash: createHash("sha256").update(credencialPre).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const operatorIdPre = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencialPre })),
+    });
+    expect(login.status).toBe(200);
+    const cookiePre = firstCookie(login.headers["set-cookie"]);
+
+    // Cena sintética com TODOS os requisitos canônicos satisfeitos (gates B,
+    // provas, OAuth correspondente) — a ÚNICA condição ausente é o papel.
+    const cenaPre = await criarCenaCanario({
+      operatorId: operatorIdPre,
+      emails: ["canario.gf45c1@exemplo.test"],
+    });
+    ambienteBase(cenaPre.fingerprints[0]!, MATRIZ_POLITICA_CENARIO.B);
+    await conectarOAuthCorrespondente();
+
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    try {
+      // FINDING 1 — regressão comportamental: PREPARADOR (papel operacional
+      // válido) + preflight satisfeito ⇒ permitida=false com o bloqueio
+      // sanitizado estável da autoridade da rota de envio.
+      const resposta = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cenaPre.campanhaId}`, {
+        headers: { cookie: cookiePre },
+      });
+      expect(resposta.status).toBe(200);
+      const corpo = JSON.parse(resposta.corpo) as {
+        acoes: { EXECUTAR_CANARIO: { permitida: boolean; bloqueios: readonly string[] } };
+      };
+      expect(corpo.acoes.EXECUTAR_CANARIO.permitida).toBe(false);
+      expect(corpo.acoes.EXECUTAR_CANARIO.bloqueios).toContain("OPERATOR_ROLE_FORBIDDEN");
+      expect(espiaoRede).not.toHaveBeenCalled();
+
+      // O POST continua independente e fail-closed: PREPARADOR ⇒ 403
+      // OPERATOR_ROLE_FORBIDDEN (guarda da rota inalterada), sem qualquer
+      // envio (zero rede) mesmo com gates de política abertos no cenário B.
+      const postRejeitado = await despachar("POST", "/api/campaigns/canary-send", {
+        headers: { cookie: cookiePre, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({ campanhaId: cenaPre.campanhaId })),
+      });
+      expect(postRejeitado.status).toBe(403);
+      expect(postRejeitado.corpo).toContain("OPERATOR_ROLE_FORBIDDEN");
+      expect(espiaoRede).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   // ---- helpers de sessão (padrão 03B) ----
   async function bootstrapAdmin(): Promise<string> {
     const adminId = randomUUID();

@@ -1943,6 +1943,14 @@ const ROTAS: readonly Rota[] = [
         // fingerprint, prova, token ou segredo. O browser NUNCA reconstrói
         // elegibilidade; POST /api/campaigns/canary-send permanece a ÚNICA
         // autoridade de mutação/envio do canário.
+        // GF4.5C.1 (FINDING 1) — autoridade de PAPEL incorporada: a rota de
+        // envio exige EXECUTOR ANTES do preflight; o readiness representa a
+        // MESMA autoridade efetiva. Sem EXECUTOR ⇒ permitida=false com o
+        // bloqueio sanitizado OPERATOR_ROLE_FORBIDDEN (o mesmo código da
+        // guarda da rota) — nenhuma configuração interna de papéis é
+        // exposta. Invariante: não-EXECUTOR ⇒ readiness false ⇒ botão
+        // desabilitado ⇒ e o POST continua rejeitando independentemente.
+        const executorHabilitado = identity.roles.includes("EXECUTOR");
         const canarioPreflight = await preflightCanarioCampanha(requireDbPool(), {
           operatorId: identity.operatorId,
           campanhaId,
@@ -2003,9 +2011,15 @@ const ROTAS: readonly Rota[] = [
             // GF4.5 — derivação canônica do MESMO preflight do envio real;
             // sem fabricar verde a partir de flags grossas: qualquer
             // inconsistência real aparece como bloqueio sanitizado.
+            // GF4.5C.1 (FINDING 1) — elegibilidade EFETIVA = papel EXECUTOR
+            // (autoridade da rota de envio, inalterada) ∧ preflight canônico.
             EXECUTAR_CANARIO: {
-              permitida: canarioPreflight.elegivel,
-              bloqueios: canarioPreflight.elegivel ? [] : canarioPreflight.bloqueios,
+              permitida: executorHabilitado && canarioPreflight.elegivel,
+              bloqueios: executorHabilitado
+                ? canarioPreflight.elegivel
+                  ? []
+                  : canarioPreflight.bloqueios
+                : ["OPERATOR_ROLE_FORBIDDEN"],
             },
           },
           executavel: false,

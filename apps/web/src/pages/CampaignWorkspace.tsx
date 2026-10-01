@@ -1392,6 +1392,11 @@ export function CampaignWorkspace() {
   // lote.estado/OAuth/canarySelected ou qualquer combinação local deles.
   // Confirmação humana explícita ⇒ exatamente UM POST; cancelar ⇒ ZERO POST;
   // nenhuma repetição automática (ambiguidade exige adjudicação do owner).
+  // GF4.5C.1 (FINDING 2) — domínios de erro DISTINTOS: o resultado da
+  // MUTAÇÃO é adjudicado independentemente da sincronização read-only
+  // posterior; uma falha de refresh NUNCA reescreve um resultado definitivo
+  // do servidor como "não conclusivo"; 4xx é rejeição DEFINITIVA; rede/5xx
+  // é conservador; readiness inválido não rearma o botão sozinho.
   async function executarCanarioOperacionalUI(): Promise<void> {
     if (!campanha?.campanhaId || acaoPendente !== null || canarioPendente) return;
     const confirmado = window.confirm(
@@ -1408,45 +1413,70 @@ export function CampaignWorkspace() {
     setCanarioPendente(true);
     setAcaoMensagem("");
     setAcaoErro("");
+    // (A) FAIL-CLOSED antes do despacho: o readiness antigo é invalidado
+    // para que um permitida=true obsoleto não reabilite o botão após a
+    // conclusão. Somente uma leitura NOVA do servidor reabilita a ação.
+    setReadiness(null);
+    setReadinessErro("");
     try {
+      // (B) MUTAÇÃO adjudicada primeiro: resultado/receipt/motivo do POST
+      // são preservados mesmo se a sincronização posterior falhar.
       const corpo = await executarCanarioOperacional(campanha.campanhaId);
-      // Pós-canário: recarrega AMBOS os recursos autoritativos antes de
-      // apresentar o estado durável; nada é inferido localmente (não existe
-      // transição ENVIADO no cliente).
-      const [detalhe, corpoReadiness] = await Promise.all([
-        obterCampanhaDetalhe(campanha.campanhaId),
-        obterReadinessOperacional(campanha.campanhaId),
-      ]);
-      setCampanha(detalhe);
-      setReadiness(corpoReadiness);
-      setReadinessErro("");
       if (corpo.resultado === "AMBIGUO") {
-        // Resultado não conclusivo: NUNCA repetir o POST automaticamente;
-        // apenas a leitura read-only acima foi realizada.
+        // (C) ambiguidade EXPLÍCITA do servidor: permanece não conclusiva,
+        // sem repetição automática, verificação manual obrigatória.
         setAcaoMensagem("");
         setAcaoErro(
-          "Resultado do canário não conclusivo. Não repetir automaticamente. Verifique o estado persistido antes de qualquer nova tentativa.",
+          "Canário: AMBIGUO — Resultado do canário não conclusivo. Não repetir automaticamente. Verifique o estado persistido antes de qualquer nova tentativa.",
         );
       } else {
+        // Resultado DEFINITIVO do servidor (ENVIADO/NAO_CLAIMADO/
+        // FALHA_PRE_PROVIDER/FALHA_DEFINITIVA/...): preservado inclusive o
+        // recibo quando presente; nunca reclassificado como ambíguo.
         setAcaoMensagem(
           "Canário: " +
             corpo.resultado +
             (corpo.receipt?.messageId ? " — recibo " + corpo.receipt.messageId : corpo.motivo ? " — " + corpo.motivo : ""),
         );
       }
+      // Sincronização READ-ONLY com domínio de erro PRÓPRIO (não compartilha
+      // o catch da mutação): nada aqui pode reescrever a mensagem acima.
+      try {
+        const [detalhe, corpoReadiness] = await Promise.all([
+          obterCampanhaDetalhe(campanha.campanhaId),
+          obterReadinessOperacional(campanha.campanhaId),
+        ]);
+        setCampanha(detalhe);
+        setReadiness(corpoReadiness);
+        setReadinessErro("");
+      } catch {
+        // (F) falha de sincronização: o resultado do POST permanece exibido;
+        // readiness fica inválido e o operador deve reler o estado
+        // autoritativo antes de qualquer nova ação. ZERO segundo POST.
+        setReadiness(null);
+        setReadinessErro(
+          "Falha na sincronização do estado pós-envio — recarregue/consulte o estado persistido antes de nova ação.",
+        );
+      }
     } catch (error: unknown) {
-      // Falha de rede/transporte após despacho é potencialmente AMBÍGUA:
-      // comportamento conservador — ZERO repetição automática, apenas o
-      // aviso sanitizado (a releitura de estado não é automática aqui para
-      // nunca mascarar o resultado pendente com um estado supostamente
-      // atual; o operador relê o estado explicitamente).
       setAcaoMensagem("");
-      setAcaoErro(
-        (error instanceof ApiCampanhaError
-          ? error.message
-          : "Canário indisponível.") +
-          " Resultado do canário não conclusivo. Não repetir automaticamente. Verifique o estado persistido antes de qualquer nova tentativa.",
-      );
+      if (error instanceof ApiCampanhaError && error.status >= 400 && error.status < 500) {
+        // (E) rejeição DEFINITIVA do servidor (4xx): exibida como é — sem
+        // "não conclusivo", sem inventar envio, sem repetição automática.
+        setAcaoErro(
+          error.message +
+            " — Rejeição definitiva do servidor. Consulte o estado persistido antes de qualquer nova tentativa.",
+        );
+      } else {
+        // (D) rede/transporte/5xx: potencialmente NÃO CONCLUSIVO —
+        // comportamento conservador; ZERO repetição automática.
+        setAcaoErro(
+          (error instanceof ApiCampanhaError ? error.message : "Canário indisponível.") +
+            " Resultado do canário potencialmente não conclusivo (falha de rede/servidor). Não repetir automaticamente. Verifique o estado persistido antes de qualquer nova tentativa.",
+        );
+      }
+      // Sem readiness fresco o botão não rearma: estado fail-closed.
+      setReadiness(null);
     } finally {
       setCanarioPendente(false);
     }
@@ -2370,6 +2400,16 @@ export function CampaignWorkspace() {
             {!readiness && !readinessErro ? (
               <p role="status">Carregando readiness operacional…</p>
             ) : null}
+            {/* GF4.5C.1 — resultado/erro do canário visíveis INDEPENDENTES do
+                readiness: um resultado definitivo do POST permanece exibido
+                mesmo com o readiness invalidado (null) aguardando nova
+                leitura autoritativa. */}
+            {acaoMensagem ? (
+              <p role="status" className="campaign-actions-note">{acaoMensagem}</p>
+            ) : null}
+            {acaoErro ? (
+              <p role="alert" className="campaign-session-error">{acaoErro}</p>
+            ) : null}
             {readiness ? (
               <>
                 <ul className="campaign-flow-stats">
@@ -2424,12 +2464,6 @@ export function CampaignWorkspace() {
                   </li>
                   <li>Próxima ação necessária: {readiness.proximaAcao}</li>
                 </ul>
-                {acaoMensagem ? (
-                  <p role="status" className="campaign-actions-note">{acaoMensagem}</p>
-                ) : null}
-                {acaoErro ? (
-                  <p role="alert" className="campaign-session-error">{acaoErro}</p>
-                ) : null}
                 {readiness.lote.estado === "HOLD" || readiness.lote.estado === "PREPARADO" ? (
                   <p className="campaign-actions-note">
                     <strong>

@@ -161,6 +161,9 @@ const describeDb = DB_URL_AMBIENTE ? describe : describe.skip;
 describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
   let pool: import("@integra-correios/persistence").NodePostgresPool | undefined;
   let despachar: Despachar;
+  let injetarFornecedor:
+    | ((fornecedor: Parameters<typeof injetarFornecedorLoteParaTeste>[0] | null) => void)
+    | undefined;
   const CHAVE_FINGERPRINT_B64 = CHAVE_FINGERPRINT_FIXTURE_B64;
 
   beforeAll(async () => {
@@ -168,6 +171,10 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
     vi.resetModules();
     const servidor = await import("../src/server.js");
     despachar = servidor.despachar as Despachar;
+    // SERVER_SINGLETON_CROSS_TEST_LEAK=false: a DI do lote é capturada DA
+    // MESMA instância reimportada do despachar (vi.resetModules cria novo
+    // estado de módulo; a injeção estática nunca afetaria esta instância).
+    injetarFornecedor = servidor.injetarFornecedorLoteParaTeste;
     const { NodePostgresPool } = await import("@integra-correios/persistence");
     pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE!, max: 4 });
   });
@@ -438,7 +445,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
         };
       }) as ProvedorEnvioCampanha["enviar"],
     };
-    injetarFornecedorLoteParaTeste({ provedorParaCampanha: () => provider });
+    injetarFornecedor!({ provedorParaCampanha: () => provider });
   }
 
   async function contagensPorEstado(loteCampanhaId: string): Promise<Record<string, number>> {
@@ -476,6 +483,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
       await pool?.query(`DELETE FROM oauth_connection WHERE id = $1 AND provider = 'GMAIL'`, [id]);
     }
     conexaoRecemInserida = undefined;
+    injetarFornecedor?.(null);
     injetarFornecedorLoteParaTeste(null);
   });
 
@@ -823,7 +831,7 @@ describeDb("GF5.3 — rota HTTP real do lote (POSTGRESQL_INTEGRATION)", () => {
         };
       }) as ProvedorEnvioCampanha["enviar"],
     };
-    injetarFornecedorLoteParaTeste({ provedorParaCampanha: () => provider });
+    injetarFornecedor!({ provedorParaCampanha: () => provider });
     const espiaoRede = vi.fn();
     vi.stubGlobal("fetch", espiaoRede);
     try {

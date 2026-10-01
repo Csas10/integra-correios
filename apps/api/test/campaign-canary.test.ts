@@ -1125,11 +1125,20 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
    * sessão (mesmo contrato admin/provision + session dos testes 2B1A-H*).
    */
   async function provisionarOperadorPapeis(papeis: readonly string[]): Promise<string> {
-    const credencial = tokenSintetico("f1-" + papeis.join("-"));
+    // GF4.5B — sufixo ÚNICO POR INVOCACAO (nunca por conjunto de papeis):
+    // mesmo conjunto de papeis + invocacoes distintas => credencial distinta
+    // => credentialHash distinto. Elimina a colisao UNIQUE(credentialHash)
+    // de uma segunda provisao do MESMO conjunto na mesma execucao de PG16
+    // (e.g. F1 provisao de ["EXECUTOR"] seguida do teste de isolamento
+    // GF4.5). tokenSintetico permanece intocado (deterministico por semente);
+    // a correcao esta SOMENTE na semente do helper. Sem 409 capturado,
+    // sem row removida, sem operador reutilizado.
+    const sufixo = randomUUID().replace(/-/g, "").slice(0, 12);
+    const credencial = tokenSintetico("f1-" + papeis.join("-") + "-" + sufixo);
     const admin = await despachar("POST", "/api/operator/admin/provision", {
       headers: { cookie: adminCookie, "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({
-        code: "OP-F1-" + randomUUID().slice(0, 8),
+        code: "OP-F1-" + sufixo,
         displayName: "Operador F1 " + papeis.join("+"),
         roles: [...papeis],
         credentialHash: createHash("sha256").update(credencial).digest("hex"),
@@ -2029,6 +2038,24 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
       });
       expect(inexistente.status).toBe(404);
       expect(inexistente.corpo).toContain("CAMPAIGN_PERSISTED_NOT_FOUND");
+
+      // GF4.5B — fixture de isolamento com credencial ÚNICA por invocação:
+      // uma SEGUNDA provisão de ["EXECUTOR"] no MESMO processo/PG deve
+      // funcionar (201), com identidade provisionada DISTINTA da primeira
+      // (nenhuma colisão de credentialHash; nenhum segredo sintético exposto).
+      const segundoExecutor = await provisionarOperadorPapeis(["EXECUTOR"]);
+      const meSegundo = await despachar("GET", "/api/operator/me", {
+        headers: { cookie: segundoExecutor },
+      });
+      expect(meSegundo.status).toBe(200);
+      const corpoSegundo = JSON.parse(meSegundo.corpo) as {
+        operatorId: string;
+        code: string;
+        roles: string[];
+      };
+      expect(corpoSegundo.roles).toContain("EXECUTOR");
+      expect(corpoSegundo.operatorId).not.toBe(operatorIdF);
+      expect(corpoSegundo.code.startsWith("OP-F1-")).toBe(true);
     } finally {
       vi.unstubAllGlobals();
     }

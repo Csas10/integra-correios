@@ -140,6 +140,50 @@ describe("retomada cross-browser — destinos derivados (UX-FLOW-01B)", () => {
     expect(visao.foco).toContain("Acompanhamento");
   });
 
+  it("GF4.3D: SINGLE LOTE_CRIADO/PREPARADO ou ATIVO → Operação/acompanhamento (macroetapa 4, NUNCA import)", () => {
+    for (const loteEstado of ["PREPARADO", "ATIVO"] as const) {
+      const resumo: CampanhaRetomavelResumo = {
+        ...base,
+        estado: "LOTE_CRIADO",
+        loteId: "lote-gf43d",
+        loteCodigo: "CAMPANHA_PF_AF75C4B48D7C",
+        loteEstado,
+        outboxTotal: 1,
+        outboxNaoExecutavel: loteEstado === "PREPARADO" ? 1 : 0,
+      };
+      const disposicao = disposicaoRetomada([resumo]);
+      expect(disposicao.tipo).toBe("ACOMPANHAMENTO");
+      if (disposicao.tipo !== "ACOMPANHAMENTO") continue;
+      const visao = macroEtapaAtual({
+        sessaoAtiva: true,
+        baseAvaliada: false,
+        decisoesPendentes: false,
+        aprovacaoPresente: false,
+        campanha: {
+          estado: disposicao.campanha.estado,
+          loteId: disposicao.campanha.loteId,
+          loteEstado: disposicao.campanha.loteEstado,
+        },
+      });
+      expect(visao.macro).toBe(4);
+      expect(visao.macroId).toBe("OPERACAO");
+      expect(visao.foco).toContain("Acompanhamento");
+      expect(visao.macro).not.toBe(2);
+    }
+  });
+
+  it("GF4.3D: derivação da macroetapa não filtra por HOLD — qualquer lote não-nulo é acompanhamento (fonte real)", () => {
+    const caminhoMacro = resolve(diretorioAtual, "../src/pages/campaign-macro-stage.ts");
+    const fonteMacro = existsSync(caminhoMacro) ? readFileSync(caminhoMacro, "utf-8") : "";
+    expect(fonteMacro.length).toBeGreaterThan(0);
+    expect(fonteMacro).toContain("if (campanha.loteId !== null && campanha.loteEstado !== null)");
+    const inicio = fonteMacro.indexOf("export function macroEtapaAtual");
+    const fim = fonteMacro.indexOf("function visao(");
+    expect(inicio).toBeGreaterThanOrEqual(0);
+    expect(fim).toBeGreaterThan(inicio);
+    expect(fonteMacro.slice(inicio, fim)).not.toContain('"HOLD"');
+  });
+
   it("EMPTY → Preparação (nada selecionado pelo cliente)", () => {
     const disposicao = disposicaoRetomada([]);
     expect(disposicao.tipo).toBe("SEM_RETOMADA");

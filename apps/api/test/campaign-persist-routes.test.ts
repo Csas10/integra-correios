@@ -5,6 +5,7 @@ import {
   carregarPoliticaCampanhaAtualizacao,
   contentHashDoTemplateSelecionado,
 } from "../src/campaigns.js";
+import { listarCampanhasRetomaveis } from "../src/campaign-persistence.js";
 
 type Despachar = typeof despacharSemBanco;
 let despacharAtivo: Despachar = despacharSemBanco;
@@ -75,6 +76,74 @@ describe("CAMPAIGN_PERSIST_ROUTES — gates fechados (sem banco)", () => {
 // 2. Bloco DB-gated (CI / PostgreSQL 16): jornada real com fixtures.
 //    Localmente é skipped — skip por ausência de DATABASE_URL NÃO é PASS.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// GF4.3D — contrato da query de retomada provado SEM banco (pool com stub):
+// whitelist de lote HOLD/PREPARADO/ATIVO, exclusão de CANCELADO, isolamento
+// por operator_id e mapeamento saneado. A execução real no PostgreSQL fica
+// no bloco DB-gated abaixo (CI/PG16).
+// ---------------------------------------------------------------------------
+
+describe("CAMPAIGN_RESUMABLE_QUERY — whitelist de lote (stub, sem banco)", () => {
+  function poolComResposta(rows: readonly unknown[] = []) {
+    const capturado: {
+      text?: string | undefined;
+      values?: readonly unknown[] | undefined;
+    } = {};
+    const pool = {
+      connect: async () => {
+        throw new Error("connect() não é esperado nesta leitura");
+      },
+      query: async (text: string, values?: readonly unknown[]) => {
+        capturado.text = text;
+        capturado.values = values;
+        return { rows, rowCount: rows.length };
+      },
+    };
+    return { pool, capturado };
+  }
+
+  it("retomáveis: lote HOLD, PREPARADO e ATIVO; CANCELADO fora; APROVADA sem lote; isolado por operator_id", async () => {
+    const { pool, capturado } = poolComResposta();
+    const resumos = await listarCampanhasRetomaveis(pool, { operatorId: randomUUID() });
+    expect(resumos).toEqual([]);
+    const sql = capturado.text ?? "";
+    expect(sql).toContain("c.estado = 'APROVADA' AND lc.id IS NULL");
+    expect(sql).toContain(
+      "OR (c.estado = 'LOTE_CRIADO' AND lc.estado IN ('HOLD', 'PREPARADO', 'ATIVO'))",
+    );
+    expect(sql).toContain("c.operator_id = $1");
+    expect(sql).not.toContain("lc.estado = 'HOLD'");
+    expect(sql).not.toContain("'CANCELADO'");
+    expect(sql).not.toContain("c.estado = 'CANCELADA'");
+  });
+
+  it("mapeamento saneado: contadores numéricos; nenhum hash/fingerprint no resumo", async () => {
+    const { pool } = poolComResposta([
+      {
+        campanha_id: randomUUID(),
+        estado: "LOTE_CRIADO",
+        total_aprovados: 1,
+        lote_id: randomUUID(),
+        lote_codigo: "CAMPANHA_PF_AF75C4B48D7C",
+        lote_estado: "PREPARADO",
+        outbox_total: "1",
+        outbox_nao_executavel: "1",
+        criada_em: "2026-10-01T05:11:35.107Z",
+      },
+    ]);
+    const resumos = await listarCampanhasRetomaveis(pool, { operatorId: randomUUID() });
+    expect(resumos).toHaveLength(1);
+    expect(resumos[0]).toMatchObject({
+      estado: "LOTE_CRIADO",
+      loteEstado: "PREPARADO",
+      outboxTotal: 1,
+      outboxNaoExecutavel: 1,
+    });
+    expect(resumos[0]).not.toHaveProperty("hashAprovacao");
+    expect(resumos[0]).not.toHaveProperty("fingerprintArquivo");
+  });
+});
 
 const describeDb = DB_URL_AMBIENTE ? describe : describe.skip;
 
@@ -892,6 +961,70 @@ describeDb("CAMPAIGN_RESUMABLE_ROUTES — retomada real (PostgreSQL 16)", () => 
       expect(corpoLote.campaign.loteEstado).toBe("HOLD");
       expect(corpoLote.campaign.outboxTotal).toBe(2);
       expect(corpoLote.campaign.outboxNaoExecutavel).toBe(2);
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("GF4.3D: lote PREPARADO/ATIVO permanece retomável (SINGLE); lote CANCELADO e campanha CANCELADA ficam fora", async () => {
+    const { NodePostgresPool } = await import("@integra-correios/persistence");
+    const pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE! });
+    const lerRetomada = async (cookie: string) => {
+      const resposta = await despachar("GET", "/api/campaigns/resumable", { headers: { cookie } });
+      expect(resposta.status).toBe(200);
+      return JSON.parse(resposta.corpo) as {
+        mode: string;
+        campaign?: { loteEstado: string | null };
+        campaigns?: unknown[];
+      };
+    };
+    try {
+      const adminCookie = await bootstrapAdmin();
+
+      // Operador A: lote HOLD → PREPARADO → ATIVO → CANCELADO.
+      const operadorA = await provisionOperator(adminCookie, ["PREPARADOR", "APROVADOR", "EXECUTOR"]);
+      const alvoA = await persistirCampanha(operadorA.cookie, sha(`gf43d-lote-${randomUUID()}`));
+      const loteCriado = await despachar("POST", "/api/campaigns/batch", {
+        headers: { cookie: operadorA.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({ campanhaId: alvoA.campanhaId, conteudoHash: alvoA.conteudoHash })),
+      });
+      expect(loteCriado.status).toBe(201);
+      const loteId = (
+        await pool.query<{ id: string }>("SELECT id FROM lote_campanha WHERE campanha_id = $1", [alvoA.campanhaId])
+      ).rows[0]!.id;
+
+      // 3. LOTE_CRIADO + PREPARADO → SINGLE (defeito corrigido).
+      await pool.query("UPDATE lote_campanha SET estado = 'PREPARADO' WHERE id = $1", [loteId]);
+      const comPreparado = await lerRetomada(operadorA.cookie);
+      expect(comPreparado.mode).toBe("SINGLE");
+      expect(comPreparado.campaign!.loteEstado).toBe("PREPARADO");
+
+      // 4. LOTE_CRIADO + ATIVO → SINGLE (corrige a recorrência pós-ativação).
+      await pool.query("UPDATE lote_campanha SET estado = 'ATIVO' WHERE id = $1", [loteId]);
+      const comAtivo = await lerRetomada(operadorA.cookie);
+      expect(comAtivo.mode).toBe("SINGLE");
+      expect(comAtivo.campaign!.loteEstado).toBe("ATIVO");
+
+      // 6. lote CANCELADO → excluído (EMPTY).
+      await pool.query("UPDATE lote_campanha SET estado = 'CANCELADO' WHERE id = $1", [loteId]);
+      const loteCancelado = await lerRetomada(operadorA.cookie);
+      expect(loteCancelado.mode).toBe("EMPTY");
+      expect(loteCancelado.campaign).toBeUndefined();
+
+      // 5. campanha CANCELADA → excluída (EMPTY).
+      const operadorB = await provisionOperator(adminCookie, ["PREPARADOR", "APROVADOR", "EXECUTOR"]);
+      const alvoB = await persistirCampanha(operadorB.cookie, sha(`gf43d-cancelada-${randomUUID()}`));
+      const aprovadaB = await lerRetomada(operadorB.cookie);
+      expect(aprovadaB.mode).toBe("SINGLE");
+      await pool.query("UPDATE campanha_persistida SET estado = 'CANCELADA' WHERE id = $1", [alvoB.campanhaId]);
+      const canceladaB = await lerRetomada(operadorB.cookie);
+      expect(canceladaB.mode).toBe("EMPTY");
+
+      // 7 (reforço): operador sem campanha própria não enxerga a alheia.
+      const operadorC = await provisionOperator(adminCookie, ["PREPARADOR", "EXECUTOR"]);
+      const alheio = await lerRetomada(operadorC.cookie);
+      expect(alheio.mode).toBe("EMPTY");
+      expect(alheio.campaign).toBeUndefined();
     } finally {
       await pool.close();
     }

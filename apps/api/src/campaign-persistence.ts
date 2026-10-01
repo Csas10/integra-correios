@@ -439,9 +439,10 @@ function operatorUuidValido(value: string): boolean {
  * exclusivamente o operator_id da sessão. Sem mutação e sem evento de
  * auditoria — a leitura não altera nenhum agregado. Campanha alheia nunca
  * entra no resultado (isolamento: invisível e indistinguível de ausência).
- * Corretivo UX-FLOW-01B: só entram na lista os estados retomáveis do
- * contrato (APROVADA sem lote OU LOTE_CRIADO com lote HOLD) — CANCELADA,
- * estados fora do contrato e lote fora de HOLD ficam fora. A lista é SEMPRE
+ * Corretivo UX-FLOW-01B / GF4.3D: só entram na lista os estados retomáveis
+ * do contrato (APROVADA sem lote OU LOTE_CRIADO com lote HOLD, PREPARADO ou
+ * ATIVO) — CANCELADA, estados fora do contrato e lote CANCELADO ficam fora.
+ * A lista é SEMPRE
  * completa (nenhum limite do cliente): a cardinalidade EMPTY/SINGLE/MULTIPLE
  * é decidida sobre a contagem total, ordenada por criada_em DESC.
  */
@@ -467,7 +468,7 @@ export async function listarCampanhasRetomaveis(
       WHERE c.operator_id = $1
         AND (
           (c.estado = 'APROVADA' AND lc.id IS NULL)
-          OR (c.estado = 'LOTE_CRIADO' AND lc.estado = 'HOLD')
+          OR (c.estado = 'LOTE_CRIADO' AND lc.estado IN ('HOLD', 'PREPARADO', 'ATIVO'))
         )
       ORDER BY c.criada_em DESC`,
     [consulta.operatorId],

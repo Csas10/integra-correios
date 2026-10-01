@@ -22,6 +22,9 @@ import {
 } from "@integra-correios/mail";
 import { chaveIdempotenciaExecucao } from "../src/campaign-execution.js";
 import {
+  Aes256GcmSecretBox,
+} from "@integra-correios/persistence";
+import {
   CampanhaTokenResolutionError,
   criarCampanhaGmailRuntime,
   type DependenciasRuntimeGmailCampanha,
@@ -95,7 +98,6 @@ function receiptFake(messageId: string): MailReceipt {
 /** Linha BRUTA de oauth_connection na forma consumida pelo
  * PostgresOperationalRepository (mesma fixture do runtime 03C.2B1A). */
 function linhaConexaoBruta(): Record<string, unknown> {
-  const { Aes256GcmSecretBox } = require("@integra-correios/persistence") as typeof import("@integra-correios/persistence");
   const caixa = new Aes256GcmSecretBox(CHAVE_CRIPTO, "v1-gf51");
   const access = caixa.seal("token-sintetico-gf51", "oauth:access");
   const refresh = caixa.seal("refresh-sintetico-gf51", "oauth:refresh");

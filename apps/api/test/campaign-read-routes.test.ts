@@ -12,6 +12,7 @@ import {
 import {
   baseSinteticaCampanha,
   carregarPoliticaCampanhaAtualizacao,
+  contentHashDoTemplateSelecionado,
   hashAprovacaoCampanha,
 } from "../src/campaigns.js";
 import { despachar as despacharSemBanco } from "../src/server.js";
@@ -102,8 +103,22 @@ function opcoesDespacho(
   };
 }
 
+// GF-2 CORRETIVO — autorização de campanha NOVA usa a versão selecionável
+// do registry (v1 RETIRED não é selecionável; o algoritmo V1 permanece apenas
+// para reconstrução histórica). O hash devolvido é SEMPRE V2 (campos
+// PREFILLED + templateVersion + templateContentHash vinculados).
 function entradaAprovacao() {
-  return { templateVersao: "pf-atualizacao-cadastral-2026-v1", registros: REGISTROS_APROVACAO };
+  return { templateVersao: "pf-expedicao-carteira-2026-v2", registros: REGISTROS_APROVACAO };
+}
+
+/** Hash de aprovação V2 da entrada canônica (mesmo contrato da rota). */
+function hashAprovacaoV2DaEntrada() {
+  return hashAprovacaoCampanha({
+    contrato: "CAMPANHA_APROVACAO_V2",
+    templateVersao: entradaAprovacao().templateVersao,
+    templateContentHash: contentHashDoTemplateSelecionado(entradaAprovacao().templateVersao),
+    registros: entradaAprovacao().registros,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +326,8 @@ describe("CAMPAIGN_READ_ROUTES — avaliarArquivoCampanha / avaliarBaseCampanha"
     expect(analise.folhas_disponiveis).toEqual(["Base"]);
     expect(analise.cabecalhos).toEqual([...CABECALHOS_CANONICOS]);
     expect(analise.total_linhas).toBe(2);
+    // GF-2 FINAL — o mapeamento sugerido inclui os campos de exibição
+    // (PREFILLED_CONFIRMATION); sem colunas de origem ⇒ -1 (campo ausente).
     expect(analise.mapeamento_sugerido).toEqual({
       profissional_id: 0,
       nome: 1,
@@ -319,6 +336,14 @@ describe("CAMPAIGN_READ_ROUTES — avaliarArquivoCampanha / avaliarBaseCampanha"
       email_normalizado: -1,
       status_validacao: -1,
       motivo_bloqueio: -1,
+      telefone: -1,
+      cep: -1,
+      logradouro: -1,
+      numero: -1,
+      complemento: -1,
+      bairro: -1,
+      cidade: -1,
+      uf: -1,
     });
   });
 
@@ -553,8 +578,8 @@ describeDb("CAMPAIGN_READ_ROUTES — papéis, contratos HTTP e zero-escrita (Pos
     expect(autorizacaoNegada.status).toBe(403);
     expect(autorizacaoNegada.corpo).toContain("OPERATOR_ROLE_FORBIDDEN");
 
-    // APROVADOR: autoriza com hash; synthetic-base/analyze/evaluate bloqueados.
-    const hash = hashAprovacaoCampanha(entradaAprovacao());
+    // APROVADOR: autoriza com hash V2; synthetic-base/analyze/evaluate bloqueados.
+    const hash = hashAprovacaoV2DaEntrada();
     const aprovacao = await despachar("POST", ROTA_AUTHORIZE, {
       headers: { cookie: aprovador.cookie, "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({ ...entradaAprovacao(), conteudoHash: hash })),
@@ -562,12 +587,14 @@ describeDb("CAMPAIGN_READ_ROUTES — papéis, contratos HTTP e zero-escrita (Pos
     expect(aprovacao.status).toBe(200);
     const corpoAprovacao = JSON.parse(aprovacao.corpo) as {
       status: string;
+      approvalHashVersion: string;
       conteudoHash: string;
       totalItens: number;
       persistida: boolean;
       aprovadaPor: string;
     };
     expect(corpoAprovacao.status).toBe("CAMPAIGN_APPROVAL_FROZEN");
+    expect(corpoAprovacao.approvalHashVersion).toBe("CAMPANHA_APROVACAO_V2");
     expect(corpoAprovacao.conteudoHash).toBe(hash);
     expect(corpoAprovacao.totalItens).toBe(REGISTROS_APROVACAO.length);
     expect(corpoAprovacao.persistida).toBe(false);
@@ -599,7 +626,7 @@ describeDb("CAMPAIGN_READ_ROUTES — papéis, contratos HTTP e zero-escrita (Pos
     });
     expect(resposta.status).toBe(409);
     expect(resposta.corpo).toContain("CAMPAIGN_APPROVAL_STALE");
-    expect(resposta.corpo).not.toContain(hashAprovacaoCampanha(entradaAprovacao()));
+    expect(resposta.corpo).not.toContain(hashAprovacaoV2DaEntrada());
   });
 
   it("entradas inválidas com sessão PREPARADOR → 400/422 antes de qualquer processamento", async () => {

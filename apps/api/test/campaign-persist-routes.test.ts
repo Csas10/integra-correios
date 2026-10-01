@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { despachar as despacharSemBanco } from "../src/server.js";
-import { carregarPoliticaCampanhaAtualizacao } from "../src/campaigns.js";
+import {
+  carregarPoliticaCampanhaAtualizacao,
+  contentHashDoTemplateSelecionado,
+} from "../src/campaigns.js";
+import { listarCampanhasRetomaveis } from "../src/campaign-persistence.js";
 
 type Despachar = typeof despacharSemBanco;
 let despacharAtivo: Despachar = despacharSemBanco;
@@ -72,6 +76,74 @@ describe("CAMPAIGN_PERSIST_ROUTES — gates fechados (sem banco)", () => {
 // 2. Bloco DB-gated (CI / PostgreSQL 16): jornada real com fixtures.
 //    Localmente é skipped — skip por ausência de DATABASE_URL NÃO é PASS.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// GF4.3D — contrato da query de retomada provado SEM banco (pool com stub):
+// whitelist de lote HOLD/PREPARADO/ATIVO, exclusão de CANCELADO, isolamento
+// por operator_id e mapeamento saneado. A execução real no PostgreSQL fica
+// no bloco DB-gated abaixo (CI/PG16).
+// ---------------------------------------------------------------------------
+
+describe("CAMPAIGN_RESUMABLE_QUERY — whitelist de lote (stub, sem banco)", () => {
+  function poolComResposta(rows: readonly unknown[] = []) {
+    const capturado: {
+      text?: string | undefined;
+      values?: readonly unknown[] | undefined;
+    } = {};
+    const pool = {
+      connect: async () => {
+        throw new Error("connect() não é esperado nesta leitura");
+      },
+      query: async (text: string, values?: readonly unknown[]) => {
+        capturado.text = text;
+        capturado.values = values;
+        return { rows, rowCount: rows.length };
+      },
+    };
+    return { pool, capturado };
+  }
+
+  it("retomáveis: lote HOLD, PREPARADO e ATIVO; CANCELADO fora; APROVADA sem lote; isolado por operator_id", async () => {
+    const { pool, capturado } = poolComResposta();
+    const resumos = await listarCampanhasRetomaveis(pool, { operatorId: randomUUID() });
+    expect(resumos).toEqual([]);
+    const sql = capturado.text ?? "";
+    expect(sql).toContain("c.estado = 'APROVADA' AND lc.id IS NULL");
+    expect(sql).toContain(
+      "OR (c.estado = 'LOTE_CRIADO' AND lc.estado IN ('HOLD', 'PREPARADO', 'ATIVO'))",
+    );
+    expect(sql).toContain("c.operator_id = $1");
+    expect(sql).not.toContain("lc.estado = 'HOLD'");
+    expect(sql).not.toContain("'CANCELADO'");
+    expect(sql).not.toContain("c.estado = 'CANCELADA'");
+  });
+
+  it("mapeamento saneado: contadores numéricos; nenhum hash/fingerprint no resumo", async () => {
+    const { pool } = poolComResposta([
+      {
+        campanha_id: randomUUID(),
+        estado: "LOTE_CRIADO",
+        total_aprovados: 1,
+        lote_id: randomUUID(),
+        lote_codigo: "CAMPANHA_PF_AF75C4B48D7C",
+        lote_estado: "PREPARADO",
+        outbox_total: "1",
+        outbox_nao_executavel: "1",
+        criada_em: "2026-10-01T05:11:35.107Z",
+      },
+    ]);
+    const resumos = await listarCampanhasRetomaveis(pool, { operatorId: randomUUID() });
+    expect(resumos).toHaveLength(1);
+    expect(resumos[0]).toMatchObject({
+      estado: "LOTE_CRIADO",
+      loteEstado: "PREPARADO",
+      outboxTotal: 1,
+      outboxNaoExecutavel: 1,
+    });
+    expect(resumos[0]).not.toHaveProperty("hashAprovacao");
+    expect(resumos[0]).not.toHaveProperty("fingerprintArquivo");
+  });
+});
 
 const describeDb = DB_URL_AMBIENTE ? describe : describe.skip;
 
@@ -157,11 +229,58 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
     return { operatorId, cookie: firstCookie(login.headers["set-cookie"]) };
   }
 
+  // GF-2 FINAL — versão EXPLÍCITA selecionável (sem default); o hash de
+  // aprovação congela versão + contentHash canônico do registry.
+  const TEMPLATE_V2 = "pf-expedicao-carteira-2026-v2";
+  // GF-2 CORRETIVO — campos PREFILLED fazem parte do conteúdo aprovado
+  // (hash V2) e do snapshot persistido.
   const REGISTROS = [
-    { profissional_id: "PF-P-0001", nome: "Ana Sintetica", email_normalizado: "ana@exemplo.test", status_validacao: "APTO" },
-    { profissional_id: "PF-P-0002", nome: "Bruno Sintetico", email_normalizado: "bruno@exemplo.test", status_validacao: "APTO" },
-    { profissional_id: "PF-P-0003", nome: "Carla Sintetica", email_normalizado: "carla@exemplo.test", status_validacao: "APTO" },
+    {
+      profissional_id: "PF-P-0001", nome: "Ana Sintetica", email_normalizado: "ana@exemplo.test", status_validacao: "APTO",
+      exibicao: { telefone: "(00) 00000-0001", cep: "00000-001", logradouro: "Rua Teste", numero: "101", bairro: "Bairro Teste", cidade: "Salvador", uf: "BA" },
+    },
+    {
+      profissional_id: "PF-P-0002", nome: "Bruno Sintetico", email_normalizado: "bruno@exemplo.test", status_validacao: "APTO",
+      exibicao: { telefone: "(00) 00000-0002", cep: "00000-002", logradouro: "Avenida Teste", numero: "202", complemento: "S/N", bairro: "Bairro Teste", cidade: "Salvador", uf: "BA" },
+    },
+    {
+      profissional_id: "PF-P-0003", nome: "Carla Sintetica", email_normalizado: "carla@exemplo.test", status_validacao: "APTO",
+      exibicao: { telefone: "(00) 00000-0003", cep: "00000-003", logradouro: "Travessa Teste", numero: "303", bairro: "Bairro Teste", cidade: "Salvador", uf: "BA" },
+    },
   ];
+  /** Espelho independente do hash de aprovação V2 (contrato versionado). */
+  function hashAprovacaoV2Local(
+    templateVersao: string,
+    templateContentHash: string,
+    registros: readonly { profissional_id: string; nome: string; email_normalizado: string; status_validacao: string; source_record_key?: string; exibicao?: Record<string, string | undefined> }[],
+  ): string {
+    const CHAVES = ["telefone", "cep", "logradouro", "numero", "complemento", "bairro", "cidade", "uf"] as const;
+    const sha256 = createHash("sha256");
+    sha256.update("integra-correios:approval-hash:CAMPANHA_APROVACAO_V2\n");
+    sha256.update(`templateVersion=${templateVersao}\n`);
+    sha256.update(`templateContentHash=${templateContentHash}\n`);
+    sha256.update(`totalRegistros=${registros.length}\n`);
+    for (const registro of registros) {
+      sha256.update(
+        [
+          registro.profissional_id,
+          registro.nome,
+          registro.email_normalizado,
+          registro.status_validacao,
+          // GF-3 CORRECTIVE-02 (F4) — encoding de PRESENÇA tipado.
+          registro.source_record_key === undefined
+            ? "\u0000AUSENTE\u0000"
+            : `s:${(registro.source_record_key as string).length}:${registro.source_record_key}`,
+          ...CHAVES.map((chave) =>
+            registro.exibicao?.[chave] === undefined
+              ? "\u0000AUSENTE\u0000"
+              : `s:${(registro.exibicao[chave] as string).length}:${registro.exibicao[chave]}`,
+          ),
+        ].join("\u001f") + "\n",
+      );
+    }
+    return sha256.digest("hex");
+  }
 
   it("jornada: gate 403 → persist → stale 409 → idempotência → batch EXECUTOR → outbox HOLD → zero-claim", async () => {
     const { NodePostgresPool, PostgresOperationalRepository } = await import("@integra-correios/persistence");
@@ -204,6 +323,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
           registros: REGISTROS,
           decisoes: decisoesTeste,
         })),
@@ -215,14 +335,11 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         status: string;
       };
       expect(corpoPersist.status).toBe("CAMPAIGN_PERSISTED");
-      const hashEsperado = createHash("sha256")
-        .update("template:pf-atualizacao-cadastral-2026-v1\n")
-        .update(
-          REGISTROS.map(
-            (r) => `${r.profissional_id}\u001f${r.nome}\u001f${r.email_normalizado}\u001f${r.status_validacao}\n`,
-          ).join(""),
-        )
-        .digest("hex");
+      const hashEsperado = hashAprovacaoV2Local(
+        TEMPLATE_V2,
+        contentHashDoTemplateSelecionado(TEMPLATE_V2),
+        REGISTROS,
+      );
       expect(corpoPersist.conteudoHash).toBe(hashEsperado);
 
       // 2. stale: conteúdo divergente com hash antigo → 409
@@ -230,6 +347,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: randomUUID().replace(/-/g, "").padEnd(64, "0"),
+          templateVersao: TEMPLATE_V2,
           registros: [{ ...REGISTROS[0]!, nome: "CONTEUDO DIVERGENTE" }],
           decisoes: [],
           conteudoHash: corpoPersist.conteudoHash,
@@ -243,6 +361,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: operador.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
           registros: REGISTROS,
           decisoes: decisoesTeste,
         })),
@@ -348,6 +467,148 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
     }
   });
 
+    // GF-2 CORRETIVO — aprovação cadastral VINCULA o conteúdo completo
+    // (todos os campos PREFILLED + templateVersion + templateContentHash):
+    // qualquer alteração entre authorize e persist ⇒ 409 STALE.
+    it("stale por campo: mudar QUALQUER campo renderizado entre authorize e persist ⇒ 409 CAMPAIGN_APPROVAL_STALE", async () => {
+      const adminCookie = await bootstrapAdmin();
+      const aprovador = await provisionOperator(adminCookie, ["APROVADOR"]);
+      const operador = await provisionOperator(adminCookie, ["PREPARADOR", "EXECUTOR"]);
+      const fingerprint = sha(`stale-por-campo-${randomUUID()}`);
+
+      // 1. authorize congela o hash V2 do conteúdo completo
+      const autorizacao = await despachar("POST", "/api/campaigns/authorize", {
+        headers: { cookie: aprovador.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({ templateVersao: TEMPLATE_V2, registros: REGISTROS })),
+      });
+      expect(autorizacao.status).toBe(200);
+      const aprovado = JSON.parse(autorizacao.corpo) as {
+        status: string;
+        approvalHashVersion: string;
+        conteudoHash: string;
+      };
+      expect(aprovado.status).toBe("CAMPAIGN_APPROVAL_FROZEN");
+      expect(aprovado.approvalHashVersion).toBe("CAMPANHA_APROVACAO_V2");
+
+      // AUTHORIZE_PERSIST_SNAPSHOT_MATCH: o mesmo conteúdo persiste com o
+      // hash EXATAMENTE devolvido pelo authorize.
+      const persistida = await despachar("POST", "/api/campaigns/persist", {
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
+          conteudoHash: aprovado.conteudoHash,
+          registros: REGISTROS,
+          decisoes: [],
+        })),
+      });
+      expect(persistida.status).toBe(201);
+
+      // 2. MUTAÇÃO de um campo ⇒ hash recalculado diverge do congelado ⇒ 409.
+      //    União DISCRIMINADA (nada de nome de propriedade dinâmico) + provas:
+      //    cópia profunda, original intacto, alvo alterado, caminho único.
+      type Mutacao =
+        | {
+            tipo: "EXIBICAO";
+            campo: "telefone" | "cep" | "logradouro" | "numero" | "complemento" | "bairro" | "cidade" | "uf";
+            valor: string;
+          }
+        | { tipo: "REGISTRO"; campo: "nome" | "email_normalizado"; valor: string };
+
+      const mutacoes: readonly Mutacao[] = [
+        { tipo: "EXIBICAO", campo: "telefone", valor: "(00) 00000-9999" },
+        { tipo: "EXIBICAO", campo: "cep", valor: "00000-999" },
+        { tipo: "EXIBICAO", campo: "logradouro", valor: "Rua Alterada" },
+        { tipo: "EXIBICAO", campo: "numero", valor: "999" },
+        { tipo: "EXIBICAO", campo: "complemento", valor: "AP 99" },
+        { tipo: "EXIBICAO", campo: "bairro", valor: "Bairro Alterado" },
+        { tipo: "EXIBICAO", campo: "cidade", valor: "Feira de Santana" },
+        { tipo: "EXIBICAO", campo: "uf", valor: "PE" },
+        { tipo: "REGISTRO", campo: "nome", valor: "Ana Sintetica ALTERADA" },
+        { tipo: "REGISTRO", campo: "email_normalizado", valor: "ana.alterada@exemplo.test" },
+      ];
+
+      for (const mutacao of mutacoes) {
+        // Cópia profunda: original e mutado NUNCA compartilham `exibicao`.
+        const original = structuredClone(REGISTROS[0]!);
+        const mutado = structuredClone(REGISTROS[0]!);
+        const antesOriginal = JSON.stringify(original);
+        let caminhoAlterado = "";
+        switch (mutacao.tipo) {
+          case "EXIBICAO":
+            mutado.exibicao = { ...(mutado.exibicao ?? {}), [mutacao.campo]: mutacao.valor };
+            caminhoAlterado = `exibicao.${mutacao.campo}`;
+            break;
+          case "REGISTRO":
+            mutado[mutacao.campo] = mutacao.valor;
+            caminhoAlterado = mutacao.campo;
+            break;
+        }
+        // ORIGINAL_RECORD_UNCHANGED / MUTATION_TARGET_CHANGED /
+        // ONLY_EXPECTED_PATH_CHANGED / DYNAMIC_REPLACEMENT_PROPERTY_CREATED=false
+        expect(JSON.stringify(original)).toBe(antesOriginal);
+        if (mutacao.tipo === "EXIBICAO") {
+          expect((original.exibicao ?? {})[mutacao.campo]).not.toBe(mutacao.valor);
+          expect((mutado.exibicao ?? {})[mutacao.campo]).toBe(mutacao.valor);
+        } else {
+          expect(original[mutacao.campo]).not.toBe(mutacao.valor);
+          expect(mutado[mutacao.campo]).toBe(mutacao.valor);
+        }
+        expect(Object.keys(mutado).filter((chave) => chave === mutacao.valor)).toEqual([]);
+        if (mutacao.tipo === "EXIBICAO") {
+          expect(Object.keys(mutado.exibicao ?? {})).toEqual(
+            expect.arrayContaining(Object.keys(original.exibicao ?? {})),
+          );
+        }
+
+        const stale = await despachar("POST", "/api/campaigns/persist", {
+          headers: { cookie: operador.cookie, "content-type": "application/json" },
+          corpo: Buffer.from(JSON.stringify({
+            fingerprintArquivo: sha(`outro-arquivo-${randomUUID()}`),
+            templateVersao: TEMPLATE_V2,
+            conteudoHash: aprovado.conteudoHash,
+            registros: [
+              mutado,
+              ...REGISTROS.slice(1).map((registro) => structuredClone(registro)),
+            ],
+            decisoes: [],
+          })),
+        });
+        expect(
+          stale.status,
+          `campo ${caminhoAlterado} deveria invalidar a aprovação`,
+        ).toBe(409);
+        expect(stale.corpo).toContain("CAMPAIGN_APPROVAL_STALE");
+      }
+
+      // CONTROL_UNCHANGED_PERSISTS: conteúdo IDÊNTICO ao autorizado persiste.
+      const controle = await despachar("POST", "/api/campaigns/persist", {
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          fingerprintArquivo: sha(`controle-inalterado-${randomUUID()}`),
+          templateVersao: TEMPLATE_V2,
+          conteudoHash: aprovado.conteudoHash,
+          registros: REGISTROS.map((registro) => structuredClone(registro)),
+          decisoes: [],
+        })),
+      });
+      expect(controle.status).toBe(201);
+
+      // RENDERED_DATA_CHANGE_INVALIDATES_APPROVAL / TEMPLATE_CHANGE: versão
+      // diferente da autorizada nunca persiste (fail-closed na seleção).
+      const versaoDivergente = await despachar("POST", "/api/campaigns/persist", {
+        headers: { cookie: operador.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({
+          fingerprintArquivo: sha(`versao-divergente-${randomUUID()}`),
+          templateVersao: "pf-expedicao-carteira-2026-v3",
+          conteudoHash: aprovado.conteudoHash,
+          registros: REGISTROS,
+          decisoes: [],
+        })),
+      });
+      expect([409, 422]).toContain(versaoDivergente.status);
+    });
+
     it("isolamento por operador: terceiro EXECUTOR não lê nem materializa campanha/lote alheios (403/404, delta zero)", async () => {
     const { NodePostgresPool } = await import("@integra-correios/persistence");
     const pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE! });
@@ -362,6 +623,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: dono.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
           registros: REGISTROS,
           decisoes: [],
         })),
@@ -434,6 +696,7 @@ describeDb("CAMPAIGN_PERSIST_ROUTES — jornada persistida real (PostgreSQL)", (
         headers: { cookie: outro.cookie, "content-type": "application/json" },
         corpo: Buffer.from(JSON.stringify({
           fingerprintArquivo: fingerprint,
+          templateVersao: TEMPLATE_V2,
           registros: REGISTROS,
           decisoes: [],
         })),
@@ -609,12 +872,16 @@ describeDb("CAMPAIGN_RESUMABLE_ROUTES — retomada real (PostgreSQL 16)", () => 
     { profissional_id: "PF-R-0001", nome: "Ana Sintetica", email_normalizado: "ana@exemplo.test", status_validacao: "APTO" },
     { profissional_id: "PF-R-0002", nome: "Bruno Sintetico", email_normalizado: "bruno@exemplo.test", status_validacao: "APTO" },
   ];
+  // GF-2 CI CORRECTIVE-01 — seleção EXPLÍCITA da versão (v1 RETIRED; NENHUM
+  // default implícito): o servidor resolve a entrada APPROVED do registry.
+  const TEMPLATE_V2 = "pf-expedicao-carteira-2026-v2";
 
   async function persistirCampanha(cookie: string, fingerprint: string) {
     const resposta = await despachar("POST", "/api/campaigns/persist", {
       headers: { cookie, "content-type": "application/json" },
       corpo: Buffer.from(JSON.stringify({
         fingerprintArquivo: fingerprint,
+        templateVersao: TEMPLATE_V2,
         registros: REGISTROS,
         decisoes: [],
       })),
@@ -694,6 +961,70 @@ describeDb("CAMPAIGN_RESUMABLE_ROUTES — retomada real (PostgreSQL 16)", () => 
       expect(corpoLote.campaign.loteEstado).toBe("HOLD");
       expect(corpoLote.campaign.outboxTotal).toBe(2);
       expect(corpoLote.campaign.outboxNaoExecutavel).toBe(2);
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("GF4.3D: lote PREPARADO/ATIVO permanece retomável (SINGLE); lote CANCELADO e campanha CANCELADA ficam fora", async () => {
+    const { NodePostgresPool } = await import("@integra-correios/persistence");
+    const pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE! });
+    const lerRetomada = async (cookie: string) => {
+      const resposta = await despachar("GET", "/api/campaigns/resumable", { headers: { cookie } });
+      expect(resposta.status).toBe(200);
+      return JSON.parse(resposta.corpo) as {
+        mode: string;
+        campaign?: { loteEstado: string | null };
+        campaigns?: unknown[];
+      };
+    };
+    try {
+      const adminCookie = await bootstrapAdmin();
+
+      // Operador A: lote HOLD → PREPARADO → ATIVO → CANCELADO.
+      const operadorA = await provisionOperator(adminCookie, ["PREPARADOR", "APROVADOR", "EXECUTOR"]);
+      const alvoA = await persistirCampanha(operadorA.cookie, sha(`gf43d-lote-${randomUUID()}`));
+      const loteCriado = await despachar("POST", "/api/campaigns/batch", {
+        headers: { cookie: operadorA.cookie, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({ campanhaId: alvoA.campanhaId, conteudoHash: alvoA.conteudoHash })),
+      });
+      expect(loteCriado.status).toBe(201);
+      const loteId = (
+        await pool.query<{ id: string }>("SELECT id FROM lote_campanha WHERE campanha_id = $1", [alvoA.campanhaId])
+      ).rows[0]!.id;
+
+      // 3. LOTE_CRIADO + PREPARADO → SINGLE (defeito corrigido).
+      await pool.query("UPDATE lote_campanha SET estado = 'PREPARADO' WHERE id = $1", [loteId]);
+      const comPreparado = await lerRetomada(operadorA.cookie);
+      expect(comPreparado.mode).toBe("SINGLE");
+      expect(comPreparado.campaign!.loteEstado).toBe("PREPARADO");
+
+      // 4. LOTE_CRIADO + ATIVO → SINGLE (corrige a recorrência pós-ativação).
+      await pool.query("UPDATE lote_campanha SET estado = 'ATIVO' WHERE id = $1", [loteId]);
+      const comAtivo = await lerRetomada(operadorA.cookie);
+      expect(comAtivo.mode).toBe("SINGLE");
+      expect(comAtivo.campaign!.loteEstado).toBe("ATIVO");
+
+      // 6. lote CANCELADO → excluído (EMPTY).
+      await pool.query("UPDATE lote_campanha SET estado = 'CANCELADO' WHERE id = $1", [loteId]);
+      const loteCancelado = await lerRetomada(operadorA.cookie);
+      expect(loteCancelado.mode).toBe("EMPTY");
+      expect(loteCancelado.campaign).toBeUndefined();
+
+      // 5. campanha CANCELADA → excluída (EMPTY).
+      const operadorB = await provisionOperator(adminCookie, ["PREPARADOR", "APROVADOR", "EXECUTOR"]);
+      const alvoB = await persistirCampanha(operadorB.cookie, sha(`gf43d-cancelada-${randomUUID()}`));
+      const aprovadaB = await lerRetomada(operadorB.cookie);
+      expect(aprovadaB.mode).toBe("SINGLE");
+      await pool.query("UPDATE campanha_persistida SET estado = 'CANCELADA' WHERE id = $1", [alvoB.campanhaId]);
+      const canceladaB = await lerRetomada(operadorB.cookie);
+      expect(canceladaB.mode).toBe("EMPTY");
+
+      // 7 (reforço): operador sem campanha própria não enxerga a alheia.
+      const operadorC = await provisionOperator(adminCookie, ["PREPARADOR", "EXECUTOR"]);
+      const alheio = await lerRetomada(operadorC.cookie);
+      expect(alheio.mode).toBe("EMPTY");
+      expect(alheio.campaign).toBeUndefined();
     } finally {
       await pool.close();
     }

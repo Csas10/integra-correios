@@ -70,8 +70,17 @@ import {
 import {
   acoesCampanhaPorPapeis,
   baseSinteticaCampanha,
+  CampaignTemplateSelectionError,
   carregarPoliticaCampanhaAtualizacao,
+  campanhasSelecionaveisCampanha,
+  contentHashDoTemplateSelecionado,
+  metadadosTemplateCampanha,
+  normalizarCampoExibicaoCampanha,
+  normalizarExibicaoRegistroCampanha,
+  selecionarTemplateCampanhaNova,
   hashAprovacaoCampanha,
+  snapshotCampanha,
+  CAMPANHA_APROVACAO_V2,
 } from "./campaigns.js";
 import {
   AvaliacaoInvalidaError,
@@ -95,6 +104,7 @@ import {
   ProvedorGmailCampanha,
   avaliarReadinessOauthCanario,
   enviarCanarioCampanha,
+  preflightCanarioCampanha,
   statusOauthFromReadiness,
 } from "./campaign-canary.js";
 import type { ProvedorEnvioCampanha } from "./campaign-execution.js";
@@ -128,6 +138,7 @@ function provedorCanarioRuntime(campanhaId: string): ProvedorEnvioCampanha {
 
 import {
   CampaignPersistenceError,
+  lerRegistroCampanhaParaPreview,
   listarCampanhasRetomaveis,
   recuperarCampanhaPorId,
   recuperarEstadoCampanha,
@@ -143,6 +154,9 @@ import {
 } from "@integra-correios/importers";
 import {
   loadGmailOauthConfig,
+  metadadosTemplate as metadadosTemplateNoRegistry,
+  renderizarTemplatePersistido,
+  type RenderInputCampanha,
   oauthStatusFromEnvironment,
   OAUTH_BINDING_COOKIE,
   GmailMailGateway,
@@ -231,6 +245,16 @@ const ROTAS_AUTH_PROPRIA = new Set([
   "POST /api/operator/admin/credentials/recover",
   "POST /api/operator/admin/suspend",
   "GET /api/operator/admin/operators",
+  // GF-3 CORRECTIVE-02 (F1) — mapa reconciliado com as rotas REGISTRADAS
+  // (inventário `metodo`+`caminhoExato` deste arquivo): a fantasma
+  // `GET /api/campaigns/templates` foi removida (nunca registrada) e as
+  // rotas reais do catálogo/prévias foram incluídas. Nenhuma rota de
+  // campanha fica pública: a chave correta é condição NECESSÁRIA para o
+  // handler ser alcançado sem OPERATOR_TOKEN, e o handler SEMPRE exige
+  // sessão individual + papel (exigirOperadorCampanha).
+  "GET /api/campaigns/template-selecionaveis",
+  "GET /api/campaigns/preview-registro",
+  "POST /api/campaigns/template-preview",
   "GET /api/campaigns/persisted",
   "GET /api/campaigns/batch",
   "GET /api/campaigns/resumable",
@@ -270,6 +294,29 @@ const CAMPAIGN_OPERATIONAL_ROLES: readonly OperatorRole[] = [
   "SUPERVISOR",
 ];
 
+/**
+ * GF-3 CORRECTIVE-01 (F1) — autoridade do canário REAL: somente EXECUTOR
+ * autoriza `POST /api/campaigns/canary-send` ANTES de qualquer preflight,
+ * claim, resolução de token, provider ou Gmail. Reutiliza o contrato existente
+ * de `exigirOperadorCampanha` (403 OPERATOR_ROLE_FORBIDDEN) — nenhum segundo
+ * framework de autorização.
+ */
+const CAMPAIGN_EXECUTOR_ROLES: readonly OperatorRole[] = ["EXECUTOR"];
+
+/**
+ * GF-3 CORRECTIVE-02 (F2) — papéis de LEITURA do catálogo de templates
+ * (GET /api/campaigns/template-selecionaveis). PREPARADOR monta a base e
+ * seleciona a versão; APROVADOR audita o que aprova; REVISOR participa da
+ * revisão de conteúdo (PF_CAMPAIGN_ROLE_ACTIONS.REVISOR =
+ * RESOLVER_INCONSISTENCIAS). EXECUTOR e ADMIN_TECNICO ficam de fora:
+ * nenhum contrato existente os vincula à seleção/revisão de template.
+ */
+const CAMPANHA_CATALOGO_ROLES: readonly OperatorRole[] = [
+  "PREPARADOR",
+  "REVISOR",
+  "APROVADOR",
+];
+
 /** Pool do banco operacional (mesma fonte do requireDb, sem repository). */
 function requireDbPool(): NodePostgresPool {
   return requireDb().pool;
@@ -284,38 +331,85 @@ function validarSubmissaoAprovacao(corpo: unknown): {
     templateVersao?: unknown;
     registros?: unknown;
   };
+  // GF-2 F5 — SEM default de template: versão ausente/vazia ⇒ submissão
+  // inválida (422). A versão deve corresponder EXATAMENTE a uma entrada
+  // selecionável do registry (validado no authorize/persist abaixo).
   const templateVersao =
     typeof entrada.templateVersao === "string" && entrada.templateVersao.trim() !== ""
       ? entrada.templateVersao.trim()
-      : "pf-atualizacao-cadastral-2026-v1";
+      : "";
   const registros = Array.isArray(entrada.registros) ? entrada.registros : [];
-  if (
-    templateVersao.length > 80 ||
-    registros.length === 0 ||
-    registros.length > 20_000 ||
-    !registros.every((registroBruto) => {
-      const registro = registroBruto as {
-        profissional_id?: unknown;
-        nome?: unknown;
-        email_normalizado?: unknown;
-        status_validacao?: unknown;
-      };
-      return (
-        typeof registro === "object" &&
-        registro !== null &&
-        typeof registro.profissional_id === "string" &&
-        registro.profissional_id.trim() !== "" &&
-        typeof registro.nome === "string" &&
-        registro.nome.trim() !== "" &&
-        typeof registro.email_normalizado === "string" &&
-        registro.email_normalizado.trim() !== "" &&
-        registro.status_validacao === "APTO"
-      );
-    })
-  ) {
+  if (templateVersao.length > 80 || registros.length === 0 || registros.length > 20_000) {
     return undefined;
   }
-  return { registros: registros as CampaignPersistRegistro[], templateVersao };
+  // GF-2 FINAL — validação estrutural de cada registro + normalização dos
+  // campos de exibição (PREFILLED_CONFIRMATION): confinados ao formato de
+  // apresentação (whitespace sequencial → espaço único; trim; vazio ⇒
+  // ausente); caractere de controle ⇒ submissão inválida (422 sanitizado).
+  // Nenhum campo de CPF é aceito neste contrato; identidade permanece opaca
+  // (profissional_id é UUID server-side, NUNCA CPF).
+  const normalizados: CampaignPersistRegistro[] = [];
+  for (const registroBruto of registros) {
+    const registro = registroBruto as {
+      profissional_id?: unknown;
+      nome?: unknown;
+      email_normalizado?: unknown;
+      status_validacao?: unknown;
+      exibicao?: unknown;
+      source_record_key?: unknown;
+    };
+    if (
+      typeof registro !== "object" ||
+      registro === null ||
+      typeof registro.profissional_id !== "string" ||
+      registro.profissional_id.trim() === "" ||
+      typeof registro.nome !== "string" ||
+      registro.nome.trim() === "" ||
+      typeof registro.email_normalizado !== "string" ||
+      registro.email_normalizado.trim() === "" ||
+      registro.status_validacao !== "APTO"
+    ) {
+      return undefined;
+    }
+    let exibicao: ReturnType<typeof normalizarExibicaoRegistroCampanha>;
+    try {
+      exibicao = normalizarExibicaoRegistroCampanha(registro.exibicao);
+    } catch {
+      return undefined;
+    }
+    // GF-2 CORRETIVO — proveniência opaca da fonte: presente, deve ser a
+    // chave SHA-256 derivada SERVER-SIDE (o browser apenas a ecoa). Ausente
+    // permanece válido (contratos herdados); valor inválido ⇒ 422.
+    let sourceRecordKey: string | undefined;
+    if (registro.source_record_key !== undefined && registro.source_record_key !== null) {
+      if (
+        typeof registro.source_record_key !== "string" ||
+        !/^[0-9a-f]{64}$/.test(registro.source_record_key.trim().toLowerCase())
+      ) {
+        return undefined;
+      }
+      sourceRecordKey = registro.source_record_key.trim().toLowerCase();
+    }
+    normalizados.push(
+      exibicao === undefined
+        ? {
+            profissional_id: registro.profissional_id,
+            nome: registro.nome,
+            email_normalizado: registro.email_normalizado,
+            status_validacao: registro.status_validacao,
+            ...(sourceRecordKey === undefined ? {} : { source_record_key: sourceRecordKey }),
+          }
+        : {
+            profissional_id: registro.profissional_id,
+            nome: registro.nome,
+            email_normalizado: registro.email_normalizado,
+            status_validacao: registro.status_validacao,
+            ...(sourceRecordKey === undefined ? {} : { source_record_key: sourceRecordKey }),
+            exibicao,
+          },
+    );
+  }
+  return { registros: normalizados, templateVersao };
 }
 
 /** Decisões humanas estruturadas (coerentes com as linhas dos registros). */
@@ -368,7 +462,8 @@ function erroPersistenciaCampanha(
     const status =
       error.code === "CAMPAIGN_INPUT_INVALID" ||
       error.code === "CAMPAIGN_NOT_APPROVED" ||
-      error.code === "CAMPAIGN_BATCH_INVALID"
+      error.code === "CAMPAIGN_BATCH_INVALID" ||
+      error.code === "CAMPAIGN_EXIBICAO_INVALIDA"
         ? 422
         : error.code === "CAMPAIGN_APPROVAL_STALE"
           ? 409
@@ -1012,6 +1107,23 @@ const ROTAS: readonly Rota[] = [
   // futuras de escrita revalidarão papel + estado no servidor, sempre.
   // ------------------------------------------------------------------
   {
+    // GF-2 FINAL — catálogo server-driven do registry: somente entradas
+    // selecionáveis (status APPROVED, escopo PF_CAMPAIGN). O operador
+    // seleciona uma templateVersion registrada; NUNCA há default implícito
+    // no cliente e o servidor revalida em authorize/persist/claim.
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/template-selecionaveis",
+    // GF-3 CORRECTIVE-02 (F2) — catálogo é LEITURA do registry (nada
+    // seleciona, persiste ou envia): legível pelos papéis de
+    // preparação/aprovação/revisão. EXECUTOR e ADMIN_TECNICO continuam
+    // EXCLUÍDOS (sem contrato existente que os vincule ao catálogo).
+    handler: async (req, res) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPANHA_CATALOGO_ROLES);
+      if (!identity) return;
+      json(res, 200, { templates: campanhasSelecionaveisCampanha() });
+    },
+  },
+  {
     metodo: "GET",
     caminhoExato: "/api/campaigns/synthetic-base",
     handler: async (req, res) => {
@@ -1088,32 +1200,46 @@ const ROTAS: readonly Rota[] = [
         json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_AUTH_JSON_INVALID" });
         return;
       }
-      const templateVersao = typeof body.templateVersao === "string" ? body.templateVersao.trim() : "";
-      const registros = Array.isArray(body.registros) ? body.registros : [];
-      if (
-        !templateVersao ||
-        templateVersao.length > 80 ||
-        registros.length === 0 ||
-        registros.length > 20_000 ||
-        !registros.every(
-          (registro) =>
-            typeof registro === "object" &&
-            registro !== null &&
-            typeof (registro as { profissional_id?: unknown }).profissional_id === "string" &&
-            typeof (registro as { nome?: unknown }).nome === "string" &&
-            typeof (registro as { email_normalizado?: unknown }).email_normalizado === "string" &&
-            typeof (registro as { status_validacao?: unknown }).status_validacao === "string",
-        )
-      ) {
+      // GF-3 CORRECTIVE-02 (F3) — autoridade ÚNICA de validação/normalização
+      // (a MESMA do persist): validarSubmissaoAprovacao valida estrutura,
+      // status "APTO", source_record_key (64-hex lowercase) e normaliza os
+      // campos de exibição (vazio ⇒ ausente). O segundo validador próprio do
+      // authorize foi REMOVIDO: authorize rejeita EXATAMENTE o que persist
+      // rejeita, e o hash de aprovação é calculado sobre os registros
+      // NORMALIZADOS — o bruto NUNCA é hasheado.
+      const submissao = validarSubmissaoAprovacao(body);
+      if (!submissao) {
         json(res, 422, {
           erro: "Dados de aprovação inválidos.",
           codigo: "CAMPAIGN_AUTHORIZE_INVALID",
         });
         return;
       }
+      const { registros: submissaoRegistros, templateVersao: templateVersaoSubmissao } = submissao;
+      // GF-2 F6 — a autorização SÓ é válida para versão SELECIONÁVEL
+      // (registrada, APPROVED, escopo PF_CAMPAIGN): RETIRED/DRAFT/desconhecida
+      // ⇒ 422 sanitizado, nada congelado.
+      try {
+        selecionarTemplateCampanhaNova({ templateVersao: templateVersaoSubmissao });
+      } catch (error) {
+        if (error instanceof CampaignTemplateSelectionError) {
+          json(res, 422, { erro: error.message, codigo: error.code });
+          return;
+        }
+        throw error;
+      }
+      // GF-2 F4/F6 + GF-2 CORRETIVO — o contentHash canônico (registry) e
+      // TODOS os campos PREFILLED entram no hash de aprovação V2: autorização
+      // fica vinculada a versão + CONTEÚDO + exibição. Qualquer alteração
+      // entre authorize e persist ⇒ 409 CAMPAIGN_APPROVAL_STALE. GF-3
+      // CORRECTIVE-02 (F3): hash sobre submissaoRegistros NORMALIZADOS
+      // (equivalência lógica bruto↔normalizado ⇒ mesmo hash).
+      const templateContentHash = contentHashDoTemplateSelecionado(templateVersaoSubmissao);
       const conteudoHash = hashAprovacaoCampanha({
-        templateVersao,
-        registros: registros as { profissional_id: string; nome: string; email_normalizado: string; status_validacao: string }[],
+        contrato: CAMPANHA_APROVACAO_V2,
+        templateVersao: templateVersaoSubmissao,
+        templateContentHash,
+        registros: submissaoRegistros,
       });
       if (typeof body.conteudoHash === "string" && body.conteudoHash !== conteudoHash) {
         json(res, 409, {
@@ -1124,8 +1250,9 @@ const ROTAS: readonly Rota[] = [
       }
       json(res, 200, {
         status: "CAMPAIGN_APPROVAL_FROZEN",
+        approvalHashVersion: CAMPANHA_APROVACAO_V2,
         conteudoHash,
-        totalItens: registros.length,
+        totalItens: submissaoRegistros.length,
         aprovadaPor: identity.operatorId,
         persistida: false,
         aviso:
@@ -1140,6 +1267,178 @@ const ROTAS: readonly Rota[] = [
   // recalculado do conteúdo re-submetido. 409 CAMPAIGN_APPROVAL_STALE
   // quando o conteúdo diverge da aprovação submetida. Idempotente.
   // ------------------------------------------------------------------
+  {
+    // GF-2 FINAL — preview server-side de registro da campanha persistida:
+    // o browser envia SOMENTE identificadores autorizados (campanhaId +
+    // linha); valores e assunto vêm SEMPRE do snapshot congelado via o MESMO
+    // registry/renderer do provider. O request NUNCA fornece nome, telefone,
+    // endereço, CEP, subject ou corpo (REQUEST_CANNOT_OVERRIDE_SNAPSHOT=false
+    // por construção). ZERO mutações, ZERO token, ZERO rede, ZERO Gmail;
+    // no-store (json()) e sem PII nos logs.
+    metodo: "GET",
+    caminhoExato: "/api/campaigns/preview-registro",
+    handler: async (req, res, url) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      if (!identity) return;
+      const campanhaId = url.searchParams.get("campanhaId")?.trim() ?? "";
+      const linhaBruta = url.searchParams.get("linha")?.trim() ?? "";
+      const linha = Number(linhaBruta);
+      if (!operatorUuidValido(campanhaId) || !Number.isInteger(linha) || linha < 1) {
+        json(res, 422, {
+          erro: "campanhaId (UUID) e linha (inteiro ≥ 1) são obrigatórios.",
+          codigo: "CAMPAIGN_PREVIEW_INVALID",
+        });
+        return;
+      }
+      const pool = requireDbPool();
+      try {
+        const resultado = await lerRegistroCampanhaParaPreview(pool, {
+          operatorId: identity.operatorId,
+          campanhaId,
+          linha,
+        });
+        if (!resultado.ok) {
+          json(res, resultado.httpStatus, { erro: resultado.erro, codigo: resultado.codigo });
+          return;
+        }
+        json(res, 200, resultado.corpo);
+      } catch (error) {
+        if (error instanceof CampaignTemplateSelectionError) {
+          json(res, 422, { erro: error.message, codigo: error.code });
+          return;
+        }
+        erroPersistenciaCampanha(res, error);
+      }
+    },
+  },
+  {
+    // GF-3 CORRECTIVE-02 (F7) — PRÉVIA PRÉ-APROVAÇÃO renderizada no SERVIDOR:
+    // o request fornece SOMENTE o payload pendente já aceito pelo authorize
+    // (templateVersao + registros) e o índice da prévia. O servidor revalida
+    // com a MESMA autoridade do authorize/persist (validarSubmissaoAprovacao
+    // → registros NORMALIZADOS), confere bounds do índice, resolve o template
+    // no REGISTRY e renderiza o registro selecionado com EXATAMENTE o
+    // renderer do provider (renderizarTemplatePersistido — identidade
+    // sintética de preview; NUNCA assunto/texto/HTML/remetente/Reply-To do
+    // browser). ZERO persistência, ZERO mutação, ZERO rede, ZERO log de PII;
+    // resposta no-store. O preview PÓS-persistência (GET
+    // /api/campaigns/preview-registro, snapshot congelado) permanece separado.
+    metodo: "POST",
+    caminhoExato: "/api/campaigns/template-preview",
+    handler: async (req, res, _url, corpo) => {
+      const identity = await exigirOperadorCampanha(req, res, CAMPANHA_CATALOGO_ROLES);
+      if (!identity) return;
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(corpo.toString("utf8") || "{}") as Record<string, unknown>;
+      } catch {
+        json(res, 400, { erro: "JSON inválido.", codigo: "CAMPAIGN_TEMPLATE_PREVIEW_JSON_INVALID" });
+        return;
+      }
+      // (1)/(2) MESMA autoridade do authorize/persist → registros NORMALIZADOS.
+      const submissao = validarSubmissaoAprovacao(body);
+      if (!submissao) {
+        json(res, 422, {
+          erro: "Dados de prévia inválidos.",
+          codigo: "CAMPAIGN_TEMPLATE_PREVIEW_INVALID",
+        });
+        return;
+      }
+      // (3) bounds-check do índice solicitado (1-based; navegação da UI).
+      const previaIndiceSolicitado: unknown = body.previaIndice;
+      if (
+        typeof previaIndiceSolicitado !== "number" ||
+        !Number.isInteger(previaIndiceSolicitado) ||
+        previaIndiceSolicitado < 1 ||
+        previaIndiceSolicitado > submissao.registros.length
+      ) {
+        json(res, 422, {
+          erro: "previaIndice deve ser inteiro entre 1 e o total de registros aptos.",
+          codigo: "CAMPAIGN_TEMPLATE_PREVIEW_INDEX_INVALID",
+        });
+        return;
+      }
+      // (4) resolução server-side do template NO REGISTRY (nada do request).
+      try {
+        selecionarTemplateCampanhaNova({ templateVersao: submissao.templateVersao });
+      } catch (error) {
+        if (error instanceof CampaignTemplateSelectionError) {
+          json(res, 422, { erro: error.message, codigo: error.code });
+          return;
+        }
+        throw error;
+      }
+      const metadados = metadadosTemplateNoRegistry(submissao.templateVersao);
+      if (!metadados.ok || metadados.contentHash === undefined) {
+        json(res, 422, {
+          erro: "Versão do template não registrada.",
+          codigo: "CAMPAIGN_TEMPLATE_PREVIEW_TEMPLATE_INVALIDO",
+        });
+        return;
+      }
+      // (5) renderização com EXATAMENTE o renderer do provider. Identidade
+      // sintética de prévia (campaignId/itemId/professionalId/recipient/
+      // correlationCode/remetente server-side) — o padrão de
+      // lerRegistroCampanhaParaPreview (GET /api/campaigns/preview-registro).
+      const registro = submissao.registros[previaIndiceSolicitado - 1];
+      if (!registro) {
+        json(res, 422, {
+          erro: "Índice de prévia não corresponde a um registro apto.",
+          codigo: "CAMPAIGN_TEMPLATE_PREVIEW_INDEX_INVALID",
+        });
+        return;
+      }
+      // Remetente institucional server-side (mesma política do preview
+      // persistido e do canário); NUNCA fornecido pelo browser.
+      const remetente = {
+        name:
+          normalizarCampoExibicaoCampanha(process.env.CAMPAIGN_SENDER_NAME) ??
+          "CRT-BA | Carteiras Profissionais",
+        address:
+          normalizarCampoExibicaoCampanha(process.env.CAMPAIGN_SENDER_ADDRESS) ??
+          "carteiras@crtba.org.br",
+      };
+      const correlationCode = createHash("sha256")
+        .update("PF-CAMP-TEMPLATE-PREVIEW-V1\n")
+        .update(`${identity.operatorId}\n${previaIndiceSolicitado}\n`)
+        .digest("hex")
+        .toUpperCase();
+      const renderizado = renderizarTemplatePersistido({
+        persistedTemplateVersion: submissao.templateVersao,
+        professionalName: registro.nome,
+        correlationCode: `PF26${correlationCode.slice(0, 28)}`,
+        ...(registro.exibicao === undefined
+          ? {}
+          : { exibicao: registro.exibicao as RenderInputCampanha["exibicao"] }),
+        remetente: { name: remetente.name, address: remetente.address },
+        campaignId: "preview",
+        itemId: `template-preview:${identity.operatorId}:${previaIndiceSolicitado}`,
+        professionalId: "preview",
+        recipient: registro.email_normalizado,
+        messageTag: "pf-campanha",
+      });
+      if (!renderizado.ok) {
+        json(res, 422, {
+          erro: "Versão do template não pôde ser renderizada para prévia.",
+          codigo: "CAMPAIGN_TEMPLATE_PREVIEW_TEMPLATE_INVALIDO",
+        });
+        return;
+      }
+      // Resposta SANITIZADA e no-store: metadados do registry + mensagem
+      // renderizada. Nada persistido, nada mutado, nenhuma rede.
+      json(res, 200, {
+        templateVersao: submissao.templateVersao,
+        templateContentHash: metadados.contentHash,
+        dataMode: metadados.dataMode ?? "",
+        assunto: metadados.subject ?? "",
+        mensagem: {
+          subject: renderizado.mensagem.subject,
+          textBody: renderizado.mensagem.textBody,
+          htmlBody: renderizado.mensagem.htmlBody,
+        },
+      });
+    },
+  },
   {
     metodo: "POST",
     caminhoExato: "/api/campaigns/persist",
@@ -1184,8 +1483,25 @@ const ROTAS: readonly Rota[] = [
         });
         return;
       }
+      // GF-2 F6 — persist revalida a versão no registry e recalcula o hash
+      // com o MESMO templateContentHash da autorização: versão ou conteúdo
+      // divergentes da autorização congelada ⇒ 409/422 sanitizado.
+      try {
+        selecionarTemplateCampanhaNova({ templateVersao: submissao.templateVersao });
+      } catch (error) {
+        if (error instanceof CampaignTemplateSelectionError) {
+          json(res, 422, { erro: error.message, codigo: error.code });
+          return;
+        }
+        throw error;
+      }
+      // GF-2 CORRETIVO — o hash recalculado é SEMPRE V2 (mesmo contrato da
+      // autorização; campos PREFILLED incluídos). Divergência de campo,
+      // versão ou conteúdo ⇒ 409 CAMPAIGN_APPROVAL_STALE.
       const fingerprintHash = hashAprovacaoCampanha({
+        contrato: CAMPANHA_APROVACAO_V2,
         templateVersao: submissao.templateVersao,
+        templateContentHash: contentHashDoTemplateSelecionado(submissao.templateVersao),
         registros: submissao.registros,
       });
       const hashSubmetido =
@@ -1225,6 +1541,10 @@ const ROTAS: readonly Rota[] = [
             "Campanha persistida com hash recalculado no servidor. Lote e outbox ainda não foram criados (use /api/campaigns/batch).",
         });
       } catch (error) {
+        if (error instanceof CampaignTemplateSelectionError) {
+          json(res, 422, { erro: error.message, codigo: error.code });
+          return;
+        }
         erroPersistenciaCampanha(res, error);
       }
     },
@@ -1614,6 +1934,29 @@ const ROTAS: readonly Rota[] = [
         // descriptografado; CONNECTED não prova token/refresh/reachability/
         // send-as (03C.2B1).
         const oauthEstado = statusOauthFromReadiness(oauth);
+        // GF4.5 — a ação de canário exposta ao UI é derivada SERVER-SIDE
+        // pelo MESMO preflight canônico do envio real
+        // (preflightCanarioCampanha), em modo ESTRITAMENTE READ-ONLY: zero
+        // claim, zero outbox, zero evento, zero carga/descriptografia/refresh
+        // de token, zero Google/Gmail/provider. A resposta expõe SOMENTE o
+        // par sanitizado { permitida, bloqueios } — nenhum destinatário,
+        // fingerprint, prova, token ou segredo. O browser NUNCA reconstrói
+        // elegibilidade; POST /api/campaigns/canary-send permanece a ÚNICA
+        // autoridade de mutação/envio do canário.
+        // GF4.5C.1 (FINDING 1) — autoridade de PAPEL incorporada: a rota de
+        // envio exige EXECUTOR ANTES do preflight; o readiness representa a
+        // MESMA autoridade efetiva. Sem EXECUTOR ⇒ permitida=false com o
+        // bloqueio sanitizado OPERATOR_ROLE_FORBIDDEN (o mesmo código da
+        // guarda da rota) — nenhuma configuração interna de papéis é
+        // exposta. Invariante: não-EXECUTOR ⇒ readiness false ⇒ botão
+        // desabilitado ⇒ e o POST continua rejeitando independentemente.
+        const executorHabilitado = identity.roles.includes("EXECUTOR");
+        const canarioPreflight = await preflightCanarioCampanha(requireDbPool(), {
+          operatorId: identity.operatorId,
+          campanhaId,
+          politica,
+          contexto: { fingerprinter: fingerprinter() },
+        });
         json(res, 200, {
           campanha: { campanhaId, estado: "LOTE_CRIADO" },
           lote: {
@@ -1665,6 +2008,19 @@ const ROTAS: readonly Rota[] = [
             AUTORIZAR_EXECUCAO: { permitida: autorizacao.permitida, bloqueios: autorizacao.bloqueios },
             ATIVAR_LOTE: { permitida: ativacao.permitida, bloqueios: ativacao.bloqueios },
             EXECUTAR_ITEM: { permitida: execucao.permitida, bloqueios: execucao.bloqueios },
+            // GF4.5 — derivação canônica do MESMO preflight do envio real;
+            // sem fabricar verde a partir de flags grossas: qualquer
+            // inconsistência real aparece como bloqueio sanitizado.
+            // GF4.5C.1 (FINDING 1) — elegibilidade EFETIVA = papel EXECUTOR
+            // (autoridade da rota de envio, inalterada) ∧ preflight canônico.
+            EXECUTAR_CANARIO: {
+              permitida: executorHabilitado && canarioPreflight.elegivel,
+              bloqueios: executorHabilitado
+                ? canarioPreflight.elegivel
+                  ? []
+                  : canarioPreflight.bloqueios
+                : ["OPERATOR_ROLE_FORBIDDEN"],
+            },
           },
           executavel: false,
           envioRealDesabilitado: !politica.realSendEnabled,
@@ -1848,7 +2204,10 @@ const ROTAS: readonly Rota[] = [
     metodo: "POST",
     caminhoExato: "/api/campaigns/canary-send",
     handler: async (req, res, _url, corpo) => {
-      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_OPERATIONAL_ROLES);
+      // GF-3 CORRECTIVE-01 (F1) — papel EXECUTOR exigido ANTES do preflight:
+      // PREPARADOR/REVISOR/APROVADOR/SUPERVISOR ⇒ 403 estável com
+      // CLAIMS=0, TOKEN_LOADS=0, PROVIDER_CALLS=0, GMAIL_CALLS=0.
+      const identity = await exigirOperadorCampanha(req, res, CAMPAIGN_EXECUTOR_ROLES);
       if (!identity) return;
       let body: { campanhaId?: unknown };
       try {

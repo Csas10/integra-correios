@@ -51,8 +51,11 @@ import {
   loadGmailOauthConfig,
   MailProviderNaoConfiguradoError,
   MailProviderRequestError,
-  renderPfUpdateCampaignMail,
+  renderizarTemplatePersistido,
+  campoExibicao,
   type MailReceipt,
+  type RenderInputCampanha,
+  type TemplateErrorCode,
   type OutboundMail,
 } from "@integra-correios/mail";
 
@@ -66,6 +69,16 @@ import type { HmacSha256Fingerprinter } from "@integra-correios/persistence";
 // vincula campanha/lote/item/fingerprint/hashAprovacao) + itemId — NUNCA
 // fornecido pelo browser.
 // ---------------------------------------------------------------------------
+/**
+ * SLICE-03C.2B1D — mapeamento sanitizado de falhas de template para o motivo
+ * pré-provider (sem detalhes internos; mesma disciplina dos demais motivos).
+ */
+export function motivoFalhaTemplateCampanha(code: TemplateErrorCode): string {
+  if (code === "CAMPAIGN_TEMPLATE_UNSUPPORTED") return "TEMPLATE_VERSAO_NAO_REGISTRADA";
+  if (code === "CAMPAIGN_TEMPLATE_NOT_APPROVED") return "TEMPLATE_NAO_APROVADO";
+  return "TEMPLATE_ESCOPO_INCOMPATIVEL";
+}
+
 export const CORRELATION_CODE_PREFIX = "PF26" as const;
 const CORRELATION_CODE_BYTES = 16 as const; // 16 bytes = 32 hex
 
@@ -482,6 +495,34 @@ export interface DependenciasProvedorGmailCampanha {
   readonly env?: AmbienteLeve;
 }
 
+/**
+ * GF-2 FINAL — projeção dos campos de exibição do payload/snapshot para a
+ * entrada do renderer: renormalização de APRESENTAÇÃO (whitespace sequencial
+ * → espaço único; trim; vazio ⇒ ausente) com confinamento de tipo. NUNCA
+ * completa, infere ou converte valores; NUNCA inclui CPF (fora do contrato).
+ */
+function payloadExibicaoCampanha(entrada: unknown): RenderInputCampanha["exibicao"] | undefined {
+  if (entrada === undefined || entrada === null) return undefined;
+  if (typeof entrada !== "object" || Array.isArray(entrada)) return undefined;
+  const bruto = entrada as Record<string, unknown>;
+  const campo = (chave: string): string | undefined =>
+    typeof bruto[chave] === "string" ? campoExibicao(bruto[chave] as string) : undefined;
+  const projetado = {
+    ...(campo("logradouro") === undefined ? {} : { logradouro: campo("logradouro") }),
+    ...(campo("numero") === undefined ? {} : { numero: campo("numero") }),
+    ...(campo("complemento") === undefined ? {} : { complemento: campo("complemento") }),
+    ...(campo("bairro") === undefined ? {} : { bairro: campo("bairro") }),
+    ...(campo("cidade") === undefined ? {} : { cidade: campo("cidade") }),
+    ...(campo("uf") === undefined ? {} : { uf: campo("uf") }),
+    ...(campo("cep") === undefined ? {} : { cep: campo("cep") }),
+    ...(campo("telefone") === undefined ? {} : { telefone: campo("telefone") }),
+  };
+  if (Object.keys(projetado).length === 0) {
+    return entrada !== undefined && typeof entrada === "object" ? {} : undefined;
+  }
+  return projetado as RenderInputCampanha["exibicao"];
+}
+
 export class ProvedorGmailCampanha implements ProvedorEnvioCampanha {
   readonly nome = "GMAIL_CAMPANHA";
   private _chamadas = 0;
@@ -500,7 +541,7 @@ export class ProvedorGmailCampanha implements ProvedorEnvioCampanha {
     }
     // Defesa em profundidade: revalidação pelo snapshot congelado (leitura).
     const linhas = await this.dependencias.pool.query(
-      `SELECT i.ordem, i.destinatario_fingerprint, i.estado, s.snapshot_registros
+      `SELECT i.ordem, i.destinatario_fingerprint, i.estado, l.template_versao, s.hash_aprovacao, s.snapshot_registros
          FROM outbox_campanha i
          JOIN lote_campanha l ON l.id = i.lote_campanha_id
          JOIN campanha_persistida s ON s.id = l.campanha_id
@@ -512,7 +553,16 @@ export class ProvedorGmailCampanha implements ProvedorEnvioCampanha {
           ordem: number;
           destinatario_fingerprint: string;
           estado: string;
-          snapshot_registros: { registros?: readonly { email_normalizado?: unknown; nome?: unknown; profissional_id?: unknown }[] };
+          template_versao?: unknown;
+          hash_aprovacao?: unknown;
+          snapshot_registros: {
+            registros?: readonly {
+              email_normalizado?: unknown;
+              nome?: unknown;
+              profissional_id?: unknown;
+              exibicao?: unknown;
+            }[];
+          };
         }
       | undefined;
     if (!linha) return { tipo: "FALHA_PRE_PROVIDER", motivo: "ITEM_INEXISTENTE" };
@@ -526,30 +576,58 @@ export class ProvedorGmailCampanha implements ProvedorEnvioCampanha {
     if (!email || !nome || !profissionalId) {
       return { tipo: "FALHA_PRE_PROVIDER", motivo: "SNAPSHOT_INCOMPATIVEL" };
     }
+    // Campos de exibição (PREFILLED_CONFIRMATION) devem ser estruturais
+    // (objeto) quando presentes; valores são renormalizados no registry.
+    const exibicaoDoItem = payloadExibicaoCampanha(registro?.exibicao);
+    if (registro?.exibicao !== undefined && exibicaoDoItem === undefined) {
+      return { tipo: "FALHA_PRE_PROVIDER", motivo: "SNAPSHOT_CORROMPIDO" };
+    }
     if (fingerprintDestinatarioCampanha(email) !== comando.destinatarioFingerprint) {
       return { tipo: "FALHA_PRE_PROVIDER", motivo: "FINGERPRINT_MISMATCH" };
     }
 
-    // Render (server-side) — sem assunto/corpo/remetente do cliente.
+    // Render (server-side) — resolução pela versão CONGELADA no lote
+    // (SLICE-03C.2B1D / GF-2 FINAL): o provider NUNCA aceita subject/corpos/
+    // remetente, versão ou campos de exibição do request. Os campos de
+    // exibição (PREFILLED_CONFIRMATION) vêm EXCLUSIVAMENTE do snapshot
+    // congelado. DRAFT/RETIRED/desconhecida/incompatível/corrompida ⇒ falha
+    // pré-provider sanitizada (defesa em profundidade; o preflight pré-claim
+    // em campaign-execution.ts normalmente impede chegar aqui).
     let mensagem: OutboundMail;
     try {
-      mensagem = renderPfUpdateCampaignMail({
-        campaignId: this.dependencias.campanhaId,
-        itemId: comando.itemId,
-        professionalId: profissionalId,
-        recipient: email,
+      const renderizado = renderizarTemplatePersistido({
+        persistedTemplateVersion: typeof linha.template_versao === "string" ? linha.template_versao : "",
         professionalName: nome,
         correlationCode: correlationCodeCanario({
           chaveIdempotencia: comando.chaveIdempotencia,
           itemId: comando.itemId,
         }),
+        ...(exibicaoDoItem === undefined ? {} : { exibicao: exibicaoDoItem }),
         remetente: { name: remetente.name, address: remetente.address },
+        campaignId: this.dependencias.campanhaId,
+        itemId: comando.itemId,
+        professionalId: profissionalId,
+        recipient: email,
         messageTag: "pf-campanha",
       });
+      if (!renderizado.ok) {
+        return {
+          tipo: "FALHA_PRE_PROVIDER",
+          motivo: motivoFalhaTemplateCampanha(renderizado.code),
+        };
+      }
+      mensagem = renderizado.mensagem;
     } catch {
       return { tipo: "FALHA_PRE_PROVIDER", motivo: "RENDER_INDISPONIVEL" };
     }
 
+    // GF-2 FINAL — defesa em profundidade: o hash de aprovação (que congela
+    // a versão + o contentHash canônico via snapshot JSONB) deve estar
+    // íntegro ANTES de qualquer gateway (o preflight PRÉ-claim é a autoridade
+    // primária; aqui a verificação é repetida imediatamente antes do envio).
+    if (typeof linha.hash_aprovacao !== "string" || linha.hash_aprovacao.length !== 64) {
+      return { tipo: "FALHA_PRE_PROVIDER", motivo: "SNAPSHOT_CORROMPIDO" };
+    }
     try {
       const receipt: MailReceipt = await this.dependencias.gateway.send(mensagem);
       if (!receipt?.messageId) {

@@ -46,6 +46,12 @@ import {
   injetarProvedorCanarioParaTeste,
 } from "../src/server.js";
 import { chaveIdempotenciaExecucao } from "../src/campaign-execution.js";
+// GF-3 CORRECTIVE-02 (F8) — a fixture V2 é construída com os helpers
+// canônicos de PRODUÇÃO (mesmo padrão da fixture do campaign-execution).
+import {
+  contentHashDoTemplateSelecionado,
+  hashAprovacaoCampanha,
+} from "../src/campaigns.js";
 import {
   ACAO_AUTORIZADA_EXECUCAO,
   fingerprintDestinatarioCampanha,
@@ -289,9 +295,10 @@ describe("SLICE_03C.2A.2 — contratos de fixture (fonte única, determinístico
     expect(MATRIZ_POLITICA_CENARIO.B).toEqual({ canarySend: true, execute: true, realSend: true });
     expect(MATRIZ_POLITICA_CENARIO.D).toEqual({ canarySend: true, execute: true, realSend: true });
     expect(MATRIZ_POLITICA_CENARIO.E).toEqual({ canarySend: false, execute: false, realSend: false });
-    // (b) TODAS as chamadas de rota passam a matriz explícita (5 chamadas: A,B,D,E,E).
+    // (b) TODAS as chamadas de rota passam a matriz explícita
+    //     (7 chamadas: A,B,D,E,E + GF4.5 E,B — mesma fonte única).
     const chamadas = fonteTeste.match(/ambienteBase\(cena\.fingerprints\[0\]!, MATRIZ_POLITICA_CENARIO\.[A-E]\)/g) ?? [];
-    expect(chamadas.length).toBe(5);
+    expect(chamadas.length).toBe(7);
     expect(new Set(chamadas.map((c) => c.slice(-2, -1))).size).toBe(4);
     // (c) ambienteBase deriva cada gate EXPLICITAMENTE da matriz — nunca ausente.
     for (const [chave, gate] of [
@@ -518,6 +525,8 @@ describe("SLICE_03C.2A.1 — mapeamento do provider (erros → resultado, AUTO_R
         {
           ordem: 1,
           estado: "ENFILEIRADO",
+          template_versao: "pf-expedicao-carteira-2026-v2",
+          hash_aprovacao: "b".repeat(64),
           destinatario_fingerprint: fingerprintDestinatarioCampanha("canario.classe@exemplo.test"),
           snapshot_registros: {
             registros: [
@@ -635,6 +644,53 @@ describe("SLICE_03C.2A.1 — mapeamento do provider (erros → resultado, AUTO_R
     const resultado = await provider.enviar(comando);
     expect(resultado.tipo).toBe("ENVIADO");
   });
+
+  it("2B1D-H. provider resolve pela versão CONGELADA no lote: versão não registrada ⇒ FALHA_PRE_PROVIDER sanitizada, zero gateway", async () => {
+    let chamadasGateway = 0;
+    const gatewayEspiao = {
+      send: async () => {
+        chamadasGateway += 1;
+        throw new Error("gateway não deveria ser invocado com versão inválida");
+      },
+      getStatus: async () => {
+        throw new Error("n/a");
+      },
+    } as never;
+    // Linha com versão DESCONHECIDA: falha sanitizada ANTES do gateway.
+    const providerComVersao = new ProvedorGmailCampanha({
+      pool: {
+        query: async () => ({
+          rows: [
+            {
+              ordem: 1,
+              estado: "ENFILEIRADO",
+              template_versao: "versao-sintetica-nao-registrada-2B1D",
+              hash_aprovacao: "",
+              destinatario_fingerprint: fingerprintDestinatarioCampanha("canario.classe@exemplo.test"),
+              snapshot_registros: {
+                registros: [
+                  {
+                    profissional_id: "PF-CLS-0001",
+                    nome: "Sintetico Classe",
+                    email_normalizado: "canario.classe@exemplo.test",
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      } as never,
+      campanhaId: randomUUID(),
+      gateway: gatewayEspiao,
+      env: { CAMPAIGN_SENDER_ADDRESS: "carteiras@crtba.org.br" },
+    });
+    const resultado = await providerComVersao.enviar(comando);
+    expect(resultado).toEqual({
+      tipo: "FALHA_PRE_PROVIDER",
+      motivo: "TEMPLATE_VERSAO_NAO_REGISTRADA",
+    });
+    expect(chamadasGateway).toBe(0);
+  });
 });
 
 describe("SLICE_03C.2A.1 — statusOauthFromReadiness (derivação canônica, E)", () => {
@@ -720,16 +776,88 @@ describe("SLICE_03C.2A — estrutura de fonte (SOURCE_STRUCTURE)", () => {
     expect(indiceExec).toBeGreaterThan(indiceCanario);
   });
 
-  it("UI: Executar canário permanece SEMPRE disabled, sem onClick e sem handler de envio", () => {
-    const indice = FONTE_WORKSPACE.indexOf("Executar canário (gate operacional pendente");
+  it("GF4.5 — readiness deriva EXECUTAR_CANARIO do MESMO preflight canônico do envio (server-side)", () => {
+    const server = semComentarios(FONTE_SERVER);
+    const indice = server.indexOf('caminhoExato: "/api/campaigns/operational-readiness"');
+    const fim = server.indexOf('caminhoExato: "/api/campaigns/prepare"', indice);
+    const trecho = server.slice(indice, fim);
+    // A. a ação existe e é derivada do preflight canônico (não de flags grossas).
+    expect(trecho).toContain("preflightCanarioCampanha(requireDbPool()");
+    expect(trecho).toContain("EXECUTAR_CANARIO");
+    expect(trecho).toContain("canarioPreflight.elegivel");
+    // Nenhuma autoridade de mutação/envio no caminho de derivação: a rota de
+    // readiness NÃO despacha canário e NÃO monta provider (somente leituras).
+    expect(trecho).not.toContain("enviarCanarioCampanha");
+    expect(trecho).not.toContain("provedorCanarioRuntime");
+  });
+
+  it("GF4.5 — preflight canônico permanece READ-ONLY (zero claim/evento/token/rede na derivação)", () => {
+    const canario = semComentarios(FONTE_CANARIO);
+    // A garantia estrutural vem do próprio módulo canônico reutilizado: o
+    // CORPO do preflight (até a próxima exportação) não contém nenhuma
+    // escrita SQL — somente leituras.
+    expect(canario).toContain("export async function preflightCanarioCampanha");
+    const inicio = canario.indexOf("export async function preflightCanarioCampanha");
+    const fim = canario.indexOf("export async function avaliarReadinessOauthCanario", inicio);
+    const corpoPreflight = canario.slice(inicio, fim);
+    expect(corpoPreflight).not.toMatch(/UPDATE\s+outbox_campanha|INSERT\s+INTO|DELETE\s+FROM/);
+  });
+
+  it("GF4.5 — UI: canary tem handler ÚNICO na rota canônica, corpo restrito a campanhaId", () => {
+    const codigo = semComentarios(FONTE_WORKSPACE);
+    expect(codigo).toContain('"/api/campaigns/canary-send"');
+    expect(codigo).toContain("executarCanarioOperacional");
+    const indiceFn = codigo.indexOf("async function executarCanarioOperacional");
+    expect(indiceFn).toBeGreaterThan(-1);
+    const fn = codigo.slice(indiceFn, indiceFn + 700);
+    expect(fn).toContain("body: JSON.stringify({ campanhaId })");
+    // Nenhuma autoridade adicional do browser no corpo do POST do canário.
+    expect(fn).not.toContain("operatorId");
+    expect(fn).not.toContain("itemId");
+    expect(fn).not.toContain("fingerprint");
+    expect(fn).not.toContain("token");
+    expect(fn).not.toContain("idempotencia");
+  });
+
+  it("GF4.5 — UI: elegibilidade do canário é EXCLUSIVAMENTE o readiness server-driven", () => {
+    const indice = FONTE_WORKSPACE.indexOf("Executar canário controlado");
     expect(indice).toBeGreaterThan(-1);
     const abertura = FONTE_WORKSPACE.lastIndexOf("<button", indice);
-    const botao = FONTE_WORKSPACE.slice(abertura, indice + 200);
-    expect(botao).toContain('<button type="button" disabled>');
-    expect(botao.slice(0, botao.indexOf("Executar canário (gate"))).not.toContain("onClick");
+    const botao = FONTE_WORKSPACE.slice(abertura, indice);
+    // Governado SOMENTE por acoes.EXECUTAR_CANARIO.permitida + guarda local
+    // de clique pendente (duplo clique). Nenhuma derivação local de
+    // elegibilidade a partir de flags/estado.
+    expect(botao).toContain("!readiness.acoes.EXECUTAR_CANARIO.permitida");
+    expect(botao).toContain("canarioPendente");
+    expect(botao).toContain("executarCanarioOperacionalUI");
+    expect(botao).not.toContain("politicas");
+    expect(botao).not.toContain("canarySendEnabled");
+    expect(botao).not.toContain("realSendEnabled");
+    expect(botao).not.toContain("lote.estado");
+    expect(botao).not.toContain("oauth");
+  });
+
+  it("GF4.5 — UI: confirmação humana obrigatória e ZERO repetição automática", () => {
     const codigo = semComentarios(FONTE_WORKSPACE);
-    expect(codigo).not.toContain("canary-send");
-    expect(codigo).not.toContain("executarCanario");
+    expect(codigo).toContain("Executar o canário real controlado?");
+    expect(codigo).toContain("exatamente um envio real pelo Gmail");
+    expect(codigo).toContain("Não haverá lote completo nem retry automático");
+    expect(codigo).toContain("Confirme somente se o gate de canário foi explicitamente autorizado");
+    expect(codigo).toContain("Resultado do canário não conclusivo. Não repetir automaticamente.");
+    // Nenhum timer/loop/polling de envio: o canário só parte de clique
+    // humano confirmado, exatamente um POST por confirmação.
+    expect(codigo).not.toMatch(/setInterval/);
+  });
+
+  it("GF4.5 — execução GENÉRICA permanece disabled e SEM handler (execute-attempt fora do cliente)", () => {
+    const codigo = semComentarios(FONTE_WORKSPACE);
+    expect(codigo).not.toContain("execute-attempt");
+    const indice = FONTE_WORKSPACE.indexOf("Executar (provider indisponível — envio não autorizado)");
+    expect(indice).toBeGreaterThan(-1);
+    const abertura = FONTE_WORKSPACE.lastIndexOf("<button", indice);
+    const botao = FONTE_WORKSPACE.slice(abertura, indice);
+    expect(botao).toContain('<button type="button" disabled>');
+    expect(botao).not.toContain("onClick");
   });
 
   it("template da campanha não importa o piloto; MIME deriva Message-ID do remetente", () => {
@@ -801,6 +929,20 @@ describe("SLICE_03C.2A — HTTP fail-closed (contrato determinístico)", () => {
     });
     expect(resposta.status).toBe(401);
     expect(resposta.corpo).toContain("INDIVIDUAL_OPERATOR_AUTH_REQUIRED");
+  });
+
+  it("GF3 F1 — canary-send exige EXECUTOR: 403 OPERATOR_ROLE_FORBIDDEN ANTES de política/preflight (zero claim/token/provider/rede)", async () => {
+    // Sessão com formato válido (cookie __Host-): a resolução de identidade
+    // exige banco; sem DATABASE_URL a rota responde 401/503 — a prova
+    // determinística dos 403 por papel é DB-gated (Parte 5). Aqui provamos
+    // APENAS que a rota NUNCA responde 409 CAMPAIGN_CANARY_SEND_DISABLED sem
+    // sessão EXECUTOR (a guarda de papel precede a checagem de política).
+    const resposta = await despacharSemBanco("POST", "/api/campaigns/canary-send", {
+      headers: { cookie: COOKIE_SESSAO },
+      corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+    });
+    expect(resposta.status).not.toBe(409);
+    expect(resposta.corpo).not.toContain("CAMPAIGN_CANARY_SEND_DISABLED");
   });
 
   it("corpo com autoridade adicional → 401 (auth precede validação do corpo); nunca 200", async () => {
@@ -896,6 +1038,49 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     pool = new NodePostgresPool({ connectionString: DB_URL_AMBIENTE!, max: 4 });
   });
 
+  // GF-3 CORRECTIVE-01 (F1) — matriz de autoridade do canário: somente
+  // EXECUTOR passa da guarda de papel. Qualquer outro papel ⇒ 403 estável
+  // ANTES de preflight/claim/token/provider (zero claim, zero rede).
+  it("2B1A-F1. CANARY_REQUIRES_EXECUTOR: PREPARADOR/REVISOR/APROVADOR/SUPERVISOR ⇒ 403; EXECUTOR segue para os gates normais", async () => {
+    adminCookie = await bootstrapAdmin();
+    const preparador = await provisionarOperadorPapeis(["PREPARADOR"]);
+    const revisor = await provisionarOperadorPapeis(["REVISOR"]);
+    const aprovador = await provisionarOperadorPapeis(["APROVADOR"]);
+    const supervisor = await provisionarOperadorPapeis(["SUPERVISOR"]);
+    const executor = await provisionarOperadorPapeis(["EXECUTOR"]);
+
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    try {
+      for (const [rotulo, cookie] of [
+        ["PREPARADOR", preparador],
+        ["REVISOR", revisor],
+        ["APROVADOR", aprovador],
+        ["SUPERVISOR", supervisor],
+      ] as const) {
+        const resposta = await despachar("POST", "/api/campaigns/canary-send", {
+          headers: { cookie, "content-type": "application/json" },
+          corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+        });
+        expect(resposta.status, `papel ${rotulo} deveria ser 403`).toBe(403);
+        expect(resposta.corpo).toContain("OPERATOR_ROLE_FORBIDDEN");
+      }
+      // EXECUTOR: a guarda de papel é SUPERADA — a execução segue para os
+      // gates normais (política canarySendEnabled fechada por padrão ⇒ 409
+      // CAMPAIGN_CANARY_SEND_DISABLED é a resposta esperada neste cenário).
+      const executorResposta = await despachar("POST", "/api/campaigns/canary-send", {
+        headers: { cookie: executor, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({ campanhaId: randomUUID() })),
+      });
+      expect(executorResposta.status).toBe(409);
+      expect(executorResposta.corpo).toContain("CAMPAIGN_CANARY_SEND_DISABLED");
+      // Nenhuma chamada de rede em NENHUM cenário da matriz.
+      expect(espiaoRede).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   // 03C.2A.4 — registro da cena (prova estrutural; nenhuma variável de
   // repositório é lida ou alterada — a matriz é constante do próprio teste).
   let matrizCenarioRegistrada: readonly [CenarioCanario, boolean, boolean, boolean] | undefined;
@@ -935,6 +1120,39 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     fingerprints: readonly string[];
   }
 
+  /**
+   * GF3 F1 — provisiona operador com papéis EXATOS e devolve o cookie de
+   * sessão (mesmo contrato admin/provision + session dos testes 2B1A-H*).
+   */
+  async function provisionarOperadorPapeis(papeis: readonly string[]): Promise<string> {
+    // GF4.5B — sufixo ÚNICO POR INVOCACAO (nunca por conjunto de papeis):
+    // mesmo conjunto de papeis + invocacoes distintas => credencial distinta
+    // => credentialHash distinto. Elimina a colisao UNIQUE(credentialHash)
+    // de uma segunda provisao do MESMO conjunto na mesma execucao de PG16
+    // (e.g. F1 provisao de ["EXECUTOR"] seguida do teste de isolamento
+    // GF4.5). tokenSintetico permanece intocado (deterministico por semente);
+    // a correcao esta SOMENTE na semente do helper. Sem 409 capturado,
+    // sem row removida, sem operador reutilizado.
+    const sufixo = randomUUID().replace(/-/g, "").slice(0, 12);
+    const credencial = tokenSintetico("f1-" + papeis.join("-") + "-" + sufixo);
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: adminCookie, "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-F1-" + sufixo,
+        displayName: "Operador F1 " + papeis.join("+"),
+        roles: [...papeis],
+        credentialHash: createHash("sha256").update(credencial).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencial })),
+    });
+    expect(login.status).toBe(200);
+    return firstCookie(login.headers["set-cookie"]);
+  }
+
   async function criarCenaCanario(params: {
     readonly operatorId: string;
     readonly emails: readonly string[];
@@ -947,20 +1165,41 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     const agora = new Date().toISOString();
     // C — identidade ÚNICA da cena (hex 64): evita colisão em
     // UNIQUE(fingerprint_arquivo, hash_aprovacao) entre cenas consecutivas.
-    const hashAprovacao = fingerprintUnico("aprovacao-" + campanhaId);
-    const fingerprintArquivo = fingerprintUnico("arquivo-" + campanhaId);
+    // GF-3 CORRECTIVE-02 (F8) — a fixture é V2 CONSISTENTE: snapshot com
+    // versão + contentHash + marcador de contrato, e hash_aprovacao
+    // recalculado pelo dispatcher canônico de produção sobre EXATAMENTE o
+    // snapshot persistido (RECOMPUTATION_INPUT_COMPLETE; nada de hash
+    // sintético a-CANÔNICO). Única fonte de unicidade: o e-mail sintético
+    // (contentHash/registros derivam dele; campanhaId entra no
+    // fingerprint_arquivo para a UNIQUE do schema).
     const registros = params.emails.map((email, indice) => ({
       profissional_id: "PF-CNR-" + String(indice + 1).padStart(4, "0"),
       nome: "Sintetico Canary " + String(indice + 1),
       email_normalizado: email,
       status_validacao: "APTO",
     }));
+    const contentHashCanario = contentHashDoTemplateSelecionado("pf-expedicao-carteira-2026-v2") ?? "";
+    const snapshot = {
+      template_versao: "pf-expedicao-carteira-2026-v2",
+      template_content_hash: contentHashCanario,
+      approval_hash_version: "CAMPANHA_APROVACAO_V2" as const,
+      registros,
+    };
+    // Hash da aprovação: dispatcher canônico de PRODUÇÃO sobre o snapshot
+    // EXATO persistido (GF-3 CORRECTIVE-02/F8 — RECOMPUTATION_INPUT_COMPLETE).
+    const hashAprovacao = hashAprovacaoCampanha({
+      contrato: "CAMPANHA_APROVACAO_V2" as const,
+      templateVersao: snapshot.template_versao,
+      templateContentHash: snapshot.template_content_hash,
+      registros,
+    });
+    const fingerprintArquivo = fingerprintUnico("arquivo-" + campanhaId);
     await p.query(
-      "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'CNR_TESTE_V1', $4, $5::jsonb, $6, $6, 0, $6, 'LOTE_CRIADO', $7, $7)",
-      [campanhaId, params.operatorId, fingerprintArquivo, hashAprovacao, JSON.stringify({ registros, total: registros.length }), registros.length, agora],
+      "INSERT INTO campanha_persistida (id, operator_id, fingerprint_arquivo, template_versao, hash_aprovacao, snapshot_registros, total_registros, total_aptos, total_bloqueados, total_aprovados, estado, criada_em, atualizada_em) VALUES ($1, $2, $3, 'pf-expedicao-carteira-2026-v2', $4, $5::jsonb, $6, $6, 0, $6, 'LOTE_CRIADO', $7, $7)",
+      [campanhaId, params.operatorId, fingerprintArquivo, hashAprovacao, JSON.stringify(snapshot), registros.length, agora],
     );
     await p.query(
-      "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'CNR_TESTE_V1', $4, $5, $6)",
+      "INSERT INTO lote_campanha (id, campanha_id, origem, codigo, template_versao, estado, total_itens, criado_em) VALUES ($1, $2, 'PF', $3, 'pf-expedicao-carteira-2026-v2', $4, $5, $6)",
       [loteCampanhaId, campanhaId, "CNR_LOTE_" + loteCampanhaId.slice(0, 8), params.estadoLote ?? "ATIVO", registros.length, agora],
     );
     const fingerprints: string[] = [];
@@ -1714,6 +1953,173 @@ describeDb("SLICE_03C.2A.1 — rota HTTP real do canário (POSTGRESQL_INTEGRATIO
     expect(espiaoRede).not.toHaveBeenCalled();
     expect(corpo.oauth.tokenRefreshes).toBe(0);
     expect(corpo.oauth.googleNetworkCalls).toBe(0);
+  });
+
+  it("GF4.5 — readiness expõe EXECUTAR_CANARIO server-derived: fechado ⇒ bloqueios canônicos; elegível ⇒ permitida SEM send", async () => {
+    const credencialF = tokenSintetico("gf45-f");
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: await bootstrapAdmin(), "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-F45-" + randomUUID().slice(0, 8),
+        displayName: "Operador GF4.5 Canário",
+        roles: ["EXECUTOR"],
+        credentialHash: createHash("sha256").update(credencialF).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const operatorIdF = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencialF })),
+    });
+    expect(login.status).toBe(200);
+    const cookieF = firstCookie(login.headers["set-cookie"]);
+
+    const cena = await criarCenaCanario({
+      operatorId: operatorIdF,
+      emails: ["canario.gf45@exemplo.test"],
+    });
+
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    try {
+      // B+C — política FECHADA (matriz E: todos os gates de envio false):
+      // a ação permanece permitida=false com bloqueios canônicos sanitizados,
+      // incluindo no mínimo CANARY_SEND_DISABLED e REAL_SEND_DISABLED.
+      ambienteBase(cena.fingerprints[0]!, MATRIZ_POLITICA_CENARIO.E);
+      const fechada = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cena.campanhaId}`, {
+        headers: { cookie: cookieF },
+      });
+      expect(fechada.status).toBe(200);
+      const corpoFechada = JSON.parse(fechada.corpo) as {
+        acoes: { EXECUTAR_CANARIO: { permitida: boolean; bloqueios: readonly string[] } };
+      };
+      expect(corpoFechada.acoes.EXECUTAR_CANARIO).toBeDefined();
+      expect(corpoFechada.acoes.EXECUTAR_CANARIO.permitida).toBe(false);
+      expect(corpoFechada.acoes.EXECUTAR_CANARIO.bloqueios).toContain("CANARY_SEND_DISABLED");
+      expect(corpoFechada.acoes.EXECUTAR_CANARIO.bloqueios).toContain("REAL_SEND_DISABLED");
+
+      // D — a avaliação do readiness NÃO executa: zero rede, zero evento
+      // EXEC, outbox intocada.
+      expect(espiaoRede).not.toHaveBeenCalled();
+      expect(await contagensExec(cena.itemCanarioId)).toEqual({});
+
+      // E — fixture sintética com TODOS os requisitos canônicos satisfeitos
+      // (gates B: canary+execute+real; prova; OAuth correspondente): o
+      // MESMO readiness deriva permitida=true SEM enviar nada — zero
+      // provider, zero rede, zero evento EXEC, item permanece PREPARADO.
+      ambienteBase(cena.fingerprints[0]!, MATRIZ_POLITICA_CENARIO.B);
+      await conectarOAuthCorrespondente();
+      const elegivel = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cena.campanhaId}`, {
+        headers: { cookie: cookieF },
+      });
+      expect(elegivel.status).toBe(200);
+      const corpoElegivel = JSON.parse(elegivel.corpo) as {
+        acoes: { EXECUTAR_CANARIO: { permitida: boolean; bloqueios: readonly string[] } };
+        lote: { estado: string; contagemPorEstado: Record<string, number> };
+      };
+      expect(corpoElegivel.acoes.EXECUTAR_CANARIO.permitida).toBe(true);
+      expect(corpoElegivel.acoes.EXECUTAR_CANARIO.bloqueios).toEqual([]);
+      expect(espiaoRede).not.toHaveBeenCalled();
+      expect(await contagensExec(cena.itemCanarioId)).toEqual({});
+      expect(await estadoItem(cena.loteCampanhaId)).toBe("PREPARADO");
+      expect(corpoElegivel.lote.contagemPorEstado["PREPARADO"]).toBe(1);
+
+      // F/G — isolamento e fail-closed: operador alheio ⇒ 404 indistinguível;
+      // campanha inexistente ⇒ 404. Nenhum bloqueio revela dados de terceiro.
+      const outroOperador = await provisionarOperadorPapeis(["EXECUTOR"]);
+      const alheia = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cena.campanhaId}`, {
+        headers: { cookie: outroOperador },
+      });
+      expect(alheia.status).toBe(404);
+      expect(alheia.corpo).toContain("CAMPAIGN_PERSISTED_NOT_FOUND");
+      const inexistente = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${randomUUID()}`, {
+        headers: { cookie: cookieF },
+      });
+      expect(inexistente.status).toBe(404);
+      expect(inexistente.corpo).toContain("CAMPAIGN_PERSISTED_NOT_FOUND");
+
+      // GF4.5B — fixture de isolamento com credencial ÚNICA por invocação:
+      // uma SEGUNDA provisão de ["EXECUTOR"] no MESMO processo/PG deve
+      // funcionar (201), com identidade provisionada DISTINTA da primeira
+      // (nenhuma colisão de credentialHash; nenhum segredo sintético exposto).
+      const segundoExecutor = await provisionarOperadorPapeis(["EXECUTOR"]);
+      const meSegundo = await despachar("GET", "/api/operator/me", {
+        headers: { cookie: segundoExecutor },
+      });
+      expect(meSegundo.status).toBe(200);
+      const corpoSegundo = JSON.parse(meSegundo.corpo) as {
+        operatorId: string;
+        code: string;
+        roles: string[];
+      };
+      expect(corpoSegundo.roles).toContain("EXECUTOR");
+      expect(corpoSegundo.operatorId).not.toBe(operatorIdF);
+      expect(corpoSegundo.code.startsWith("OP-F1-")).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("GF4.5C.1 — autoridade de papel no readiness: PREPARADOR sem EXECUTOR nunca recebe EXECUTAR_CANARIO.permitida=true, mesmo com preflight canônico satisfeito", async () => {
+    const credencialPre = tokenSintetico("gf45c1-pre");
+    const admin = await despachar("POST", "/api/operator/admin/provision", {
+      headers: { cookie: await bootstrapAdmin(), "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({
+        code: "OP-C1-" + randomUUID().slice(0, 8),
+        displayName: "Operador GF4.5C.1 PREPARADOR",
+        roles: ["PREPARADOR"],
+        credentialHash: createHash("sha256").update(credencialPre).digest("hex"),
+      })),
+    });
+    expect(admin.status).toBe(201);
+    const operatorIdPre = (JSON.parse(admin.corpo) as { operatorId: string }).operatorId;
+    const login = await despachar("POST", "/api/operator/identity/session", {
+      headers: { "content-type": "application/json" },
+      corpo: Buffer.from(JSON.stringify({ token: credencialPre })),
+    });
+    expect(login.status).toBe(200);
+    const cookiePre = firstCookie(login.headers["set-cookie"]);
+
+    // Cena sintética com TODOS os requisitos canônicos satisfeitos (gates B,
+    // provas, OAuth correspondente) — a ÚNICA condição ausente é o papel.
+    const cenaPre = await criarCenaCanario({
+      operatorId: operatorIdPre,
+      emails: ["canario.gf45c1@exemplo.test"],
+    });
+    ambienteBase(cenaPre.fingerprints[0]!, MATRIZ_POLITICA_CENARIO.B);
+    await conectarOAuthCorrespondente();
+
+    const espiaoRede = vi.fn();
+    vi.stubGlobal("fetch", espiaoRede);
+    try {
+      // FINDING 1 — regressão comportamental: PREPARADOR (papel operacional
+      // válido) + preflight satisfeito ⇒ permitida=false com o bloqueio
+      // sanitizado estável da autoridade da rota de envio.
+      const resposta = await despachar("GET", `/api/campaigns/operational-readiness?campanhaId=${cenaPre.campanhaId}`, {
+        headers: { cookie: cookiePre },
+      });
+      expect(resposta.status).toBe(200);
+      const corpo = JSON.parse(resposta.corpo) as {
+        acoes: { EXECUTAR_CANARIO: { permitida: boolean; bloqueios: readonly string[] } };
+      };
+      expect(corpo.acoes.EXECUTAR_CANARIO.permitida).toBe(false);
+      expect(corpo.acoes.EXECUTAR_CANARIO.bloqueios).toContain("OPERATOR_ROLE_FORBIDDEN");
+      expect(espiaoRede).not.toHaveBeenCalled();
+
+      // O POST continua independente e fail-closed: PREPARADOR ⇒ 403
+      // OPERATOR_ROLE_FORBIDDEN (guarda da rota inalterada), sem qualquer
+      // envio (zero rede) mesmo com gates de política abertos no cenário B.
+      const postRejeitado = await despachar("POST", "/api/campaigns/canary-send", {
+        headers: { cookie: cookiePre, "content-type": "application/json" },
+        corpo: Buffer.from(JSON.stringify({ campanhaId: cenaPre.campanhaId })),
+      });
+      expect(postRejeitado.status).toBe(403);
+      expect(postRejeitado.corpo).toContain("OPERATOR_ROLE_FORBIDDEN");
+      expect(espiaoRede).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   // ---- helpers de sessão (padrão 03B) ----

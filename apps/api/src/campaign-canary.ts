@@ -481,6 +481,28 @@ export function provedorWiringReady(env: AmbienteLeve = process.env): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// GF5.7A — preservação do motivo SANITIZADO da resolução de token.
+// CampanhaTokenResolutionError.motivo é um enum interno ESTÁVEL (allowlist do
+// runtime: DECRYPT_INDISPONIVEL, REFRESH_TOKEN_AUSENTE, REFRESH_INDISPONIVEL,
+// REFRESH_PERSISTENCIA_INDISPONIVEL). O motivo EXTERNO de FALHA_PRE_PROVIDER
+// preserva a causa exata sem ecoar Error.message, token, segredo, header ou
+// corpo do Google: SEMPRE um literal desta allowlist fechada — motivo interno
+// desconhecido ⇒ TOKEN_RESOLUTION_INDISPONIVEL genérico (nunca o valor cru).
+// A classificação permanece SEMPRE pré-provider (nada foi despachado) e a
+// semântica de settlement/auditoria (EXEC_FALHA_PRE_PROVIDER) é intocada.
+// ---------------------------------------------------------------------------
+const MOTIVOS_TOKEN_RESOLUTION_SANITIZADOS: Readonly<Record<string, string>> = {
+  DECRYPT_INDISPONIVEL: "TOKEN_DECRYPT_INDISPONIVEL",
+  REFRESH_TOKEN_AUSENTE: "TOKEN_REFRESH_TOKEN_AUSENTE",
+  REFRESH_INDISPONIVEL: "TOKEN_REFRESH_INDISPONIVEL",
+  REFRESH_PERSISTENCIA_INDISPONIVEL: "TOKEN_REFRESH_PERSISTENCIA_INDISPONIVEL",
+};
+
+function motivoTokenResolutionSanitizado(motivo: string): string {
+  return MOTIVOS_TOKEN_RESOLUTION_SANITIZADOS[motivo] ?? "TOKEN_RESOLUTION_INDISPONIVEL";
+}
+
+// ---------------------------------------------------------------------------
 // ProvedorGmailCampanha — implementação runtime do ProvedorEnvioCampanha.
 // Revalida o fingerprint do comando contra o snapshot congelado (defesa em
 // profundidade; NÃO substitui o preflight). Zero rede quando transport/token
@@ -650,7 +672,12 @@ export class ProvedorGmailCampanha implements ProvedorEnvioCampanha {
       // falhou ANTES de qualquer messages.send: SEMPRE FALHA_PRE_PROVIDER.
       // Nunca AMBIGUO (nada foi despachado) e nunca rejeição de envio.
       if (error instanceof CampanhaTokenResolutionError) {
-        return { tipo: "FALHA_PRE_PROVIDER", motivo: "TOKEN_RESOLUTION_INDISPONIVEL" };
+        // GF5.7A — motivo interno ESTÁVEL preservado como enum EXTERNO
+        // sanitizado (allowlist acima); NUNCA a mensagem bruta do erro.
+        return {
+          tipo: "FALHA_PRE_PROVIDER",
+          motivo: motivoTokenResolutionSanitizado(error.motivo),
+        };
       }
       if (error instanceof GmailAmbiguousError) {
         return { tipo: "AMBIGUO", motivo: "GMAIL_AMBIGUO" };
